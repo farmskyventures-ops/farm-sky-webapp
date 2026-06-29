@@ -4,6 +4,7 @@
 // =====================================================================
 
 import { env } from 'hono/adapter'
+const myEnv = env<{ MPESA_CONSUMER_KEY: string }>(c);
 
 export type MpesaEnv = {
   MPESA_CONSUMER_KEY?: string
