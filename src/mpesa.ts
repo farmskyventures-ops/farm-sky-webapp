@@ -4,14 +4,6 @@
 // =====================================================================
 
 import { env } from 'hono/adapter'
-const { MPESA_CONSUMER_KEY } = env<{ MPESA_CONSUMER_KEY: string }>(c);
-  
-  if (!MPESA_CONSUMER_KEY) {
-    return c.text('M-Pesa: SIMULATION mode (no Daraja credentials set).');
-  }
-  
-  return c.text('M-Pesa: Credentials loaded successfully.');
-});
 
 export type MpesaEnv = {
   MPESA_CONSUMER_KEY?: string
