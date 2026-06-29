@@ -1,9 +1,9 @@
 // =====================================================================
 // M-Pesa Daraja (Lipa na M-Pesa Online / STK Push) integration
-// Uses the Safaricom sandbox/production when real credentials are
-// provided via vars/secrets; otherwise falls back to a realistic
-// simulation so the demo remains fully functional without keys.
+// Updated to support both Cloudflare (c.env) and Render (process.env)
 // =====================================================================
+
+import { env } from 'hono/adapter'
 
 export type MpesaEnv = {
   MPESA_CONSUMER_KEY?: string
@@ -12,6 +12,19 @@ export type MpesaEnv = {
   MPESA_PASSKEY?: string
   MPESA_ENV?: string
   MPESA_CALLBACK_URL?: string
+}
+
+// Helper to resolve environment variables regardless of platform
+export function getMpesaEnv(c: any): MpesaEnv {
+  const hEnv = env<MpesaEnv>(c)
+  return {
+    MPESA_CONSUMER_KEY: hEnv.MPESA_CONSUMER_KEY || process.env.MPESA_CONSUMER_KEY,
+    MPESA_CONSUMER_SECRET: hEnv.MPESA_CONSUMER_SECRET || process.env.MPESA_CONSUMER_SECRET,
+    MPESA_SHORTCODE: hEnv.MPESA_SHORTCODE || process.env.MPESA_SHORTCODE,
+    MPESA_PASSKEY: hEnv.MPESA_PASSKEY || process.env.MPESA_PASSKEY,
+    MPESA_ENV: hEnv.MPESA_ENV || process.env.MPESA_ENV,
+    MPESA_CALLBACK_URL: hEnv.MPESA_CALLBACK_URL || process.env.MPESA_CALLBACK_URL,
+  }
 }
 
 const SANDBOX_BASE = 'https://sandbox.safaricom.co.ke'
@@ -26,7 +39,7 @@ function baseUrl(env: MpesaEnv): string {
 }
 
 function timestamp(): string {
-  const now = new Date(Date.now() + 3 * 3600 * 1000) // EAT (UTC+3)
+  const now = new Date(Date.now() + 3 * 3600 * 1000)
   const p = (n: number) => String(n).padStart(2, '0')
   return `${now.getUTCFullYear()}${p(now.getUTCMonth() + 1)}${p(now.getUTCDate())}${p(now.getUTCHours())}${p(now.getUTCMinutes())}${p(now.getUTCSeconds())}`
 }
@@ -100,7 +113,7 @@ export async function stkPush(env: MpesaEnv, opts: { phone: string; amount: numb
         success: true,
         checkout_request_id: data.CheckoutRequestID,
         merchant_request_id: data.MerchantRequestID,
-        customer_message: data.CustomerMessage || 'STK push sent. Enter your M-Pesa PIN on your phone.'
+        customer_message: data.CustomerMessage || 'STK push sent.'
       }
     }
     return { simulated: false, success: false, error: data.errorMessage || data.ResponseDescription || 'STK push failed' }
