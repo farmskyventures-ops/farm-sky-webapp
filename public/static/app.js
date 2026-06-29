@@ -1,0 +1,1605 @@
+// ============================================================================
+// Farmsky - Sharia-Compliant Agri-Finance Platform - SPA frontend
+// ============================================================================
+const api = axios.create({ baseURL: '/api', withCredentials: true })
+let state = { user: null, route: 'dashboard', data: {} }
+const $ = (id) => document.getElementById(id)
+const fmt = (n) => 'KES ' + Number(n || 0).toLocaleString()
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]))
+// Friendly labels for equipment payment types
+const payLabel = (t, model) => {
+  if (t === 'financing') {
+    return model === 'paygo'
+      ? 'PAYGO <span class="text-[10px] text-slate-400">(M-KOPA-style equipment financing)</span>'
+      : 'Financing <span class="text-[10px] text-slate-400">(interest-based)</span>'
+  }
+  return t === 'cash'
+    ? 'Cash'
+    : (String(t || '').charAt(0).toUpperCase() + String(t || '').slice(1))
+}
+
+let _products = [], _agents = [], _users = [], _customers = []
+let _permMeta = { permissions: [], roles: [] }
+function getRoleTemplate(role) {
+  return (_permMeta.roles || []).find((r) => r.role_key === role)
+}
+const roleLabel = (r) => getRoleTemplate(r)?.label || ({ super_admin: 'Super Admin', admin: 'Admin', operations_finance: 'Operations & Finance', agent: 'Agent', customer: 'Farmer', support: 'Support' }[r] || r)
+const permsText = (perms) => Object.entries(perms || {}).filter(([, v]) => v).map(([k]) => k.replace(/_/g, ' ')).join(', ')
+async function ensurePermissionMeta() {
+  if (!_permMeta.permissions.length && state.user) {
+    try { _permMeta = (await api.get('/permissions')).data } catch {}
+  }
+  return _permMeta
+}
+function templatePermissions(role) {
+  return { ...(getRoleTemplate(role)?.permissions || {}) }
+}
+function selectedPermissions(prefix) {
+  const out = {}
+  document.querySelectorAll(`[data-perm-group="${prefix}"]`).forEach((el) => { out[el.value] = !!el.checked })
+  return out
+}
+function permissionChecklist(prefix, selected = {}, readOnly = false) {
+  const perms = (_permMeta.permissions || []).slice().sort((a, b) => `${a.category || ''}:${a.label}`.localeCompare(`${b.category || ''}:${b.label}`))
+  if (!perms.length) return '<div class="text-xs text-slate-400">No permission check-boxes available yet.</div>'
+  let currentCategory = ''
+  return perms.map((p) => {
+    const heading = p.category !== currentCategory ? `<div class="col-span-2 text-[11px] font-bold uppercase tracking-wide text-slate-400 pt-1">${esc(p.category || 'general')}</div>` : ''
+    currentCategory = p.category
+    return `${heading}<label class="col-span-2 sm:col-span-1 flex items-start gap-2 border border-slate-200 rounded-lg px-3 py-2 bg-white">
+      <input type="checkbox" value="${esc(p.permission_key)}" data-perm-group="${prefix}" ${selected[p.permission_key] ? 'checked' : ''} ${readOnly ? 'disabled' : ''}>
+      <span><span class="block text-sm font-medium text-slate-700">${esc(p.label)}</span><span class="block text-[11px] text-slate-400">${esc(p.description || p.permission_key)}</span></span>
+    </label>`
+  }).join('')
+}
+function refreshPermissionChecklist(prefix, roleSelectId, readOnly = false) {
+  const box = $(prefix + '_box')
+  if (!box || !$(roleSelectId)) return
+  box.innerHTML = permissionChecklist(prefix, templatePermissions($(roleSelectId).value), readOnly)
+}
+function canDo(perm) {
+  if (!state.user) return false
+  if (['super_admin', 'admin'].includes(state.user.role)) return true
+  return !!state.user.permissions?.[perm]
+}
+function boolBadge(v, yes='Yes', no='No') { return v ? `<span class="text-emerald-600">${yes}</span>` : `<span class="text-slate-400">${no}</span>` }
+function toggleSidebar(force) {
+  const sidebar = $('appSidebar')
+  const overlay = $('appOverlay')
+  if (!sidebar || !overlay) return
+  const open = typeof force === 'boolean' ? force : !sidebar.classList.contains('open')
+  sidebar.classList.toggle('open', open)
+  overlay.classList.toggle('show', open)
+}
+window.toggleSidebar = toggleSidebar
+function confirmEdit(message) {
+  return window.confirm(message || 'Save these changes?')
+}
+function confirmDelete(message) {
+  return window.confirm(message || 'Delete this record? This cannot be undone.')
+}
+function confirmStatus(message) {
+  return window.confirm(message || 'Apply this status change?')
+}
+function previewSelectedImage(input, previewId) {
+  const file = input.files?.[0]
+  if (!file || !$(previewId)) return
+  const reader = new FileReader()
+  reader.onload = () => { $(previewId).innerHTML = `<img src="${reader.result}" class="w-full h-full object-cover">` }
+  reader.readAsDataURL(file)
+}
+window.previewSelectedImage = previewSelectedImage
+
+function badge(status) {
+  const map = {
+    active: 'bg-emerald-100 text-emerald-700', completed: 'bg-blue-100 text-blue-700',
+    pending: 'bg-amber-100 text-amber-700', rejected: 'bg-red-100 text-red-700',
+    current: 'bg-slate-100 text-slate-600', late: 'bg-red-100 text-red-700',
+    defaulted: 'bg-red-200 text-red-800', verified: 'bg-emerald-100 text-emerald-700',
+    suspended: 'bg-red-100 text-red-700',
+    in_stock: 'bg-emerald-100 text-emerald-700', low_stock: 'bg-amber-100 text-amber-700',
+    out_of_stock: 'bg-red-100 text-red-700', paid: 'bg-emerald-100 text-emerald-700',
+    partial: 'bg-amber-100 text-amber-700', unpaid: 'bg-slate-100 text-slate-600',
+    low: 'bg-emerald-100 text-emerald-700', medium: 'bg-amber-100 text-amber-700', high: 'bg-red-100 text-red-700'
+  }
+  return `<span class="badge ${map[status] || 'bg-slate-100 text-slate-600'}">${esc(String(status).replace(/_/g, ' '))}</span>`
+}
+function toast(msg, ok = true) {
+  const t = document.createElement('div')
+  t.className = `fixed top-4 right-4 z-50 px-5 py-3 rounded-lg shadow-lg text-white ${ok ? 'bg-emerald-600' : 'bg-red-600'} fade-in`
+  t.textContent = msg
+  document.body.appendChild(t)
+  setTimeout(() => t.remove(), 3200)
+}
+window.pickFileDataUrl = (input, targetId, nameId) => {
+  const file = input.files?.[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    $(targetId).value = reader.result
+    if (nameId && $(nameId)) $(nameId).textContent = file.name
+  }
+  reader.readAsDataURL(file)
+}
+window.requestChangeModal = (entityType, entityId, requestedAction = 'update') => {
+  showModal(`<h3 class="font-bold mb-1">Request Admin Action</h3>
+    <p class="text-xs text-slate-500 mb-3">Operations & Finance users can submit a request instead of editing or deleting directly.</p>
+    <div class="space-y-3 text-sm">
+      <input id="cr_action" value="${esc(requestedAction)}" class="w-full px-3 py-2 border rounded-lg">
+      <textarea id="cr_reason" placeholder="Reason / instructions for admin" class="w-full px-3 py-2 border rounded-lg min-h-28"></textarea>
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="submitChangeRequest('${entityType}', ${entityId})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Submit Request</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+window.submitChangeRequest = async (entityType, entityId) => {
+  try {
+    await api.post('/change-requests', {
+      entity_type: entityType,
+      entity_id: entityId,
+      requested_action: $('cr_action').value,
+      reason: $('cr_reason').value
+    })
+    closeModal(); toast('Change request submitted to admin')
+  } catch (err) { toast(err.response?.data?.error || 'Failed to submit request', false) }
+}
+
+// ---------------------------------------------------------------------------
+// AUTH
+// ---------------------------------------------------------------------------
+async function init() {
+  try { const { data } = await api.get('/me'); state.user = data.user; renderApp() }
+  catch { renderLogin() }
+}
+let _authTab = 'signin'
+let _smsLive = false
+async function renderLogin(tab) {
+  _authTab = tab || 'signin'
+  try { _smsLive = (await api.get('/auth/status')).data.sms_live } catch {}
+  const heading = _authTab === 'signup' ? 'Create your account'
+    : _authTab === 'reset' ? 'Reset your password'
+    : 'Sign in to your account'
+  $('app').innerHTML = `
+  <div class="min-h-screen brand-bg flex items-center justify-center p-4">
+    <div class="w-full max-w-md card p-8 fade-in">
+      <div class="text-center mb-5">
+        <img src="/static/farmsky-logo.png" alt="Farmsky" class="w-24 h-24 mx-auto mb-1 object-contain">
+        <p class="text-sm text-slate-500">Financing Agriculture</p>
+      </div>
+      <h2 class="text-base font-semibold text-slate-700 text-center mb-4">${heading}</h2>
+      <div id="authBody"></div>
+      <div id="authFooter" class="mt-6 pt-4 border-t border-slate-100 text-center text-sm space-y-2"></div>
+    </div>
+  </div>`
+  if (_authTab === 'signin') authSignIn()
+  else if (_authTab === 'signup') authSignUp()
+  else authReset()
+  renderAuthFooter()
+}
+// Sign-up + Forgot password links live at the BOTTOM of the card.
+function renderAuthFooter() {
+  const f = $('authFooter')
+  if (!f) return
+  if (_authTab === 'signin') {
+    f.innerHTML = `
+      <p class="text-slate-500">New to Farmsky?
+        <button onclick="renderLogin('signup')" class="font-semibold text-teal-600 hover:underline">Create an account</button>
+      </p>
+      <p><button onclick="renderLogin('reset')" class="text-slate-400 hover:text-teal-600 hover:underline">Forgot password?</button></p>`
+  } else {
+    f.innerHTML = `<p><button onclick="renderLogin('signin')" class="font-semibold text-teal-600 hover:underline"><i class="fas fa-arrow-left mr-1"></i>Back to sign in</button></p>`
+  }
+}
+function smsBanner() {
+  return _smsLive
+    ? '<div class="bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs rounded-lg p-2 mb-3"><i class="fas fa-comment-sms mr-1"></i>A real SMS code will be sent to your phone.</div>'
+    : '<div class="bg-amber-50 border border-amber-200 text-amber-700 text-xs rounded-lg p-2 mb-3"><i class="fas fa-flask mr-1"></i>Demo mode — the SMS code is shown on screen (configure SMS provider to go live).</div>'
+}
+function authSignIn() {
+  $('authBody').innerHTML = `
+    <form id="loginForm" class="space-y-4">
+      <div>
+        <label class="text-sm font-medium text-slate-600">Mobile Number</label>
+        <input id="phone" type="text" placeholder="07XX XXX XXX" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required>
+      </div>
+      <div>
+        <label class="text-sm font-medium text-slate-600">Password</label>
+        <input id="password" type="password" placeholder="••••" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required>
+      </div>
+      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Sign In</button>
+    </form>`
+  $('loginForm').onsubmit = async (e) => {
+    e.preventDefault()
+    try {
+      const { data } = await api.post('/login', { phone: $('phone').value, password: $('password').value })
+      state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp()
+    } catch (err) { toast(err.response?.data?.error || 'Login failed', false) }
+  }
+}
+// ---------------------------------------------------------------------------
+// KYC helpers — gallery + camera capture for ID front, ID back, selfie
+// ---------------------------------------------------------------------------
+function kycFileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(reader.result)
+    reader.onerror = reject
+    reader.readAsDataURL(file)
+  })
+}
+window.kycOpenPicker = (inputId) => {
+  const input = $(inputId)
+  if (!input) return
+  input.value = ''
+  input.click()
+}
+window.kycHandlePick = async (input, hiddenId, previewId, statusId, nextSectionId = '') => {
+  const file = input?.files?.[0]
+  if (!file) return
+  try {
+    const dataUrl = await kycFileToDataUrl(file)
+    const hidden = $(hiddenId)
+    const preview = $(previewId)
+    const status = $(statusId)
+    if (hidden) hidden.value = dataUrl
+    if (preview) {
+      const isSelfie = previewId.toLowerCase().includes('selfie')
+      preview.innerHTML = `<img src="${dataUrl}" class="${isSelfie ? 'w-28 h-28 rounded-full' : 'w-full h-40 rounded-xl'} object-cover border border-slate-200">`
+    }
+    if (status) status.innerHTML = `<span class="text-emerald-600"><i class="fas fa-circle-check mr-1"></i>Captured</span>`
+    if (nextSectionId && $(nextSectionId)) {
+      $(nextSectionId).classList.remove('hidden')
+      $(nextSectionId).scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  } catch { toast('Could not read the selected image', false) }
+}
+function kycStepCard({ sectionId, title, subtitle, previewId, statusId, hiddenId, galleryId, cameraId, cameraFacing = 'environment', cameraLabel = 'Open camera', nextSectionId = '', hidden = false, value = '', previewHtml = '', statusText = 'Required' }) {
+  const isSelfie = previewId.toLowerCase().includes('selfie')
+  return `
+    <section id="${sectionId}" class="${hidden ? 'hidden ' : ''}border border-slate-200 rounded-xl p-4 bg-slate-50">
+      <div class="flex items-start justify-between gap-3 mb-3">
+        <div>
+          <div class="text-sm font-semibold text-slate-800">${title}</div>
+          <div class="text-xs text-slate-500">${subtitle}</div>
+        </div>
+        <div id="${statusId}" class="text-xs text-amber-600">${statusText}</div>
+      </div>
+      <div id="${previewId}" class="${isSelfie ? 'w-28 h-28 rounded-full' : 'w-full h-40 rounded-xl'} overflow-hidden bg-slate-200 flex items-center justify-center mx-auto border border-dashed border-slate-300">
+        ${previewHtml || `<i class="fas ${isSelfie ? 'fa-user' : 'fa-id-card'} text-3xl text-slate-400"></i>`}
+      </div>
+      <input id="${hiddenId}" type="hidden" value="${esc(value || '')}">
+      <input id="${galleryId}" type="file" accept="image/*" class="hidden" onchange="kycHandlePick(this,'${hiddenId}','${previewId}','${statusId}','${nextSectionId}')">
+      <input id="${cameraId}" type="file" accept="image/*" capture="${cameraFacing}" class="hidden" onchange="kycHandlePick(this,'${hiddenId}','${previewId}','${statusId}','${nextSectionId}')">
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3">
+        <button type="button" onclick="kycOpenPicker('${galleryId}')" class="btn bg-white border border-slate-300 px-3 py-2 rounded-lg text-sm"><i class="fas fa-image mr-1"></i>Upload from gallery</button>
+        <button type="button" onclick="kycOpenPicker('${cameraId}')" class="btn brand-bg text-white px-3 py-2 rounded-lg text-sm"><i class="fas fa-camera mr-1"></i>${cameraLabel}</button>
+      </div>
+    </section>`
+}
+
+// ---- SIGN UP (SMS OTP) ----
+function authSignUp() {
+  $('authBody').innerHTML = `
+    ${smsBanner()}
+    <form id="suForm" class="space-y-3">
+      <div><label class="text-sm font-medium text-slate-600">Full Name</label>
+        <input id="su_name" type="text" placeholder="Jane Wanjiku" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
+      <div><label class="text-sm font-medium text-slate-600">Mobile Number</label>
+        <input id="su_phone" type="text" placeholder="07XX XXX XXX" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
+      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold"><i class="fas fa-paper-plane mr-1"></i>Send Verification Code</button>
+    </form>`
+  $('suForm').onsubmit = async (e) => {
+    e.preventDefault()
+    try {
+      const { data } = await api.post('/signup/request-otp', { phone: $('su_phone').value, full_name: $('su_name').value })
+      authSignUpVerify(data.phone, $('su_name').value, data.demo_otp)
+    } catch (err) { toast(err.response?.data?.error || 'Could not send code', false) }
+  }
+}
+function authSignUpVerify(phone, name, demoOtp) {
+  $('authBody').innerHTML = `
+    <p class="text-sm text-slate-600 mb-1">Enter the code sent to <b>${esc(phone)}</b></p>
+    ${demoOtp ? `<div class="bg-teal-50 border border-teal-200 text-teal-800 text-sm rounded-lg p-2 mb-3">Demo code: <b class="tracking-widest">${esc(demoOtp)}</b></div>` : ''}
+    <form id="suvForm" class="space-y-4">
+      <div><label class="text-sm font-medium text-slate-600">Verification Code</label>
+        <input id="su_code" type="text" inputmode="numeric" placeholder="6-digit code" value="${esc(demoOtp || '')}" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg tracking-widest" required></div>
+      <div><label class="text-sm font-medium text-slate-600">National ID Number</label>
+        <input id="su_nid" type="text" placeholder="National ID" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
+      <div><label class="text-sm font-medium text-slate-600">Create Password</label>
+        <input id="su_pass" type="password" placeholder="Choose a password" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
+      <div class="border-t pt-4">
+        <h4 class="font-semibold text-slate-800 mb-1">Identity capture</h4>
+        <p class="text-xs text-slate-500 mb-4">Step 1: ID front. Step 2: ID back. Step 3: passport photo for liveness.</p>
+        <div class="space-y-4">
+          ${kycStepCard({ sectionId: 'su_front_section', title: 'Step 1 — National ID front', subtitle: 'Upload from gallery or use the back camera.', previewId: 'su_front_preview', statusId: 'su_front_status', hiddenId: 'su_id_front_url', galleryId: 'su_front_gallery', cameraId: 'su_front_camera', cameraFacing: 'environment', cameraLabel: 'Open back camera', nextSectionId: 'su_back_section' })}
+          ${kycStepCard({ sectionId: 'su_back_section', title: 'Step 2 — National ID back', subtitle: 'Unlocks after the front image is captured.', previewId: 'su_back_preview', statusId: 'su_back_status', hiddenId: 'su_id_back_url', galleryId: 'su_back_gallery', cameraId: 'su_back_camera', cameraFacing: 'environment', cameraLabel: 'Open back camera', nextSectionId: 'su_selfie_section', hidden: true })}
+          ${kycStepCard({ sectionId: 'su_selfie_section', title: 'Step 3 — Passport photo / live selfie', subtitle: 'Use the front camera for liveness verification.', previewId: 'su_selfie_preview', statusId: 'su_selfie_status', hiddenId: 'su_selfie_url', galleryId: 'su_selfie_gallery', cameraId: 'su_selfie_camera', cameraFacing: 'user', cameraLabel: 'Open front camera', hidden: true })}
+        </div>
+      </div>
+      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Verify & Create Account</button>
+    </form>
+    <button onclick="renderLogin('signup')" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Back</button>`
+  $('suvForm').onsubmit = async (e) => {
+    e.preventDefault()
+    try {
+      const id_front_url = $('su_id_front_url').value
+      const id_back_url = $('su_id_back_url').value
+      const selfie_url = $('su_selfie_url').value
+      if (!id_front_url) return toast('Capture the front of the ID first', false)
+      if (!id_back_url) return toast('Capture the back of the ID next', false)
+      if (!selfie_url) return toast('Take the passport photo / selfie to continue', false)
+      const { data } = await api.post('/signup/verify', { phone, full_name: name, code: $('su_code').value, password: $('su_pass').value, national_id: $('su_nid').value, id_front_url, id_back_url, selfie_url })
+      state.user = data.user; toast('Account created. Welcome, ' + data.user.full_name); renderApp()
+    } catch (err) { toast(err.response?.data?.error || 'Verification failed', false) }
+  }
+}
+// ---- PASSWORD RESET (SMS OTP) ----
+function authReset() {
+  $('authBody').innerHTML = `
+    ${smsBanner()}
+    <form id="rsForm" class="space-y-3">
+      <div><label class="text-sm font-medium text-slate-600">Mobile Number</label>
+        <input id="rs_phone" type="text" placeholder="07XX XXX XXX" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
+      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold"><i class="fas fa-paper-plane mr-1"></i>Send Reset Code</button>
+    </form>`
+  $('rsForm').onsubmit = async (e) => {
+    e.preventDefault()
+    try {
+      const { data } = await api.post('/reset-password/request-otp', { phone: $('rs_phone').value })
+      authResetVerify(data.phone, data.demo_otp)
+    } catch (err) { toast(err.response?.data?.error || 'Could not send code', false) }
+  }
+}
+function authResetVerify(phone, demoOtp) {
+  $('authBody').innerHTML = `
+    <p class="text-sm text-slate-600 mb-1">Enter the reset code sent to <b>${esc(phone)}</b></p>
+    ${demoOtp ? `<div class="bg-teal-50 border border-teal-200 text-teal-800 text-sm rounded-lg p-2 mb-3">Demo code: <b class="tracking-widest">${esc(demoOtp)}</b></div>` : ''}
+    <form id="rsvForm" class="space-y-3">
+      <div><label class="text-sm font-medium text-slate-600">Reset Code</label>
+        <input id="rs_code" type="text" inputmode="numeric" placeholder="6-digit code" value="${esc(demoOtp || '')}" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg tracking-widest" required></div>
+      <div><label class="text-sm font-medium text-slate-600">New Password</label>
+        <input id="rs_pass" type="password" placeholder="New password" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
+      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Update Password</button>
+    </form>
+    <button onclick="renderLogin('reset')" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Back</button>`
+  $('rsvForm').onsubmit = async (e) => {
+    e.preventDefault()
+    try {
+      await api.post('/reset-password/verify', { phone, code: $('rs_code').value, password: $('rs_pass').value })
+      toast('Password updated. Please sign in.'); renderLogin('signin')
+    } catch (err) { toast(err.response?.data?.error || 'Reset failed', false) }
+  }
+}
+window.renderLogin = renderLogin
+window.fill = (p, pw) => { $('phone').value = p; $('password').value = pw }
+async function logout() { await api.post('/logout'); state.user = null; renderLogin() }
+
+// ---------------------------------------------------------------------------
+// APP SHELL + NAV
+// ---------------------------------------------------------------------------
+function navItems() {
+  const r = state.user.role
+  const common = [{ k: 'dashboard', i: 'fa-gauge-high', t: 'Dashboard' }]
+  if (r === 'super_admin' || r === 'admin') return [...common,
+    { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
+    { k: 'inventory', i: 'fa-boxes-stacked', t: 'Inventory' },
+    { k: 'customers', i: 'fa-users', t: 'Customers' },
+    { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
+    { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
+    { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
+    { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
+    { k: 'exports', i: 'fa-database', t: 'Data Export' }]
+  if (r === 'operations_finance') return [...common,
+    { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
+    { k: 'customers', i: 'fa-users', t: 'Customers' },
+    { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
+    { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' }]
+  if (r === 'agent') return [...common,
+    { k: 'onboard', i: 'fa-user-plus', t: 'Add Farmer' },
+    { k: 'customers', i: 'fa-users', t: 'My Farmers' },
+    { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' }]
+  if (r === 'customer') return [...common,
+    { k: 'shop', i: 'fa-store', t: 'Equipment Shop' },
+    { k: 'contracts', i: 'fa-file-signature', t: 'My Purchases' }]
+  if (r === 'support') return [...common,
+    { k: 'customers', i: 'fa-users', t: 'Customers' },
+    { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' }]
+  return common
+}
+function renderApp() {
+  const items = navItems()
+  $('app').innerHTML = `
+  <div class="app-shell">
+    <div id="appOverlay" class="app-overlay" onclick="toggleSidebar(false)"></div>
+    <aside id="appSidebar" class="sidebar brand-bg text-white">
+      <div class="p-4 border-b border-white/10 bg-white/95">
+        <img src="/static/farmsky-logo.png" alt="Farmsky" class="h-16 mx-auto object-contain">
+      </div>
+      <nav class="flex-1 py-4 overflow-y-auto">
+        ${items.map(it => `<div class="nav-link px-5 py-3 flex items-center gap-3 text-sm hover:bg-white/10 ${state.route === it.k ? 'active' : ''}" onclick="go('${it.k}')"><i class="fas ${it.i} w-5"></i>${it.t}</div>`).join('')}
+      </nav>
+      <div class="p-4 border-t border-white/10">
+        <div class="text-sm font-medium">${esc(state.user.full_name)}</div>
+        <div class="text-xs text-teal-200 mb-2">${esc(roleLabel(state.user.role))}${state.user.label ? ' · ' + esc(state.user.label) : ''}</div>
+        <button onclick="logout()" class="btn w-full text-xs bg-white/10 hover:bg-white/20 py-2 rounded-lg"><i class="fas fa-right-from-bracket mr-1"></i>Logout</button>
+      </div>
+    </aside>
+    <main class="main-area">
+      <header class="topbar">
+        <div class="flex items-center gap-3 min-w-0">
+          <button class="menu-toggle" onclick="toggleSidebar()"><i class="fas fa-bars"></i></button>
+          <div class="min-w-0">
+            <h2 id="pageTitle" class="text-xl font-bold text-slate-800 truncate"></h2>
+            <div class="text-xs text-slate-500 md:hidden"><i class="fas fa-tractor text-teal-600 mr-1"></i>Cash, PAYGO & Equipment Financing</div>
+          </div>
+        </div>
+        <div class="text-sm text-slate-500 hidden md:block"><i class="fas fa-tractor text-teal-600 mr-1"></i>Cash, PAYGO & Equipment Financing</div>
+      </header>
+      <div id="content-wrap"><div id="content"></div></div>
+    </main>
+  </div>
+  <div id="modal"></div>`
+  route()
+}
+window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
+function route() {
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports' }
+  $('pageTitle').textContent = titles[state.route] || 'Dashboard'
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports }
+  ;(map[state.route] || viewDashboard)()
+}
+
+// ---------------------------------------------------------------------------
+// DASHBOARD
+// ---------------------------------------------------------------------------
+function statCard(icon, label, value, color) {
+  return `<div class="card p-5 fade-in">
+    <div class="flex items-center justify-between">
+      <div><p class="text-xs text-slate-500 uppercase tracking-wide">${label}</p><p class="text-2xl font-bold text-slate-800 mt-1">${value}</p></div>
+      <div class="w-12 h-12 rounded-xl flex items-center justify-center ${color}"><i class="fas ${icon} text-lg"></i></div>
+    </div></div>`
+}
+async function viewDashboard() {
+  $('content').innerHTML = '<div class="text-slate-400">Loading...</div>'
+  const { data } = await api.get('/dashboard')
+  if (data.role === 'customer') {
+    let next = data.next_payment ? `<div class="card p-5"><p class="text-xs text-slate-500 uppercase">Next Payment</p><p class="text-2xl font-bold mt-1">${fmt(data.next_payment.amount_due - data.next_payment.amount_paid)}</p><p class="text-sm text-slate-500">Due ${data.next_payment.due_date}</p></div>` : '<div class="card p-5"><p class="text-slate-500">No upcoming payments</p></div>'
+    $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+      ${statCard('fa-file-signature', 'Active Purchases', data.active_contracts, 'bg-teal-50 text-teal-600')}
+      ${statCard('fa-money-bill-wave', 'Total Outstanding', fmt(data.total_outstanding), 'bg-amber-50 text-amber-600')}
+      ${statCard('fa-circle-check', 'Completed', data.completed_contracts, 'bg-emerald-50 text-emerald-600')}
+      ${next}
+    </div>
+    <div class="card p-6"><h3 class="font-bold mb-2"><i class="fas fa-store text-teal-600 mr-2"></i>Quick Actions</h3>
+      <button onclick="go('shop')" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm mr-2"><i class="fas fa-cart-plus mr-1"></i>Buy Equipment</button>
+      <button onclick="go('contracts')" class="btn bg-slate-100 px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-list mr-1"></i>My Purchases</button>
+    </div>`
+  } else if (data.role === 'agent') {
+    $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+      ${statCard('fa-users', 'Farmers Added', data.customers_onboarded, 'bg-teal-50 text-teal-600')}
+      ${statCard('fa-file-signature', 'Active Contracts', data.active_contracts, 'bg-blue-50 text-blue-600')}
+      ${statCard('fa-clock', 'Pending Approvals', data.pending_approvals, 'bg-amber-50 text-amber-600')}
+      ${statCard('fa-credit-card', 'Credit Purchases', data.credit_purchases || 0, 'bg-violet-50 text-violet-600')}
+      ${statCard('fa-coins', 'Commission', fmt(data.commission), 'bg-emerald-50 text-emerald-600')}
+      ${statCard('fa-wallet', 'Portfolio Value', fmt(data.portfolio_value), 'bg-indigo-50 text-indigo-600')}
+      ${statCard('fa-triangle-exclamation', 'Portfolio at Risk', data.portfolio_at_risk + '%', 'bg-red-50 text-red-600')}
+      ${statCard('fa-calendar-xmark', 'Late Installments', data.late_installments, 'bg-orange-50 text-orange-600')}
+    </div>
+    <div class="card p-6"><button onclick="go('onboard')" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add New Farmer</button></div>`
+  } else {
+    $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+      ${statCard('fa-chart-line', 'Total Sales', fmt(data.total_sales), 'bg-teal-50 text-teal-600')}
+      ${statCard('fa-hand-holding-dollar', 'Equipment Financed', fmt(data.equipment_financed), 'bg-blue-50 text-blue-600')}
+      ${statCard('fa-money-bill', 'Cash Sales', fmt(data.cash_sales), 'bg-emerald-50 text-emerald-600')}
+      ${statCard('fa-percent', 'Repayment Rate', data.repayment_rate + '%', 'bg-indigo-50 text-indigo-600')}
+      ${statCard('fa-triangle-exclamation', 'Default Rate', data.default_rate + '%', 'bg-red-50 text-red-600')}
+      ${statCard('fa-warehouse', 'Inventory Value', fmt(data.inventory_value), 'bg-amber-50 text-amber-600')}
+      ${statCard('fa-users', 'Active Customers', data.active_customers, 'bg-cyan-50 text-cyan-600')}
+      ${statCard('fa-clock', 'Pending Approvals', data.pending_approvals, 'bg-orange-50 text-orange-600')}
+    </div>
+    <div class="card p-6"><h3 class="font-bold mb-4"><i class="fas fa-ranking-star text-teal-600 mr-2"></i>Top Products</h3>
+      ${data.top_products.map(p => `<div class="flex justify-between py-2 border-b border-slate-100 last:border-0"><span>${esc(p.name)}</span><span class="font-semibold">${p.sales} sales</span></div>`).join('') || '<p class="text-slate-400">No data</p>'}
+    </div>`
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SHOP (customer buy flow)
+// ---------------------------------------------------------------------------
+function prodImg(p, cls) {
+  return p.image
+    ? `<img src="${esc(p.image)}" alt="${esc(p.name)}" class="${cls} object-cover">`
+    : `<div class="${cls} flex items-center justify-center bg-gradient-to-br from-teal-50 to-emerald-100 text-teal-400"><i class="fas fa-box-open text-3xl"></i></div>`
+}
+async function viewShop() {
+  const { data } = await api.get('/products')
+  _products = data.products
+  $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+    ${data.products.map(p => `
+      <div class="card overflow-hidden fade-in flex flex-col">
+        <div class="cursor-pointer" onclick="productDetail(${p.id})">${prodImg(p, 'w-full h-44')}</div>
+        <div class="p-4 flex flex-col flex-1">
+          <div class="flex justify-between items-start"><h3 class="font-bold text-slate-800">${esc(p.name)}</h3>${badge(p.stock_status)}</div>
+          <p class="text-xs text-slate-500 mb-3">${esc(p.category)} · ${p.quantity} ${esc(p.unit)} in stock</p>
+          <div class="space-y-1 text-sm mt-auto">
+            <div class="flex justify-between"><span class="text-slate-500">Cash Price</span><span class="font-semibold text-emerald-600">${fmt(p.cash_price)}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Pay Later Price <span class="text-[10px] text-slate-400">(Murabaha Financing)</span></span><span class="font-semibold text-blue-600">${fmt(p.credit_price)}</span></div>
+          </div>
+          <div class="flex gap-2 mt-4">
+            <button onclick="productDetail(${p.id})" class="btn flex-1 bg-slate-100 hover:bg-slate-200 py-2 rounded-lg text-sm"><i class="fas fa-circle-info mr-1"></i>Details</button>
+            <button onclick="buyModal(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-cart-plus mr-1"></i>Buy</button>
+          </div>
+        </div>
+      </div>`).join('')}
+  </div>`
+}
+window.productDetail = (id) => {
+  const p = _products.find(x => x.id === id)
+  if (!p) return
+  showModal(`
+    ${prodImg(p, 'w-full h-56 rounded-xl mb-4')}
+    <div class="flex justify-between items-start mb-1"><h3 class="text-xl font-bold">${esc(p.name)}</h3>${badge(p.stock_status)}</div>
+    <p class="text-sm text-slate-500 mb-4"><i class="fas fa-tag mr-1"></i>${esc(p.category)} · SKU ${esc(p.sku)}</p>
+    <div class="responsive-grid cols-2 text-sm">
+      <div class="bg-emerald-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Cash Price</p><b class="text-emerald-700 text-lg">${fmt(p.cash_price)}</b></div>
+      <div class="bg-blue-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Pay Later Price <span class="text-[10px] text-slate-400">(Murabaha Financing)</span></p><b class="text-blue-700 text-lg">${fmt(p.credit_price)}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">In Stock</p><b>${p.quantity} ${esc(p.unit)}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Pay Later Markup</p><b>${p.credit_markup_pct}%</b></div>
+    </div>
+    <button onclick="buyModal(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn w-full mt-5 brand-bg text-white py-2.5 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-cart-plus mr-1"></i>Purchase This Product</button>
+    <button onclick="closeModal()" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Close</button>`)
+}
+window.buyModal = async (productId) => {
+  if (!_products.length) { const { data } = await api.get('/products'); _products = data.products }
+  const p = _products.find(x => x.id === productId)
+  const minTerm = Math.max(1, Number(p.financing_term_min_months || 3))
+  const maxTerm = Math.max(minTerm, Number(p.financing_term_max_months || 12))
+  const termOptions = Array.from({ length: maxTerm - minTerm + 1 }, (_, i) => minTerm + i)
+    .map(m => `<option value="${m}" ${m === Math.min(6, maxTerm) && m >= minTerm ? 'selected' : ''}>${m}</option>`).join('')
+  const paymentOptions = [
+    p.cash_enabled ? '<option value="cash">Cash purchase</option>' : '',
+    p.financing_enabled ? `<option value="financing">${p.financing_model === 'paygo' ? 'PAYGO financing' : 'Normal financing'}</option>` : ''
+  ].join('')
+  showModal(`
+    <h3 class="text-lg font-bold mb-1">Purchase: ${esc(p.name)}</h3>
+    <p class="text-xs text-slate-500 mb-4">Configure the order, review the deposit and repayment terms, then consent before purchase.</p>
+    <div class="responsive-grid cols-2 text-sm">
+      <div style="grid-column:1 / -1"><label class="font-medium">Description</label><div class="mt-1 text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">${esc(p.description || 'No description added')}</div></div>
+      <div><label class="font-medium">Quantity</label><input id="qty" type="number" value="1" min="1" max="${p.quantity}" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
+      <div><label class="font-medium">Payment Type</label>
+        <select id="ptype" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg" onchange="toggleTerm()">${paymentOptions}</select>
+      </div>
+      <div id="termWrap" class="hidden"><label class="font-medium">Payment Term (months)</label>
+        <select id="term" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg">${termOptions}</select>
+      </div>
+      <div><label class="font-medium">Delivery Location</label><input id="dloc" type="text" placeholder="Village / Ward" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
+    </div>
+    <div class="responsive-grid cols-2 mt-3 text-xs">
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Cash deposit requirement</div><div class="font-semibold mt-1">${Number(p.cash_deposit_pct ?? 100)}%</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing deposit requirement</div><div class="font-semibold mt-1">${Number(p.financing_deposit_pct ?? 10)}%</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing model</div><div class="font-semibold mt-1">${p.financing_model === 'paygo' ? 'PAYGO / M-KOPA-style' : 'Normal financing'}</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Interest / finance rate</div><div class="font-semibold mt-1">${Number(p.financing_interest_pct || 0)}%</div></div>
+    </div>
+    <div id="quoteBox" class="mt-4"></div>
+    <div class="flex gap-2 mt-5">
+      <button onclick="getQuote(${p.id})" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-calculator mr-1"></i>Preview Payment Terms</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+  toggleTerm()
+}
+window.toggleTerm = () => {
+  const wrap = $('termWrap')
+  if (wrap) wrap.classList.toggle('hidden', $('ptype').value !== 'financing')
+}
+window.getQuote = async (productId) => {
+  const body = { product_id: productId, quantity: $('qty').value, payment_type: $('ptype').value, term_months: $('term') ? $('term').value : 0 }
+  const { data } = await api.post('/murabaha/quote', body)
+  const financing = body.payment_type === 'financing'
+  $('quoteBox').innerHTML = `
+    <div class="bg-teal-50 border border-teal-200 rounded-xl p-4">
+      <h4 class="font-bold text-teal-800 mb-2"><i class="fas fa-file-invoice-dollar mr-1"></i>Payment Summary</h4>
+      <div class="space-y-1 text-sm">
+        <div class="flex justify-between"><span>Purchase type</span><b>${payLabel(data.payment_type, data.financing_model)}</b></div>
+        <div class="flex justify-between"><span>Supplier cost</span><b>${fmt(data.supplier_cost)}</b></div>
+        <div class="flex justify-between"><span>Deposit required</span><b>${data.deposit_pct}% (${fmt(data.deposit_amount)})</b></div>
+        <div class="flex justify-between"><span>Amount due now</span><b>${fmt(data.amount_due_now)}</b></div>
+        <div class="flex justify-between"><span>Total payable</span><b>${fmt(data.total_payable)}</b></div>
+        ${financing ? `
+          <div class="flex justify-between"><span>Financed principal</span><b>${fmt(data.finance_principal)}</b></div>
+          <div class="flex justify-between"><span>Term</span><b>${data.term_months} month(s)</b></div>
+          <div class="flex justify-between"><span>Payment frequency</span><b>${esc(data.payment_frequency)}</b></div>
+          <div class="flex justify-between"><span>Installments</span><b>${data.installment_count}</b></div>
+          <div class="flex justify-between"><span>Installment amount</span><b>${fmt(data.installment_amount)}</b></div>
+          <div class="flex justify-between"><span>Interest / finance rate</span><b>${data.interest_rate_pct || 0}%</b></div>` : `
+          <div class="flex justify-between"><span>Balance after deposit</span><b>${fmt(data.outstanding_after_deposit)}</b></div>`}
+      </div>
+      <p class="text-xs text-teal-700 mt-2 italic">${esc(data.disclosure_note || '')}</p>
+      ${data.terms_text ? `<div class="mt-3 text-xs text-slate-600 bg-white/70 rounded-lg p-3 border border-teal-100"><b>Terms summary:</b> ${esc(data.terms_text)}</div>` : ''}
+      ${data.terms_document_url ? `<p class="mt-2 text-xs"><a href="${esc(data.terms_document_url)}" target="_blank" class="text-teal-700 underline">Open uploaded agreement</a></p>` : ''}
+      <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="consent"> I consent to these configured cash / financing terms.</label>
+      <button onclick="submitBuy(${productId})" class="btn w-full mt-3 brand-bg text-white py-2.5 rounded-lg text-sm">${financing ? 'Submit Financing Application' : 'Confirm Cash Purchase'}</button>
+    </div>`
+}
+window.submitBuy = async (productId) => {
+  if (!$('consent').checked) return toast('Consent is required (Sharia requirement)', false)
+  const body = { product_id: productId, quantity: $('qty').value, payment_type: $('ptype').value, term_months: $('term') ? $('term').value : 0, delivery_location: $('dloc').value, consent: true }
+  try {
+    const { data } = await api.post('/murabaha/apply', body)
+    if (data.requires_payment) {
+      // Cash purchase -> pay now via M-Pesa STK push (full amount).
+      payModal(data.id, data.amount_due_now, data.outstanding, 'cash')
+      return
+    }
+    closeModal()
+    toast('Application submitted: ' + data.contract_ref)
+    state.route = 'contracts'; renderApp()
+  } catch (err) {
+    const d = err.response?.data
+    if (err.response?.status === 412 && d?.error === 'kyc_required') {
+      showModal(`<div class="text-center">
+        <div class="w-14 h-14 mx-auto rounded-full bg-amber-100 text-amber-600 flex items-center justify-center text-2xl mb-3"><i class="fas fa-id-card"></i></div>
+        <h3 class="text-lg font-bold mb-1">Complete User Registration</h3>
+        <p class="text-sm text-slate-600 mb-4">${esc(d.message)}</p>
+        <p class="text-xs text-slate-400 mb-4">This runs a TransUnion credit check and a liveness / ID verification.</p>
+        <button onclick="completeRegistration(${d.customer_id}, true)" class="btn w-full brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-shield-halved mr-1"></i>Complete Registration Now</button>
+        <button onclick="closeModal()" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Later</button>
+      </div>`)
+    } else { toast(d?.error || 'Failed', false) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// CONTRACTS
+// ---------------------------------------------------------------------------
+async function viewContracts() {
+  const { data } = await api.get('/murabaha')
+  $('content').innerHTML = `<div class="card table-card">
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+        <th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Customer</th><th class="text-left px-4 py-3">Product</th>
+        <th class="text-left px-4 py-3">Type</th><th class="text-right px-4 py-3">Price</th><th class="text-right px-4 py-3">Outstanding</th>
+        <th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+      <tbody>${data.contracts.map(c => `<tr class="border-t border-slate-100">
+        <td class="px-4 py-3 font-mono text-xs">${esc(c.contract_ref)}</td>
+        <td class="px-4 py-3">${esc(c.customer_name)}</td>
+        <td class="px-4 py-3">${esc(c.product_name)} ×${c.quantity}</td>
+        <td class="px-4 py-3">${payLabel(c.payment_type, c.financing_model)}</td>
+        <td class="px-4 py-3 text-right">${fmt(c.murabaha_price)}</td>
+        <td class="px-4 py-3 text-right">${fmt(c.outstanding)}</td>
+        <td class="px-4 py-3">${badge(c.status)}</td>
+        <td class="px-4 py-3"><button onclick="contractDetail(${c.id})" class="text-teal-600 hover:underline text-xs">View</button></td>
+      </tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No contracts</td></tr>'}</tbody>
+    </table></div>`
+}
+window.contractDetail = async (id) => {
+  const { data } = await api.get('/murabaha/' + id)
+  const c = data.contract
+  const canPay = state.user.role === 'customer' && c.status === 'active'
+  const canDispatch = ['admin', 'super_admin', 'operations_finance'].includes(state.user.role) && ['active', 'completed', 'awaiting_cash_balance'].includes(c.status) && c.dispatch_status !== 'dispatched'
+  const canRequest = !['admin', 'super_admin'].includes(state.user.role) && canDo('request_admin_action')
+  showModal(`
+    <div class="flex justify-between items-start mb-3">
+      <div><h3 class="text-lg font-bold">${esc(c.contract_ref)}</h3><p class="text-xs text-slate-500">${esc(c.customer_name)} · ${esc(c.product_name)}</p></div>
+      ${badge(c.status)}
+    </div>
+    <div class="grid grid-cols-2 gap-3 text-sm mb-4">
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Purchase type</p><b>${payLabel(c.payment_type, c.financing_model)}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Dispatch status</p><b>${esc((c.dispatch_status || 'pending').replace(/_/g, ' '))}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Supplier Cost</p><b>${fmt(c.supplier_cost)}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Total payable</p><b>${fmt(c.murabaha_price)}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Deposit</p><b>${Number(c.deposit_pct || 0)}% · ${fmt(c.deposit_amount || 0)}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Interest / finance rate</p><b>${Number(c.interest_rate_pct || c.markup_pct || 0)}%</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Frequency</p><b>${esc(c.payment_frequency || 'monthly')}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Installment amount</p><b>${fmt(c.installment_amount || c.monthly_payment || 0)}</b></div>
+      <div class="bg-teal-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Outstanding</p><b>${fmt(c.outstanding)}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Terms</p><b>${c.term_months || 0} month(s)</b></div>
+    </div>
+    ${c.terms_text ? `<div class="text-xs text-slate-600 bg-slate-50 p-3 rounded-lg mb-4 border border-slate-200"><b>Configured terms:</b> ${esc(c.terms_text)}</div>` : ''}
+    ${data.repayments.length ? `<h4 class="font-semibold text-sm mb-2">Repayment Schedule</h4>
+    <table class="w-full text-xs mb-4"><thead class="text-slate-400"><tr><th class="text-left">#</th><th class="text-left">Due</th><th class="text-right">Amount</th><th class="text-right">Paid</th><th>Status</th></tr></thead>
+    <tbody>${data.repayments.map(r => `<tr class="border-t border-slate-100"><td>${r.installment_no}</td><td>${r.due_date}</td><td class="text-right">${fmt(r.amount_due)}</td><td class="text-right">${fmt(r.amount_paid)}</td><td class="text-center">${badge(r.status)}</td></tr>`).join('')}</tbody></table>` : ''}
+    <div class="flex flex-wrap gap-2">
+      ${canPay ? `<button onclick="payModal(${c.id}, ${c.monthly_payment || c.installment_amount || c.outstanding}, ${c.outstanding})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-mobile-alt mr-1"></i>Pay via M-Pesa</button>` : ''}
+      ${canDispatch ? `<button onclick="dispatchContract(${c.id})" class="btn flex-1 bg-emerald-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-truck mr-1"></i>Dispatch Equipment</button>` : ''}
+      ${canRequest ? `<button onclick="requestChangeModal('contract', ${c.id}, 'amend contract')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Request Admin Change</button>` : ''}
+      <button onclick="viewDoc(${c.id})" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-pdf mr-1"></i>Documents</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
+    </div>`)
+}
+window.dispatchContract = async (id) => {
+  try {
+    await api.post(`/murabaha/${id}/dispatch`, {})
+    toast('Equipment dispatched')
+    closeModal(); viewContracts()
+  } catch (err) { toast(err.response?.data?.error || 'Dispatch failed', false) }
+}
+window.payModal = async (id, amount, outstanding, kind) => {
+  kind = kind || 'repay'
+  const isCash = kind === 'cash'
+  let mpMode = { mode: 'simulation', live: false }, spMode = { mode: 'simulation', live: false }, bnMode = { mode: 'simulation', live: false }
+  try { mpMode = (await api.get('/mpesa/status')).data } catch {}
+  try { spMode = (await api.get('/sasapay/status')).data } catch {}
+  try { bnMode = (await api.get('/buni/status')).data } catch {}
+  const modeBadge = (m) => m.live
+    ? `<span class="text-[10px] text-emerald-700">live · ${esc(m.mode)}</span>`
+    : `<span class="text-[10px] text-amber-700">simulation</span>`
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-mobile-alt text-teal-600 mr-2"></i>${isCash ? 'Cash Checkout' : 'Repayment'}</h3>
+    <p class="text-xs text-slate-500 mb-3">${isCash ? 'Amount due' : 'Outstanding'}: ${fmt(outstanding)}</p>
+    <label class="text-sm font-medium block mb-2">Choose payment method</label>
+    <div class="grid grid-cols-3 gap-2 mb-3">
+      <label class="border rounded-lg p-2 text-center cursor-pointer bg-emerald-50 border-emerald-300 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500">
+        <input type="radio" name="paymethod" value="mpesa" checked class="hidden">
+        <i class="fas fa-mobile-screen-button text-emerald-600 text-lg block"></i>
+        <span class="text-xs font-medium">M-Pesa</span><div>${modeBadge(mpMode)}</div>
+      </label>
+      <label class="border rounded-lg p-2 text-center cursor-pointer bg-blue-50 border-blue-300 has-[:checked]:ring-2 has-[:checked]:ring-blue-500">
+        <input type="radio" name="paymethod" value="sasapay" class="hidden">
+        <i class="fas fa-wallet text-blue-600 text-lg block"></i>
+        <span class="text-xs font-medium">SasaPay</span><div>${modeBadge(spMode)}</div>
+      </label>
+      <label class="border rounded-lg p-2 text-center cursor-pointer bg-amber-50 border-amber-300 has-[:checked]:ring-2 has-[:checked]:ring-amber-500">
+        <input type="radio" name="paymethod" value="buni" class="hidden">
+        <i class="fas fa-building-columns text-amber-700 text-lg block"></i>
+        <span class="text-xs font-medium">KCB Buni</span><div>${modeBadge(bnMode)}</div>
+      </label>
+    </div>
+    <label class="text-sm font-medium">Phone</label><input id="mpphone" value="${esc(state.user.phone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg">
+    <label class="text-sm font-medium">Amount (KES)</label><input id="mpamt" type="number" value="${amount}" ${isCash ? 'readonly' : ''} class="w-full mt-1 mb-4 px-3 py-2 border border-slate-300 rounded-lg ${isCash ? 'bg-slate-50' : ''}">
+    <div id="payStatus"></div>
+    <div class="flex gap-2"><button id="payBtn" onclick="doPay(${id}, '${kind}')" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Send Payment Prompt</button>
+    <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doPay = async (id, kind) => {
+  const isCash = kind === 'cash'
+  const method = document.querySelector('input[name="paymethod"]:checked')?.value || 'mpesa'
+  const endpoint = method === 'sasapay' ? '/sasapay/stkpush' : method === 'buni' ? '/buni/stkpush' : '/mpesa/stkpush'
+  const confirmEndpoint = method === 'sasapay' ? '/sasapay/confirm' : method === 'buni' ? '/buni/confirm' : '/mpesa/confirm'
+  const methodLabel = method === 'sasapay' ? 'SasaPay' : method === 'buni' ? 'KCB Buni' : 'M-Pesa'
+  const btn = $('payBtn'); btn.disabled = true; btn.classList.add('opacity-50')
+  $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Sending ${methodLabel} STK push...</div>`
+  try {
+    const { data } = await api.post(endpoint, { contract_id: id, amount: $('mpamt').value, phone: $('mpphone').value })
+    $('payStatus').innerHTML = `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'STK push sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Waiting for ${methodLabel} confirmation...</div>`
+    let tries = 0
+    const poll = async () => {
+      tries++
+      try {
+        const { data: cd } = await api.post(confirmEndpoint, { checkout_request_id: data.checkout_request_id })
+        if (cd.status === 'success') { closeModal(); toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt); state.route = 'contracts'; renderApp(); return }
+        else if (cd.status === 'failed') { $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(cd.result_desc || 'Payment failed')}</div>`; btn.disabled = false; btn.classList.remove('opacity-50'); return }
+      } catch (e) {}
+      if (tries < 20) setTimeout(poll, 3000)
+      else { $('payStatus').innerHTML = '<div class="text-xs text-amber-600 mb-3">Timed out waiting. Check Contracts later.</div>'; btn.disabled = false; btn.classList.remove('opacity-50') }
+    }
+    setTimeout(poll, data.simulated ? 1200 : 4000)
+  } catch (err) {
+    $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || 'Payment failed')}</div>`
+    btn.disabled = false; btn.classList.remove('opacity-50')
+  }
+}
+window.viewDoc = async (id) => {
+  const { data } = await api.get('/documents/contract/' + id)
+  const c = data.contract
+  showModal(`<div class="text-center">
+    <h3 class="font-bold text-lg">Murabaha Agreement</h3>
+    <p class="text-xs text-slate-500 mb-3">${esc(c.contract_ref)}</p>
+    <img src="${data.qr}" class="mx-auto mb-3" alt="QR">
+    <div class="text-left text-sm bg-slate-50 p-4 rounded-lg space-y-1">
+      <p><b>Customer:</b> ${esc(c.customer_name)} (ID ${esc(c.national_id || '—')})</p>
+      <p><b>Product:</b> ${esc(c.product_name)} ×${c.quantity}</p>
+      <p><b>Supplier Cost:</b> ${fmt(c.supplier_cost)} · <b>Markup:</b> ${c.markup_pct}%</p>
+      <p><b>Murabaha Price (fixed):</b> ${fmt(c.murabaha_price)}</p>
+      <p class="text-xs italic text-slate-500 pt-2">Compliant with Murabaha principles. No interest, penalties, or compounding applied.</p>
+    </div>
+    <button onclick="window.print()" class="btn mt-4 bg-slate-800 text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-print mr-1"></i>Print / Save PDF</button>
+    <button onclick="closeModal()" class="btn mt-4 ml-2 bg-slate-100 px-5 py-2 rounded-lg text-sm">Close</button>
+  </div>`)
+}
+
+// ---------------------------------------------------------------------------
+// APPROVALS (admin)
+// ---------------------------------------------------------------------------
+async function viewApprovals() {
+  const { data } = await api.get('/murabaha')
+  const pending = data.contracts.filter(c => c.status === 'pending')
+  $('content').innerHTML = `<div class="card table-card"><table class="w-full text-sm">
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Customer</th><th class="text-left px-4 py-3">Product</th><th class="text-right px-4 py-3">Price</th><th class="text-left px-4 py-3">Term</th><th></th></tr></thead>
+    <tbody>${pending.map(c => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3 font-mono text-xs">${esc(c.contract_ref)}</td><td class="px-4 py-3">${esc(c.customer_name)}</td>
+      <td class="px-4 py-3">${esc(c.product_name)} ×${c.quantity}</td><td class="px-4 py-3 text-right">${fmt(c.murabaha_price)}</td>
+      <td class="px-4 py-3">${c.term_months}mo</td>
+      <td class="px-4 py-3 text-right whitespace-nowrap">
+        <button onclick="contractDetail(${c.id})" class="text-slate-500 hover:underline text-xs mr-3">Review</button>
+        <button onclick="decide(${c.id},'approve')" class="text-emerald-600 hover:underline text-xs mr-2"><i class="fas fa-check"></i> Approve</button>
+        <button onclick="decide(${c.id},'reject')" class="text-red-600 hover:underline text-xs"><i class="fas fa-xmark"></i> Reject</button>
+      </td></tr>`).join('') || '<tr><td colspan="6" class="text-center py-8 text-slate-400">No pending approvals</td></tr>'}</tbody>
+  </table></div>`
+}
+window.decide = async (id, action) => {
+  if (!confirmEdit(`Confirm ${action} for this financing contract?`)) return
+  try { await api.post(`/murabaha/${id}/decision`, { action }); toast('Contract ' + action + 'd'); viewApprovals() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// ---------------------------------------------------------------------------
+// INVENTORY (admin CRUD + image)
+// ---------------------------------------------------------------------------
+function productForm(prefix, p = {}) {
+  const paymentMode = p.payment_option_mode || (p.cash_enabled && p.financing_enabled ? 'both' : p.cash_enabled ? 'cash' : 'financing') || 'both'
+  return `
+    <div class="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-600 mb-4"><i class="fas fa-circle-info text-teal-600 mr-1"></i>Use the labeled fields below to collect or update inventory clearly: identify the equipment, capture stock levels, then define cash and financing terms.</div>
+    <div class="flex items-center gap-3 mb-4">
+      <div id="${prefix}_preview">${p.id ? prodImg(p, 'w-16 h-16 rounded-lg') : '<div class="w-16 h-16 rounded-lg bg-slate-100 flex items-center justify-center text-slate-400"><i class="fas fa-image"></i></div>'}</div>
+      <div class="space-y-2">
+        <label class="btn bg-slate-100 px-3 py-2 rounded-lg text-xs cursor-pointer"><i class="fas fa-upload mr-1"></i>Upload equipment image<input type="file" accept="image/*" class="hidden" onchange="pickImage(this,'${prefix}_img','${prefix}_preview')"></label>
+        <div class="text-[11px] text-slate-400">Agreement files can be uploaded as an image or PDF and saved with the equipment record.</div>
+      </div>
+    </div>
+    <input type="hidden" id="${prefix}_img" value="${esc(p.image || '')}">
+    <div class="responsive-grid cols-2 text-sm">
+      <div><label class="field-label">Equipment SKU</label><input id="${prefix}_sku" value="${esc(p.sku || '')}" placeholder="SKU" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Equipment name</label><input id="${prefix}_name" value="${esc(p.name || '')}" placeholder="Equipment name" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Inventory category</label><input id="${prefix}_cat" value="${esc(p.category || 'Equipment')}" placeholder="Category" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Stock unit</label><input id="${prefix}_unit" value="${esc(p.unit || 'unit')}" placeholder="Unit" class="px-3 py-2 border rounded-lg"></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Equipment description</label><textarea id="${prefix}_desc" placeholder="Equipment details / description" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.description || '')}</textarea></div>
+      <div><label class="field-label">Buying cost</label><input id="${prefix}_buy" type="number" value="${Number(p.buying_price || 0)}" placeholder="Buying price" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Quantity in stock</label><input id="${prefix}_qty" type="number" value="${Number(p.quantity || 0)}" placeholder="Quantity" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Cash markup %</label><input id="${prefix}_cm" type="number" value="${Number(p.cash_markup_pct || 10)}" placeholder="Cash markup %" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Financing markup %</label><input id="${prefix}_crm" type="number" value="${Number(p.credit_markup_pct || 20)}" placeholder="Financing markup %" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Reorder threshold</label><input id="${prefix}_rt" type="number" value="${Number(p.reorder_threshold || 10)}" placeholder="Reorder threshold" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">TransUnion product code</label><input id="${prefix}_tu" value="${esc(p.transunion_product_code || '')}" placeholder="TransUnion product code" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Payment availability</label><select id="${prefix}_mode" class="px-3 py-2 border rounded-lg">
+        <option value="both" ${paymentMode === 'both' ? 'selected' : ''}>Cash + Financing</option>
+        <option value="cash" ${paymentMode === 'cash' ? 'selected' : ''}>Cash only</option>
+        <option value="financing" ${paymentMode === 'financing' ? 'selected' : ''}>Financing only</option>
+      </select></div>
+      <div><label class="field-label">Financing model</label><select id="${prefix}_fin_model" class="px-3 py-2 border rounded-lg">
+        <option value="loan_interest" ${(p.financing_model || 'loan_interest') === 'loan_interest' ? 'selected' : ''}>Normal financing with interest</option>
+        <option value="paygo" ${(p.financing_model || '') === 'paygo' ? 'selected' : ''}>PAYGO (M-KOPA style)</option>
+      </select></div>
+      <div><label class="field-label">Interest / finance rate %</label><input id="${prefix}_int" type="number" value="${Number(p.financing_interest_pct || 0)}" placeholder="Interest rate %" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Repayment frequency</label><select id="${prefix}_freq" class="px-3 py-2 border rounded-lg">
+        ${['daily','weekly','monthly'].map(v => `<option value="${v}" ${(p.financing_frequency || 'monthly') === v ? 'selected' : ''}>${v}</option>`).join('')}
+      </select></div>
+      <div><label class="field-label">Minimum term (months)</label><input id="${prefix}_tmin" type="number" value="${Number(p.financing_term_min_months || 3)}" placeholder="Minimum term (months)" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Maximum term (months)</label><input id="${prefix}_tmax" type="number" value="${Number(p.financing_term_max_months || 12)}" placeholder="Maximum term (months)" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Cash deposit %</label><input id="${prefix}_cash_dep" type="number" value="${Number(p.cash_deposit_pct ?? 100)}" placeholder="Cash deposit % (0/10/100)" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" type="number" value="${Number(p.financing_deposit_pct ?? 10)}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Cash terms summary</label><textarea id="${prefix}_cash_terms" placeholder="Cash terms summary" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.cash_terms_text || '')}</textarea></div>
+      <div><label class="field-label">Financing / PAYGO terms summary</label><textarea id="${prefix}_fin_terms" placeholder="Financing / PAYGO terms summary" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.financing_terms_text || '')}</textarea></div>
+      <div style="grid-column:1 / -1" class="responsive-grid cols-2">
+        <div class="border rounded-xl p-3 bg-slate-50">
+          <div class="font-medium text-slate-700 mb-2">Cash agreement</div>
+          <input id="${prefix}_cash_doc" value="${esc(p.cash_terms_doc_url || '')}" placeholder="Cash agreement URL / uploaded file data" class="w-full px-3 py-2 border rounded-lg text-xs">
+          <div class="flex items-center justify-between gap-2 mt-2">
+            <label class="btn bg-white px-3 py-2 rounded-lg text-xs cursor-pointer border"><i class="fas fa-file-upload mr-1"></i>Upload<input type="file" accept="image/*,application/pdf" class="hidden" onchange="pickFileDataUrl(this,'${prefix}_cash_doc','${prefix}_cash_doc_name')"></label>
+            <span id="${prefix}_cash_doc_name" class="text-[11px] text-slate-400 truncate">${p.cash_terms_doc_url ? 'existing document attached' : 'no file selected'}</span>
+          </div>
+        </div>
+        <div class="border rounded-xl p-3 bg-slate-50">
+          <div class="font-medium text-slate-700 mb-2">Financing / PAYGO agreement</div>
+          <input id="${prefix}_fin_doc" value="${esc(p.financing_terms_doc_url || '')}" placeholder="Financing agreement URL / uploaded file data" class="w-full px-3 py-2 border rounded-lg text-xs">
+          <div class="flex items-center justify-between gap-2 mt-2">
+            <label class="btn bg-white px-3 py-2 rounded-lg text-xs cursor-pointer border"><i class="fas fa-file-upload mr-1"></i>Upload<input type="file" accept="image/*,application/pdf" class="hidden" onchange="pickFileDataUrl(this,'${prefix}_fin_doc','${prefix}_fin_doc_name')"></label>
+            <span id="${prefix}_fin_doc_name" class="text-[11px] text-slate-400 truncate">${p.financing_terms_doc_url ? 'existing document attached' : 'no file selected'}</span>
+          </div>
+        </div>
+      </div>
+    </div>`
+}
+function productPayload(prefix) {
+  const mode = $(prefix + '_mode').value
+  return {
+    sku: $(prefix + '_sku').value,
+    name: $(prefix + '_name').value,
+    category: $(prefix + '_cat').value,
+    description: $(prefix + '_desc').value,
+    product_type: 'equipment',
+    unit: $(prefix + '_unit').value,
+    buying_price: Number($(prefix + '_buy').value || 0),
+    quantity: Number($(prefix + '_qty').value || 0),
+    cash_markup_pct: Number($(prefix + '_cm').value || 0),
+    credit_markup_pct: Number($(prefix + '_crm').value || 0),
+    reorder_threshold: Number($(prefix + '_rt').value || 10),
+    image: $(prefix + '_img').value || null,
+    payment_option_mode: mode,
+    cash_enabled: mode !== 'financing',
+    financing_enabled: mode !== 'cash',
+    financing_model: $(prefix + '_fin_model').value,
+    financing_interest_pct: Number($(prefix + '_int').value || 0),
+    financing_frequency: $(prefix + '_freq').value,
+    financing_term_min_months: Number($(prefix + '_tmin').value || 3),
+    financing_term_max_months: Number($(prefix + '_tmax').value || 12),
+    cash_deposit_pct: Number($(prefix + '_cash_dep').value || 100),
+    financing_deposit_pct: Number($(prefix + '_fin_dep').value || 10),
+    cash_terms_text: $(prefix + '_cash_terms').value || null,
+    financing_terms_text: $(prefix + '_fin_terms').value || null,
+    cash_terms_doc_url: $(prefix + '_cash_doc').value || null,
+    financing_terms_doc_url: $(prefix + '_fin_doc').value || null,
+    transunion_product_code: $(prefix + '_tu').value || null
+  }
+}
+async function viewInventory() {
+  const { data } = await api.get('/products')
+  _products = data.products
+  $('content').innerHTML = `
+  <div class="flex justify-end mb-4"><button onclick="addProductModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Add Equipment</button></div>
+  <div class="card table-card"><table class="w-full text-sm">
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Equipment</th><th class="text-left px-4 py-3">Payment Options</th><th class="text-left px-4 py-3">Financing</th><th class="text-right px-4 py-3">Cash Deposit</th><th class="text-right px-4 py-3">Finance Deposit</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
+    <tbody>${data.products.map(p => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-2">${prodImg(p, 'w-10 h-10 rounded-lg')}</td>
+      <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || 'Equipment')}</div></td>
+      <td class="px-4 py-3">${esc((p.payment_option_mode || 'both').replace('_', ' '))}</td>
+      <td class="px-4 py-3">${esc(p.financing_model === 'paygo' ? 'PAYGO' : 'Interest financing')}<div class="text-xs text-slate-400">${Number(p.financing_interest_pct || 0)}% · ${esc(p.financing_frequency || 'monthly')}</div></td>
+      <td class="px-4 py-3 text-right">${Number(p.cash_deposit_pct ?? 100)}%</td>
+      <td class="px-4 py-3 text-right">${Number(p.financing_deposit_pct ?? 10)}%</td>
+      <td class="px-4 py-3 text-right">${p.quantity} ${esc(p.unit)}</td>
+      <td class="px-4 py-3 whitespace-nowrap text-right">
+        <button onclick="editProductModal(${p.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>
+        <button onclick="restockModal(${p.id},'${esc(p.name)}')" class="text-slate-500 hover:underline text-xs mr-2">Restock</button>
+        <button onclick="deleteProduct(${p.id},'${esc(p.name)}')" class="text-red-600 hover:underline text-xs">Delete</button>
+      </td></tr>`).join('')}</tbody>
+  </table></div>`
+}
+window.pickImage = (input, targetId, previewId) => {
+  const file = input.files[0]; if (!file) return
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    const img = new Image()
+    img.onload = () => {
+      const max = 600, scale = Math.min(1, max / Math.max(img.width, img.height))
+      const canvas = document.createElement('canvas')
+      canvas.width = img.width * scale; canvas.height = img.height * scale
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height)
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.8)
+      $(targetId).value = dataUrl
+      $(previewId).innerHTML = `<img src="${dataUrl}" class="w-16 h-16 rounded-lg object-cover">`
+    }
+    img.src = e.target.result
+  }
+  reader.readAsDataURL(file)
+}
+window.addProductModal = () => {
+  showModal(`<h3 class="font-bold mb-3">Add Equipment</h3>${productForm('np')}<div class="flex gap-2 mt-4"><button onclick="doAddProduct()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doAddProduct = async () => {
+  try {
+    await api.post('/products', productPayload('np'))
+    closeModal(); toast('Equipment added'); viewInventory()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.editProductModal = (id) => {
+  const p = _products.find(x => x.id === id)
+  showModal(`<h3 class="font-bold mb-3">Edit Equipment</h3>${productForm('ep', p)}<div class="flex gap-2 mt-4"><button onclick="doEditProduct(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doEditProduct = async (id) => {
+  if (!confirmEdit('Save changes to this equipment record?')) return
+  try {
+    await api.put('/products/' + id, productPayload('ep'))
+    closeModal(); toast('Equipment updated'); viewInventory()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.deleteProduct = async (id, name) => {
+  if (!confirmDelete('Delete product "' + name + '"? This cannot be undone.')) return
+  try { await api.delete('/products/' + id); toast('Product deleted'); viewInventory() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.restockModal = (id, name) => {
+  showModal(`<h3 class="font-bold mb-3">Restock: ${name}</h3>
+    <label class="text-sm">Quantity to add</label><input id="rq" type="number" value="10" class="w-full mt-1 mb-4 px-3 py-2 border border-slate-300 rounded-lg">
+    <div class="flex gap-2"><button onclick="doRestock(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Add Stock</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doRestock = async (id) => {
+  if (!confirmEdit(`Confirm inventory update and add ${$('rq').value || 0} unit(s) to stock?`)) return
+  await api.put(`/products/${id}/stock`, { quantity: Number($('rq').value), movement_type: 'purchase' })
+  closeModal(); toast('Stock updated'); viewInventory()
+}
+
+// ---------------------------------------------------------------------------
+// CUSTOMERS + Complete Registration (TransUnion + Selfie Upload)
+// ---------------------------------------------------------------------------
+async function viewCustomers() {
+  const { data } = await api.get('/customers')
+  _customers = data.customers || []
+  const isAdmin = ['admin', 'super_admin'].includes(state.user.role)
+  const canEditFarmers = isAdmin || state.user.role === 'agent'
+  const actionBar = canDo('add_farmer') || isAdmin
+    ? `<div class="action-bar"><button onclick="viewOnboard()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Farmer</button></div>`
+    : ''
+  $('content').innerHTML = `${actionBar}<div class="card table-card"><table class="w-full text-sm">
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Farmer</th><th class="text-left px-4 py-3">Mobile</th><th class="text-left px-4 py-3">County</th><th class="text-left px-4 py-3">Value Chain</th><th class="text-left px-4 py-3">KYC</th><th class="text-left px-4 py-3">Profile Status</th><th class="text-left px-4 py-3">Risk</th><th></th></tr></thead>
+    <tbody>${_customers.map(c => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3"><div class="font-medium">${esc(c.full_name)}</div><div class="text-xs text-slate-400">ID ${esc(c.national_id || '—')}</div></td>
+      <td class="px-4 py-3">${esc(c.mobile || '—')}</td>
+      <td class="px-4 py-3">${esc(c.county || '—')}</td>
+      <td class="px-4 py-3">${esc(c.value_chain || '—')}</td>
+      <td class="px-4 py-3">${badge(c.kyc_status)}</td>
+      <td class="px-4 py-3">${badge(c.status || 'active')}</td>
+      <td class="px-4 py-3">${c.risk_band ? badge(c.risk_band) : '—'}</td>
+      <td class="px-4 py-3 whitespace-nowrap text-right">
+        <button onclick="custDetail(${c.id})" class="text-slate-500 hover:underline text-xs mr-2">View</button>
+        ${canEditFarmers ? `<button onclick="editCustomerModal(${c.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>` : ''}
+        ${c.kyc_status !== 'verified' ? `<button onclick="completeRegistration(${c.id})" class="text-blue-600 hover:underline text-xs mr-2"><i class="fas fa-id-card mr-1"></i>Complete Registration</button>` : ''}
+        ${isAdmin ? `${(c.status || 'active') === 'active' ? `<button onclick="setCustomerStatus(${c.id},'suspended','${esc(c.full_name)}')" class="text-amber-600 hover:underline text-xs mr-2">Suspend</button>` : `<button onclick="setCustomerStatus(${c.id},'active','${esc(c.full_name)}')" class="text-emerald-600 hover:underline text-xs mr-2">Activate</button>`}<button onclick="deleteCustomer(${c.id},'${esc(c.full_name)}')" class="text-red-600 hover:underline text-xs">Delete</button>` : ''}
+      </td></tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No customers</td></tr>'}</tbody>
+  </table></div>`
+}
+window.custDetail = async (id) => {
+  const { data } = await api.get('/customers/' + id)
+  const c = data.customer, tu = data.transunion, idv = data.id_verification
+  const isAdmin = ['admin', 'super_admin'].includes(state.user.role)
+  const canEditFarmers = isAdmin || state.user.role === 'agent'
+  showModal(`
+    <h3 class="text-lg font-bold mb-1">${esc(c.full_name)}</h3>
+    <p class="text-xs text-slate-500 mb-4">ID ${esc(c.national_id || '—')} · ${esc(c.mobile || '—')} · ${esc(c.county || '')}</p>
+    <div class="responsive-grid cols-2 text-sm mb-4">
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Value Chain</p><b>${esc(c.value_chain_type || '—')} / ${esc(c.value_chain || '—')}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">KYC Status</p>${badge(c.kyc_status)}</div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Profile Status</p>${badge(c.status || 'active')}</div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Current Loan Amount</p><b>${esc(c.existing_loans || '—')}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">GPS</p><b>${c.latitude ? c.latitude + ', ' + c.longitude : '—'}</b></div>
+      <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">SACCO Member</p><b>${esc((c.sacco_membership || 'no').toUpperCase())}</b></div>
+    </div>
+    <div class="border rounded-xl p-4 mb-4 ${tu ? 'border-emerald-200 bg-emerald-50' : 'border-slate-200'}">
+      <h4 class="font-semibold text-sm mb-2"><i class="fas fa-chart-line mr-1 text-teal-600"></i>TransUnion Credit Check</h4>
+      ${tu ? `<div class="text-sm flex flex-wrap gap-4"><span>Score: <b>${tu.credit_score}</b></span><span>Band: ${badge(tu.risk_band)}</span><span>Defaults: <b>${tu.defaults_found}</b></span></div>` : '<p class="text-xs text-slate-400">Not yet run.</p>'}
+    </div>
+    <div class="border rounded-xl p-4 mb-4 ${idv ? 'border-emerald-200 bg-emerald-50' : 'border-slate-200'}">
+      <h4 class="font-semibold text-sm mb-2"><i class="fas fa-id-card mr-1 text-teal-600"></i>ID & Selfie Verification</h4>
+      ${idv ? `<div class="text-sm flex flex-wrap gap-4"><span>Face match: <b>${idv.face_match ? '✓' : '✗'}</b></span><span>Liveness: <b>${idv.liveness ? '✓' : '✗'}</b></span><span>Status: ${badge(idv.status)}</span></div>` : '<p class="text-xs text-slate-400">Not yet run.</p>'}
+    </div>
+    ${c.id_front_url ? `<div class="responsive-grid cols-2 mb-3"><img src="${esc(c.id_front_url)}" class="w-full h-32 object-cover rounded-lg border"><img src="${esc(c.id_back_url || c.id_front_url)}" class="w-full h-32 object-cover rounded-lg border"></div>` : '<p class="text-xs text-amber-600 mb-3">National ID images not uploaded yet.</p>'}
+    <div class="action-bar mt-4">
+      ${c.kyc_status !== 'verified' ? `<button onclick="completeRegistration(${c.id})" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-shield-halved mr-1"></i>Complete Registration</button>` : ''}
+      ${canEditFarmers ? `<button onclick="closeModal();editCustomerModal(${c.id})" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Edit Profile</button>` : ''}
+      ${isAdmin ? `${(c.status || 'active') === 'active' ? `<button onclick="closeModal();setCustomerStatus(${c.id},'suspended','${esc(c.full_name)}')" class="btn bg-amber-100 text-amber-800 px-4 py-2 rounded-lg text-sm">Suspend Farmer</button>` : `<button onclick="closeModal();setCustomerStatus(${c.id},'active','${esc(c.full_name)}')" class="btn bg-emerald-100 text-emerald-800 px-4 py-2 rounded-lg text-sm">Activate Farmer</button>`}<button onclick="closeModal();deleteCustomer(${c.id},'${esc(c.full_name)}')" class="btn bg-red-100 text-red-700 px-4 py-2 rounded-lg text-sm">Delete Farmer</button>` : ''}
+      <button onclick="closeModal()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Close</button>
+    </div>`)
+}
+window.editCustomerModal = (id) => {
+  const c = _customers.find((x) => x.id === id)
+  if (!c) return toast('Farmer record not loaded', false)
+  showModal(`<h3 class="font-bold mb-1">Edit Farmer Profile</h3>
+    <p class="text-xs text-slate-500 mb-3">Update the farmer profile, then confirm before saving the changes.</p>
+    <div class="responsive-grid cols-2 text-sm">
+      <div><label class="field-label">Full name</label><input id="cf_name" value="${esc(c.full_name || '')}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">National ID</label><input id="cf_id" value="${esc(c.national_id || '')}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Mobile number</label><input id="cf_mobile" value="${esc(c.mobile || '')}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Alternative number</label><input id="cf_alt_mobile" value="${esc(c.alt_mobile || '')}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">County</label><input id="cf_county" value="${esc(c.county || '')}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Value chain</label><input id="cf_value_chain" value="${esc(c.value_chain || '')}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Current loan amount</label><input id="cf_loans" value="${esc(c.existing_loans || '')}" class="px-3 py-2 border rounded-lg" placeholder="Loan amount"></div>
+      <div><label class="field-label">SACCO membership</label><select id="cf_sacco" class="px-3 py-2 border rounded-lg"><option value="yes" ${(c.sacco_membership || '').toLowerCase() === 'yes' ? 'selected' : ''}>Yes</option><option value="no" ${(c.sacco_membership || '').toLowerCase() !== 'yes' ? 'selected' : ''}>No</option></select></div>
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="doEditCustomer(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Farmer Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doEditCustomer = async (id) => {
+  if (!confirmEdit('Save changes to this farmer profile?')) return
+  try {
+    await api.put('/customers/' + id, {
+      full_name: $('cf_name').value,
+      national_id: $('cf_id').value,
+      mobile: $('cf_mobile').value,
+      alt_mobile: $('cf_alt_mobile').value,
+      county: $('cf_county').value,
+      value_chain: $('cf_value_chain').value,
+      existing_loans: $('cf_loans').value,
+      sacco_membership: $('cf_sacco').value
+    })
+    closeModal(); toast('Farmer profile updated'); viewCustomers()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.setCustomerStatus = async (id, status, name) => {
+  if (!confirmStatus(`${status === 'active' ? 'Activate' : 'Suspend'} farmer profile for "${name}"?`)) return
+  try { await api.put(`/customers/${id}/status`, { status }); toast('Farmer status updated'); viewCustomers() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.deleteCustomer = async (id, name) => {
+  if (!confirmDelete(`Delete farmer profile for "${name}"? This also removes the linked farmer account.`)) return
+  try { await api.delete('/customers/' + id); toast('Farmer deleted'); viewCustomers() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.stopLive = () => {}
+window.completeRegistration = async (id, returnToShop) => {
+  let customer = {}
+  try { const { data } = await api.get('/customers/' + id); customer = data.customer || {} } catch {}
+  const hasFront = !!customer.id_front_url
+  const hasBack = !!customer.id_back_url
+  showModal(`<div>
+    <h3 class="text-lg font-bold mb-1"><i class="fas fa-camera text-teal-600 mr-2"></i>ID / Selfie Verification</h3>
+    <p class="text-xs text-slate-500 mb-4">Capture in this order: ID front → ID back → passport photo/selfie.</p>
+    <div class="space-y-4">
+      ${kycStepCard({ sectionId: 'cr_front_section', title: 'Step 1 — National ID front', subtitle: 'Upload from gallery or use the back camera.', previewId: 'cr_front_preview', statusId: 'cr_front_status', hiddenId: 'cr_id_front_url', galleryId: 'cr_front_gallery', cameraId: 'cr_front_camera', cameraFacing: 'environment', cameraLabel: 'Open back camera', nextSectionId: 'cr_back_section', value: customer.id_front_url || '', previewHtml: customer.id_front_url ? `<img src="${esc(customer.id_front_url)}" class="w-full h-40 rounded-xl object-cover border border-slate-200">` : '', statusText: customer.id_front_url ? '<span class="text-emerald-600"><i class="fas fa-circle-check mr-1"></i>Captured</span>' : 'Required' })}
+      ${kycStepCard({ sectionId: 'cr_back_section', title: 'Step 2 — National ID back', subtitle: 'Unlocks after the front image is captured.', previewId: 'cr_back_preview', statusId: 'cr_back_status', hiddenId: 'cr_id_back_url', galleryId: 'cr_back_gallery', cameraId: 'cr_back_camera', cameraFacing: 'environment', cameraLabel: 'Open back camera', nextSectionId: 'cr_selfie_section', hidden: !hasFront, value: customer.id_back_url || '', previewHtml: customer.id_back_url ? `<img src="${esc(customer.id_back_url)}" class="w-full h-40 rounded-xl object-cover border border-slate-200">` : '', statusText: customer.id_back_url ? '<span class="text-emerald-600"><i class="fas fa-circle-check mr-1"></i>Captured</span>' : 'Required' })}
+      ${kycStepCard({ sectionId: 'cr_selfie_section', title: 'Step 3 — Passport photo / live selfie', subtitle: 'Open the front camera for liveness verification.', previewId: 'cr_selfie_preview', statusId: 'cr_selfie_status', hiddenId: 'cr_selfie_url', galleryId: 'cr_selfie_gallery', cameraId: 'cr_selfie_camera', cameraFacing: 'user', cameraLabel: 'Open front camera', hidden: !(hasFront && hasBack) })}
+    </div>
+    <div id="regStatus" class="text-xs text-slate-500 mt-4">Capture all required images, then run verification.</div>
+    <button id="captureBtn" onclick="runChecks(${id}, ${!!returnToShop})" class="btn w-full brand-bg text-white py-2.5 rounded-lg text-sm mt-4"><i class="fas fa-circle-check mr-1"></i>Verify Farmer</button>
+    <button onclick="closeModal()" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Cancel</button>
+  </div>`)
+}
+window.runChecks = async (id, returnToShop) => {
+  const btn = $('captureBtn'); if (btn) { btn.disabled = true; btn.classList.add('opacity-50') }
+  const id_front_url = $('cr_id_front_url')?.value || ''
+  const id_back_url = $('cr_id_back_url')?.value || ''
+  const selfie_url = $('cr_selfie_url')?.value || ''
+  if (!id_front_url) { $('regStatus').innerHTML = '<span class="text-amber-600">Capture the front of the ID first.</span>'; if (btn) { btn.disabled = false; btn.classList.remove('opacity-50') } return }
+  if (!id_back_url) { $('regStatus').innerHTML = '<span class="text-amber-600">Capture the back of the ID next.</span>'; if (btn) { btn.disabled = false; btn.classList.remove('opacity-50') } return }
+  if (!selfie_url) { $('regStatus').innerHTML = '<span class="text-amber-600">Take the passport photo / selfie for liveness verification.</span>'; if (btn) { btn.disabled = false; btn.classList.remove('opacity-50') } return }
+  $('regStatus').innerHTML = '<i class="fas fa-spinner fa-spin mr-1"></i>Saving ID images and running verification…'
+  try {
+    await api.put('/customers/' + id, { id_front_url, id_back_url })
+    const { data } = await api.post(`/customers/${id}/verify`, { selfie_url, liveness_mode: 'passport_photo' })
+    $('regStatus').innerHTML = `<span class="text-emerald-600">Verified ✓ Credit score ${data.credit_score} · ${data.risk_band} risk</span>`
+    setTimeout(() => {
+      closeModal(); toast(`Registration complete · Score ${data.credit_score} · ${data.risk_band} risk`)
+      if (returnToShop) { state.route = 'shop'; renderApp() }
+      else if (state.route === 'customers') viewCustomers()
+    }, 1100)
+  } catch (err) {
+    $('regStatus').innerHTML = `<span class="text-red-600">${esc(err.response?.data?.error || 'Verification failed')}</span>`
+    if (btn) { btn.disabled = false; btn.classList.remove('opacity-50') }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ONBOARD (agent)
+// ---------------------------------------------------------------------------
+function viewOnboard() {
+  $('content').innerHTML = `<div class="card p-6 max-w-3xl"><form id="onbForm" class="space-y-5">
+    <div><h3 class="font-bold text-teal-700 mb-2"><i class="fas fa-user mr-2"></i>Personal Information</h3>
+      <div class="responsive-grid cols-2 text-sm">
+        <input name="full_name" placeholder="Full Name *" required class="px-3 py-2 border rounded-lg col-span-2">
+        <input name="national_id" placeholder="National ID *" required class="px-3 py-2 border rounded-lg">
+        <input name="date_of_birth" type="date" class="px-3 py-2 border rounded-lg">
+        <select name="gender" class="px-3 py-2 border rounded-lg"><option value="">Gender</option><option>Female</option><option>Male</option></select>
+        <input name="mobile" placeholder="Mobile *" required class="px-3 py-2 border rounded-lg">
+        <input name="alt_mobile" placeholder="Alternative Number" class="px-3 py-2 border rounded-lg">
+      </div></div>
+    <div><h3 class="font-bold text-teal-700 mb-2"><i class="fas fa-map-marker-alt mr-2"></i>Location</h3>
+      <div class="responsive-grid cols-2 text-sm">
+        <input name="county" placeholder="County" class="px-3 py-2 border rounded-lg">
+        <input name="sub_county" placeholder="Sub-county" class="px-3 py-2 border rounded-lg">
+        <input name="ward" placeholder="Ward" class="px-3 py-2 border rounded-lg">
+        <input name="village" placeholder="Village" class="px-3 py-2 border rounded-lg">
+        <input name="latitude" id="lat" placeholder="Latitude" class="px-3 py-2 border rounded-lg">
+        <input name="longitude" id="lng" placeholder="Longitude" class="px-3 py-2 border rounded-lg">
+      </div>
+      <button type="button" onclick="captureGPS()" class="btn mt-2 text-xs bg-slate-100 px-3 py-1.5 rounded-lg"><i class="fas fa-location-crosshairs mr-1"></i>Auto-capture GPS</button></div>
+    <div><h3 class="font-bold text-teal-700 mb-2"><i class="fas fa-leaf mr-2"></i>Farming Profile</h3>
+      <div class="responsive-grid cols-2 text-sm">
+        <select name="value_chain_type" id="vct" onchange="updateChain()" class="px-3 py-2 border rounded-lg"><option value="">Value Chain Type</option><option value="crop">Crop</option><option value="livestock">Livestock</option></select>
+        <select name="value_chain" id="vc" class="px-3 py-2 border rounded-lg"><option value="">Select type first</option></select>
+        <input name="acreage" type="number" step="0.1" placeholder="Acreage" class="px-3 py-2 border rounded-lg">
+        <input name="herd_size" type="number" placeholder="Herd Size" class="px-3 py-2 border rounded-lg">
+        <input name="farm_experience" type="number" placeholder="Years experience" class="px-3 py-2 border rounded-lg">
+        <input name="annual_production" placeholder="Annual production" class="px-3 py-2 border rounded-lg">
+      </div></div>
+    <div><h3 class="font-bold text-teal-700 mb-2"><i class="fas fa-wallet mr-2"></i>Financial Profile</h3>
+      <div class="responsive-grid cols-2 text-sm">
+        <div><label class="field-label">Current loan amount</label><input name="existing_loans" placeholder="Loan amount" class="px-3 py-2 border rounded-lg"></div>
+        <div><label class="field-label">SACCO membership</label><select name="sacco_membership" class="px-3 py-2 border rounded-lg"><option value="no">No</option><option value="yes">Yes</option></select></div>
+      </div></div>
+    <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-700"><i class="fas fa-info-circle mr-1"></i>ID upload and manual selfie capture now happen during "Complete User Registration" — run it from the Customers page after onboarding.</div>
+    <button class="btn brand-bg text-white px-6 py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Submit Onboarding</button>
+  </form></div>`
+  $('onbForm').onsubmit = async (e) => {
+    e.preventDefault()
+    const fd = new FormData(e.target); const body = Object.fromEntries(fd.entries())
+    try { await api.post('/customers', body); toast('Customer onboarded successfully'); state.route = 'customers'; renderApp() }
+    catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+  }
+}
+window.captureGPS = () => {
+  if (!navigator.geolocation) { $('lat').value = '-0.7167'; $('lng').value = '36.4333'; return toast('Geolocation unavailable, using demo coords') }
+  navigator.geolocation.getCurrentPosition(
+    p => { $('lat').value = p.coords.latitude.toFixed(4); $('lng').value = p.coords.longitude.toFixed(4); toast('GPS captured') },
+    () => { $('lat').value = '-0.7167'; $('lng').value = '36.4333'; toast('Using demo coords (permission denied)') })
+}
+window.updateChain = () => {
+  const crops = ['Maize', 'Beans', 'Wheat', 'Rice', 'Sorghum', 'Tomatoes', 'Onion', 'Avocado', 'Mango', 'Coffee', 'Tea', 'Other']
+  const ls = ['Dairy', 'Beef', 'Goat', 'Sheep', 'Poultry', 'Fish', 'Pig', 'Camel']
+  const list = $('vct').value === 'crop' ? crops : $('vct').value === 'livestock' ? ls : []
+  $('vc').innerHTML = list.length ? list.map(x => `<option>${x}</option>`).join('') : '<option value="">Select type first</option>'
+}
+
+// ---------------------------------------------------------------------------
+// AGENTS (admin CRUD)
+// ---------------------------------------------------------------------------
+async function viewAgents() {
+  const { data } = await api.get('/agents')
+  _agents = data.agents
+  $('content').innerHTML = `<div class="flex justify-end mb-4"><button onclick="addAgentModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Create Agent</button></div>
+  <div class="card table-card"><table class="w-full text-sm">
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Name</th><th class="text-left px-4 py-3">Phone</th><th class="text-left px-4 py-3">Region</th><th class="text-right px-4 py-3">Customers</th><th class="text-right px-4 py-3">Active</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+    <tbody>${data.agents.map(a => `<tr class="border-t border-slate-100"><td class="px-4 py-3 font-medium">${esc(a.full_name)}</td><td class="px-4 py-3">${esc(a.phone)}</td><td class="px-4 py-3">${esc(a.region || '—')}</td><td class="px-4 py-3 text-right">${a.customers}</td><td class="px-4 py-3 text-right">${a.active}</td><td class="px-4 py-3">${badge(a.status)}</td>
+      <td class="px-4 py-3 whitespace-nowrap text-right">
+        <button onclick="editAgentModal(${a.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>
+        <button onclick="resetUserPassword(${a.id},'${esc(a.full_name)}')" class="text-blue-600 hover:underline text-xs mr-2">Reset Password</button>
+        ${a.status === 'active' ? `<button onclick="setUserStatus(${a.id},'suspended','agents','${esc(a.full_name)}')" class="text-amber-600 hover:underline text-xs mr-2">Deactivate</button>` : `<button onclick="setUserStatus(${a.id},'active','agents','${esc(a.full_name)}')" class="text-emerald-600 hover:underline text-xs mr-2">Activate</button>`}
+        <button onclick="deleteUser(${a.id},'${esc(a.full_name)}','agents')" class="text-red-600 hover:underline text-xs">Delete</button>
+      </td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No agents</td></tr>'}</tbody>
+  </table></div>`
+}
+window.addAgentModal = () => {
+  showModal(`<h3 class="font-bold mb-1">Onboard New Agent</h3>
+    <p class="text-xs text-slate-500 mb-3">Create the agent's login. Set a password now, or leave blank to auto-generate one.</p>
+    <div class="space-y-3 text-sm">
+    <input id="ag_name" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
+    <input id="ag_phone" placeholder="Phone (07XX XXX XXX)" class="w-full px-3 py-2 border rounded-lg">
+    <input id="ag_email" placeholder="Email (optional)" class="w-full px-3 py-2 border rounded-lg">
+    <input id="ag_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
+    <input id="ag_pwd" placeholder="Password (optional — auto-generated if blank)" class="w-full px-3 py-2 border rounded-lg">
+  </div><div class="flex gap-2 mt-4"><button onclick="doAddAgent()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create Agent</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doAddAgent = async () => {
+  try {
+    const body = { full_name: $('ag_name').value, phone: $('ag_phone').value, email: $('ag_email').value, region: $('ag_region').value }
+    if ($('ag_pwd').value) body.password = $('ag_pwd').value
+    const { data } = await api.post('/agents', body)
+    closeModal()
+    showCredential('Agent Created', body.full_name, body.phone || '', data.password, data.password_was_set_by_admin)
+    viewAgents()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+// Reusable credential dialog (shows password to admin to share with the user)
+window.showCredential = (title, name, phone, password, wasSet) => {
+  showModal(`<div class="text-center">
+    <div class="w-14 h-14 mx-auto rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center text-2xl mb-3"><i class="fas fa-key"></i></div>
+    <h3 class="text-lg font-bold mb-1">${esc(title)}</h3>
+    <p class="text-sm text-slate-600 mb-3">${esc(name)}${phone ? ' · ' + esc(phone) : ''}</p>
+    <div class="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-3">
+      <p class="text-xs text-slate-500 mb-1">${wasSet ? 'Password (as you set it)' : 'Auto-generated password'}</p>
+      <p class="text-2xl font-bold tracking-widest text-slate-800">${esc(password)}</p>
+    </div>
+    <p class="text-xs text-slate-400 mb-4">Share this with the user securely. They can change it later via "Forgot password".</p>
+    <button onclick="closeModal()" class="btn w-full brand-bg text-white py-2.5 rounded-lg text-sm">Done</button></div>`)
+}
+window.resetUserPassword = async (id, name) => {
+  if (!confirm('Reset password for "' + name + '"? A new password will be generated and their current sessions ended.')) return
+  try {
+    const { data } = await api.post(`/users/${id}/reset-password`, {})
+    showCredential('Password Reset', name, '', data.new_password, false)
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.editAgentModal = (id) => {
+  const a = _agents.find(x => x.id === id)
+  showModal(`<h3 class="font-bold mb-3">Edit Agent</h3><div class="space-y-3 text-sm">
+    <input id="ea_name" value="${esc(a.full_name)}" class="w-full px-3 py-2 border rounded-lg">
+    <input id="ea_phone" value="${esc(a.phone)}" class="w-full px-3 py-2 border rounded-lg">
+    <input id="ea_email" value="${esc(a.email || '')}" placeholder="Email" class="w-full px-3 py-2 border rounded-lg">
+    <input id="ea_region" value="${esc(a.region || '')}" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
+  </div><div class="flex gap-2 mt-4"><button onclick="doEditAgent(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doEditAgent = async (id) => {
+  if (!confirmEdit('Save changes to this agent profile?')) return
+  try {
+    await api.put('/agents/' + id, { full_name: $('ea_name').value, phone: $('ea_phone').value, email: $('ea_email').value, region: $('ea_region').value })
+    closeModal(); toast('Agent updated'); viewAgents()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// ---------------------------------------------------------------------------
+// USER ACCOUNTS (admin CRUD + super-admin access templates)
+// ---------------------------------------------------------------------------
+function userRoleOptions(selected) {
+  const roles = (_permMeta.roles || []).length
+    ? (_permMeta.roles || []).map((r) => ({ key: r.role_key, label: r.label }))
+    : ['super_admin', 'admin', 'operations_finance', 'agent', 'customer', 'support'].map((r) => ({ key: r, label: roleLabel(r) }))
+  return roles.map((r) => `<option value="${r.key}" ${selected === r.key ? 'selected' : ''}>${esc(r.label)}</option>`).join('')
+}
+async function viewUsers() {
+  await ensurePermissionMeta()
+  const { data } = await api.get('/users')
+  _users = data.users
+  const accessButton = state.user.role === 'super_admin'
+    ? `<button onclick="openAccessManager()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm"><i class="fas fa-shield-halved mr-1"></i>Manage Roles & Permissions</button>`
+    : ''
+  $('content').innerHTML = `
+    <div class="action-bar">${accessButton}<button onclick="addUserModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Create User</button></div>
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Name</th><th class="text-left px-4 py-3">Label</th><th class="text-left px-4 py-3">Role</th><th class="text-left px-4 py-3">Phone</th><th class="text-left px-4 py-3">Permissions</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+      <tbody>${data.users.map(u => `<tr class="border-t border-slate-100">
+        <td class="px-4 py-3 font-medium">${esc(u.full_name)}</td>
+        <td class="px-4 py-3">${esc(u.label || '—')}</td>
+        <td class="px-4 py-3">${esc(roleLabel(u.role))}</td>
+        <td class="px-4 py-3">${esc(u.phone)}</td>
+        <td class="px-4 py-3 text-xs text-slate-500">${esc(permsText(u.permissions || {})) || '—'}</td>
+        <td class="px-4 py-3">${badge(u.status)}</td>
+        <td class="px-4 py-3 whitespace-nowrap text-right">
+          <button onclick="editUserModal(${u.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>
+          <button onclick="resetUserPassword(${u.id},'${esc(u.full_name)}')" class="text-blue-600 hover:underline text-xs mr-2">Reset Password</button>
+          ${u.status === 'active' ? `<button onclick="setUserStatus(${u.id},'suspended','users','${esc(u.full_name)}')" class="text-amber-600 hover:underline text-xs mr-2">Deactivate</button>` : `<button onclick="setUserStatus(${u.id},'active','users','${esc(u.full_name)}')" class="text-emerald-600 hover:underline text-xs mr-2">Activate</button>`}
+          <button onclick="deleteUser(${u.id},'${esc(u.full_name)}','users')" class="text-red-600 hover:underline text-xs">Delete</button>
+        </td></tr>`).join('')}</tbody>
+    </table></div>`
+}
+window.openAccessManager = async (editRoleKey = '') => {
+  await ensurePermissionMeta()
+  const role = (_permMeta.roles || []).find((r) => r.role_key === editRoleKey)
+  showModal(`<h3 class="font-bold mb-1">Roles & Permission Check-boxes</h3>
+    <p class="text-xs text-slate-500 mb-4">Super Admin can create permission check-boxes and role categories. These then appear directly in user setup.</p>
+    <div class="border rounded-xl p-4 bg-slate-50 mb-4">
+      <div class="font-semibold mb-2">Add Permission Check-box</div>
+      <div class="responsive-grid cols-2 text-sm">
+        <input id="perm_key" placeholder="permission_key" class="px-3 py-2 border rounded-lg">
+        <input id="perm_label" placeholder="Display label" class="px-3 py-2 border rounded-lg">
+        <input id="perm_category" placeholder="Category" class="px-3 py-2 border rounded-lg">
+        <input id="perm_desc" placeholder="Short description" class="px-3 py-2 border rounded-lg">
+      </div>
+      <button onclick="savePermissionCatalog()" class="btn mt-3 brand-bg text-white px-4 py-2 rounded-lg text-sm">Save Permission</button>
+      <div class="mt-3 space-y-2 max-h-40 overflow-y-auto">${(_permMeta.permissions || []).map((p) => `<div class="flex items-center justify-between gap-3 text-xs border border-slate-200 rounded-lg px-3 py-2 bg-white"><div><div class="font-medium text-slate-700">${esc(p.label)}</div><div class="text-slate-400">${esc(p.permission_key)} · ${esc(p.category || 'general')}</div></div><button onclick="deletePermissionCatalog('${esc(p.permission_key)}')" class="text-red-600 hover:underline">Delete</button></div>`).join('') || '<div class="text-xs text-slate-400">No permissions added yet.</div>'}</div>
+    </div>
+    <div class="border rounded-xl p-4 bg-slate-50">
+      <div class="font-semibold mb-2">${role ? 'Edit Role Category' : 'Add Role Category'}</div>
+      <div class="responsive-grid cols-2 text-sm">
+        <input id="role_key" value="${esc(role?.role_key || '')}" ${role?.is_system ? 'disabled' : ''} placeholder="role_key" class="px-3 py-2 border rounded-lg">
+        <input id="role_label" value="${esc(role?.label || '')}" placeholder="Display label" class="px-3 py-2 border rounded-lg">
+        <input id="role_desc" value="${esc(role?.description || '')}" placeholder="Description" class="px-3 py-2 border rounded-lg col-span-2">
+      </div>
+      <div class="mt-3">
+        <div class="field-label">Permission check-boxes shown for this role</div>
+        <div id="rt_perm_box" class="responsive-grid cols-2">${permissionChecklist('rt_perm', role?.permissions || {}, false)}</div>
+      </div>
+      <div class="flex gap-2 mt-4 flex-wrap">
+        <button onclick="saveRoleTemplate('${esc(role?.role_key || '')}')" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm">Save Role Category</button>
+        ${role && !role.is_system ? `<button onclick="deleteRoleTemplate('${esc(role.role_key)}')" class="btn bg-red-100 text-red-700 px-4 py-2 rounded-lg text-sm">Delete Role Category</button>` : ''}
+        <button onclick="openAccessManager()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">New Role</button>
+      </div>
+      <div class="mt-4 space-y-2 max-h-40 overflow-y-auto">${(_permMeta.roles || []).map((r) => `<div class="flex items-center justify-between gap-3 text-xs border border-slate-200 rounded-lg px-3 py-2 bg-white"><div><div class="font-medium text-slate-700">${esc(r.label)}</div><div class="text-slate-400">${esc(r.role_key)} · ${esc(permsText(r.permissions || {})) || 'no permissions selected'}</div></div><button onclick="openAccessManager('${esc(r.role_key)}')" class="text-teal-600 hover:underline">Edit</button></div>`).join('')}</div>
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="closeModal()" class="btn flex-1 bg-slate-100 py-2 rounded-lg text-sm">Close</button></div>`)
+}
+window.savePermissionCatalog = async () => {
+  try {
+    await api.post('/permissions', {
+      permission_key: $('perm_key').value,
+      label: $('perm_label').value,
+      category: $('perm_category').value,
+      description: $('perm_desc').value
+    })
+    _permMeta = { permissions: [], roles: [] }
+    await ensurePermissionMeta()
+    toast('Permission check-box saved')
+    openAccessManager()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.deletePermissionCatalog = async (key) => {
+  if (!confirmDelete(`Delete permission check-box "${key}"?`)) return
+  try {
+    await api.delete('/permissions/' + encodeURIComponent(key))
+    _permMeta = { permissions: [], roles: [] }
+    await ensurePermissionMeta()
+    toast('Permission deleted')
+    openAccessManager()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.saveRoleTemplate = async () => {
+  if (!confirmEdit('Save this role category and permission selection?')) return
+  try {
+    await api.post('/role-templates', {
+      role_key: $('role_key').value,
+      label: $('role_label').value,
+      description: $('role_desc').value,
+      permissions: selectedPermissions('rt_perm')
+    })
+    _permMeta = { permissions: [], roles: [] }
+    await ensurePermissionMeta()
+    closeModal(); toast('Role category saved'); viewUsers()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.deleteRoleTemplate = async (key) => {
+  if (!confirmDelete(`Delete role category "${key}"?`)) return
+  try {
+    await api.delete('/role-templates/' + encodeURIComponent(key))
+    _permMeta = { permissions: [], roles: [] }
+    await ensurePermissionMeta()
+    closeModal(); toast('Role category deleted'); viewUsers()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.addUserModal = async () => {
+  await ensurePermissionMeta()
+  const defaultRole = getRoleTemplate('agent')?.role_key || 'agent'
+  const allowCustomPerms = state.user.role === 'super_admin'
+  showModal(`<h3 class="font-bold mb-1">Create User Account</h3>
+    <p class="text-xs text-slate-500 mb-3">Choose the user category, label, and permission check-boxes that should apply.</p>
+    <div class="space-y-3 text-sm">
+      <input id="nu_name" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
+      <input id="nu_phone" placeholder="Phone" class="w-full px-3 py-2 border rounded-lg">
+      <input id="nu_email" placeholder="Email (optional)" class="w-full px-3 py-2 border rounded-lg">
+      <select id="nu_role" class="w-full px-3 py-2 border rounded-lg">${userRoleOptions(defaultRole)}</select>
+      <input id="nu_label" placeholder="Label (for example: Western Cluster Agent)" class="w-full px-3 py-2 border rounded-lg">
+      <input id="nu_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
+      <input id="nu_pwd" placeholder="Password (optional — auto-generated if blank)" class="w-full px-3 py-2 border rounded-lg">
+      <div><div class="field-label">Permission check-boxes</div><div id="nu_perm_box" class="responsive-grid cols-2">${permissionChecklist('nu_perm', templatePermissions(defaultRole), !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Toggle the exact permissions to assign to this user.' : 'Only Super Admin can customize the check-box selection. Admin users see role-based defaults.'}</div></div>
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="doAddUser()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create User</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  $('nu_role').onchange = () => refreshPermissionChecklist('nu_perm', 'nu_role', !allowCustomPerms)
+}
+window.doAddUser = async () => {
+  try {
+    const body = { full_name: $('nu_name').value, phone: $('nu_phone').value, email: $('nu_email').value, role: $('nu_role').value, label: $('nu_label').value, region: $('nu_region').value }
+    if ($('nu_pwd').value) body.password = $('nu_pwd').value
+    if (state.user.role === 'super_admin') body.permissions = selectedPermissions('nu_perm')
+    const { data } = await api.post('/users', body)
+    closeModal()
+    showCredential('User Created', body.full_name, body.phone, data.password, data.password_was_set_by_admin)
+    viewUsers()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.editUserModal = async (id) => {
+  await ensurePermissionMeta()
+  const u = _users.find(x => x.id === id)
+  const allowCustomPerms = state.user.role === 'super_admin'
+  showModal(`<h3 class="font-bold mb-3">Edit User</h3><div class="space-y-3 text-sm">
+    <input id="eu_name" value="${esc(u.full_name)}" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
+    <input id="eu_phone" value="${esc(u.phone)}" placeholder="Phone" class="w-full px-3 py-2 border rounded-lg">
+    <input id="eu_email" value="${esc(u.email || '')}" placeholder="Email" class="w-full px-3 py-2 border rounded-lg">
+    <select id="eu_role" class="w-full px-3 py-2 border rounded-lg">${userRoleOptions(u.role)}</select>
+    <input id="eu_label" value="${esc(u.label || '')}" placeholder="Label" class="w-full px-3 py-2 border rounded-lg">
+    <input id="eu_region" value="${esc(u.region || '')}" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
+    <div><div class="field-label">Permission check-boxes</div><div id="eu_perm_box" class="responsive-grid cols-2">${permissionChecklist('eu_perm', u.permissions || {}, !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Update the assigned permission check-boxes, then confirm to save.' : 'Only Super Admin can customize the permission check-boxes.'}</div></div>
+    <input id="eu_pwd" placeholder="New password (leave blank to keep)" class="w-full px-3 py-2 border rounded-lg">
+  </div><div class="flex gap-2 mt-4"><button onclick="doEditUser(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  $('eu_role').onchange = () => refreshPermissionChecklist('eu_perm', 'eu_role', !allowCustomPerms)
+}
+window.doEditUser = async (id) => {
+  if (!confirmEdit('Save changes to this user account?')) return
+  try {
+    const body = { full_name: $('eu_name').value, phone: $('eu_phone').value, email: $('eu_email').value, role: $('eu_role').value, label: $('eu_label').value, region: $('eu_region').value }
+    if ($('eu_pwd').value) body.password = $('eu_pwd').value
+    if (state.user.role === 'super_admin') body.permissions = selectedPermissions('eu_perm')
+    await api.put('/users/' + id, body)
+    closeModal(); toast('User updated'); viewUsers()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.setUserStatus = async (id, status, back, name = 'this user') => {
+  if (!confirmStatus(`${status === 'active' ? 'Activate' : 'Suspend'} "${name}"?`)) return
+  try { await api.put(`/users/${id}/status`, { status }); toast('Status updated'); back === 'agents' ? viewAgents() : viewUsers() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.deleteUser = async (id, name, back) => {
+  if (!confirmDelete(`Delete "${name}"? This permanently removes the account.`)) return
+  try { await api.delete('/users/' + id); toast('Account deleted'); back === 'agents' ? viewAgents() : viewUsers() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// ---------------------------------------------------------------------------
+// REPAYMENTS
+// ---------------------------------------------------------------------------
+async function viewRepayments() {
+  const { data } = await api.get('/repayments')
+  $('content').innerHTML = `<div class="card table-card"><table class="w-full text-sm">
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Contract</th><th class="text-left px-4 py-3">Customer</th><th class="text-left px-4 py-3">Inst.</th><th class="text-left px-4 py-3">Due Date</th><th class="text-right px-4 py-3">Amount</th><th class="text-right px-4 py-3">Paid</th><th class="text-left px-4 py-3">Status</th></tr></thead>
+    <tbody>${data.repayments.map(r => `<tr class="border-t border-slate-100"><td class="px-4 py-3 font-mono text-xs">${esc(r.contract_ref)}</td><td class="px-4 py-3">${esc(r.customer)}</td><td class="px-4 py-3">#${r.installment_no}</td><td class="px-4 py-3">${r.due_date}</td><td class="px-4 py-3 text-right">${fmt(r.amount_due)}</td><td class="px-4 py-3 text-right">${fmt(r.amount_paid)}</td><td class="px-4 py-3">${badge(r.status)}</td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No repayments</td></tr>'}</tbody>
+  </table></div>`
+}
+
+// ---------------------------------------------------------------------------
+// DATA EXPORT & REPORTS (admin) - filter, download (CSV/Excel), email share
+// ---------------------------------------------------------------------------
+let _exportMeta = null
+let _lastExport = null   // { label, cols, rows }
+async function viewExports() {
+  if (!_exportMeta) {
+    try { _exportMeta = (await api.get('/export/datasets')).data } catch (e) { toast('Failed to load export options', false); return }
+  }
+  const opts = _exportMeta.datasets.map(d => `<option value="${d.key}">${esc(d.label)}</option>`).join('')
+  $('content').innerHTML = `
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <div class="card p-6 lg:col-span-1">
+      <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-filter text-teal-600 mr-2"></i>Build Export</h3>
+      <p class="text-xs text-slate-500 mb-4">Choose a dataset, apply filters, then download or email the result.</p>
+      <label class="text-sm font-medium text-slate-600">Dataset</label>
+      <select id="ex_dataset" onchange="exFilters()" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg text-sm">${opts}</select>
+      <div id="ex_filters"></div>
+      <div class="grid grid-cols-2 gap-2 mt-1">
+        <div><label class="text-xs text-slate-500">From date</label><input id="ex_from" type="date" class="w-full mt-1 px-2 py-2 border border-slate-300 rounded-lg text-sm"></div>
+        <div><label class="text-xs text-slate-500">To date</label><input id="ex_to" type="date" class="w-full mt-1 px-2 py-2 border border-slate-300 rounded-lg text-sm"></div>
+      </div>
+      <button onclick="runExport()" class="btn w-full mt-4 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-magnifying-glass mr-1"></i>Preview Data</button>
+    </div>
+    <div class="card p-6 lg:col-span-2">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-bold text-slate-800"><i class="fas fa-table text-teal-600 mr-2"></i>Preview & Download</h3>
+        <span id="ex_count" class="text-xs text-slate-500"></span>
+      </div>
+      <div class="flex flex-wrap gap-2 mb-4">
+        <button onclick="downloadExport('csv')" class="btn bg-emerald-600 text-white px-3 py-2 rounded-lg text-sm"><i class="fas fa-file-csv mr-1"></i>Download CSV</button>
+        <button onclick="downloadExport('xlsx')" class="btn bg-blue-600 text-white px-3 py-2 rounded-lg text-sm"><i class="fas fa-file-excel mr-1"></i>Download Excel</button>
+        <button onclick="emailExportModal()" class="btn brand-bg text-white px-3 py-2 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Share via Email</button>
+      </div>
+      <div id="ex_preview" class="overflow-x-auto text-xs text-slate-500">Run a preview to see data here.</div>
+    </div>
+  </div>`
+  exFilters()
+}
+window.exFilters = () => {
+  const key = $('ex_dataset').value
+  const d = _exportMeta.datasets.find(x => x.key === key)
+  $('ex_filters').innerHTML = (d.filters || []).map(f =>
+    `<div class="mb-2"><label class="text-xs text-slate-500 capitalize">${esc(f.replace(/_/g,' '))}</label>
+     <input id="exf_${f}" placeholder="Any" class="w-full mt-1 px-2 py-2 border border-slate-300 rounded-lg text-sm"></div>`
+  ).join('') || '<p class="text-xs text-slate-400 mb-2">No specific filters for this dataset.</p>'
+}
+function exParams() {
+  const key = $('ex_dataset').value
+  const d = _exportMeta.datasets.find(x => x.key === key)
+  const filters = {}
+  ;(d.filters || []).forEach(f => { const v = $('exf_' + f)?.value?.trim(); if (v) filters[f] = v })
+  return { dataset: key, filters, date_from: $('ex_from').value || undefined, date_to: $('ex_to').value || undefined }
+}
+window.runExport = async () => {
+  try {
+    const { data } = await api.post('/export/data', exParams())
+    _lastExport = { label: data.label, cols: data.cols, rows: data.rows }
+    $('ex_count').textContent = data.rows.length + ' row(s)'
+    const head = data.cols.map(c => `<th class="text-left px-2 py-1 bg-slate-50 sticky top-0">${esc(c)}</th>`).join('')
+    const body = data.rows.slice(0, 200).map(r => `<tr class="border-t border-slate-100">${data.cols.map(c => `<td class="px-2 py-1">${esc(r[c] ?? '')}</td>`).join('')}</tr>`).join('')
+    $('ex_preview').innerHTML = data.rows.length
+      ? `<table class="w-full"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>${data.rows.length > 200 ? '<p class="mt-2 text-slate-400">Showing first 200 rows. Download for full data.</p>' : ''}`
+      : '<p class="text-slate-400">No rows match these filters.</p>'
+  } catch (err) { toast(err.response?.data?.error || 'Export failed', false) }
+}
+function exFilename(ext) {
+  const key = $('ex_dataset')?.value || 'export'
+  return `farmsky-${key}-${new Date().toISOString().slice(0,10)}.${ext}`
+}
+window.downloadExport = async (fmt) => {
+  if (!_lastExport) { await runExport() }
+  if (!_lastExport || !_lastExport.rows.length) return toast('Nothing to download — preview first', false)
+  const { cols, rows } = _lastExport
+  if (fmt === 'csv') {
+    const esc2 = v => { const s = v == null ? '' : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s }
+    const csv = cols.join(',') + '\n' + rows.map(r => cols.map(c => esc2(r[c])).join(',')).join('\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
+    triggerDownload(blob, exFilename('csv'))
+  } else {
+    // Real .xlsx via SheetJS
+    const aoa = [cols, ...rows.map(r => cols.map(c => r[c]))]
+    const ws = XLSX.utils.aoa_to_sheet(aoa)
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, ws, 'Export')
+    XLSX.writeFile(wb, exFilename('xlsx'))
+  }
+  toast('Download started')
+}
+function triggerDownload(blob, name) {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click()
+  setTimeout(() => { a.remove(); URL.revokeObjectURL(url) }, 1000)
+}
+window.emailExportModal = () => {
+  const emailLive = _exportMeta?.email_configured
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-paper-plane text-teal-600 mr-2"></i>Share Export by Email</h3>
+    ${emailLive
+      ? '<p class="text-xs text-emerald-600 mb-3">Email provider configured — a CSV attachment will be sent.</p>'
+      : '<p class="text-xs text-amber-600 mb-3">Email provider not configured at deploy. Set EMAIL_API_URL/TOKEN/FROM, or use the Download buttons. (Trying anyway will report this.)</p>'}
+    <label class="text-sm font-medium">Recipient email</label>
+    <input id="ex_email" type="email" placeholder="name@example.com" class="w-full mt-1 mb-4 px-3 py-2 border border-slate-300 rounded-lg">
+    <div class="flex gap-2"><button onclick="sendExportEmail()" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Send</button>
+    <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.sendExportEmail = async () => {
+  const to = $('ex_email').value
+  if (!to) return toast('Enter a recipient email', false)
+  try {
+    const { data } = await api.post('/export/email', { ...exParams(), to })
+    closeModal(); toast(data.message || 'Email sent')
+  } catch (err) {
+    const d = err.response?.data
+    toast(d?.message || d?.error || 'Email failed', false)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MODAL
+// ---------------------------------------------------------------------------
+function showModal(html) {
+  $('modal').innerHTML = `<div class="fixed inset-0 modal-overlay flex items-center justify-center p-4 z-40" onclick="if(event.target===this)closeModal()">
+    <div class="bg-white rounded-2xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto fade-in">${html}</div></div>`
+}
+window.closeModal = () => { stopLive(); $('modal').innerHTML = '' }
+
+init()
