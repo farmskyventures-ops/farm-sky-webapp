@@ -1,11 +1,45 @@
-// Add this interface or update your existing opts type
-export type SasaPayStkOpts = { 
-  phone: string; 
-  amount: number; 
-  account: string; 
-  description: string; 
+// Define your environment interface
+export interface SasaPayEnv {
+  SASAPAY_MERCHANT_CODE: string;
+  SASAPAY_CONSUMER_KEY: string;
+  SASAPAY_CONSUMER_SECRET: string;
+  SASAPAY_CALLBACK_URL: string;
+  SASAPAY_ENV?: 'sandbox' | 'production';
+}
+
+export type SasaPayResult = {
+  simulated: boolean;
+  success: boolean;
+  checkout_request_id?: string;
+  merchant_request_id?: string;
+  customer_message?: string;
+  error?: string;
+};
+
+export type SasaPayStkOpts = {
+  phone: string;
+  amount: number;
+  account: string;
+  description: string;
   networkCode?: string; // M-PESA: "63902", Airtel: "63903", T-Kash: "63907"
 };
+
+// Internal helpers
+function baseUrl(env: SasaPayEnv) {
+  return env.SASAPAY_ENV === 'production' 
+    ? 'https://api.sasapay.app' 
+    : 'https://sandbox.sasapay.app';
+}
+
+export function sasapayConfigured(env: SasaPayEnv): boolean {
+  return !!(env.SASAPAY_MERCHANT_CODE && env.SASAPAY_CONSUMER_KEY && env.SASAPAY_CONSUMER_SECRET);
+}
+
+// Mocked Token Helper - Ensure this implementation matches your existing auth flow
+async function getToken(env: SasaPayEnv): Promise<string> {
+  // Replace with your actual OAuth/Token retrieval logic
+  return "YOUR_ACCESS_TOKEN"; 
+}
 
 export async function sasapayStkPush(
   env: SasaPayEnv,
@@ -23,9 +57,7 @@ export async function sasapayStkPush(
 
   try {
     const token = await getToken(env);
-    const phone = normalizePhone(opts.phone);
-    
-    // Use the provided networkCode or default to M-PESA
+    const phone = opts.phone.replace('+', ''); // Ensure format 254...
     const networkCode = opts.networkCode || '63902'; 
 
     const body = {
@@ -50,18 +82,27 @@ export async function sasapayStkPush(
 
     const data: any = await res.json();
     
-    // Success code '0' or status true confirms the STK push was triggered
     if (data.status === true || data.ResponseCode === '0') {
       return {
         simulated: false,
         success: true,
         checkout_request_id: data.CheckoutRequestID || data.MerchantRequestID,
         merchant_request_id: data.MerchantRequestID || data.CheckoutRequestID,
-        customer_message: data.CustomerMessage || 'STK push sent. Enter PIN on your phone.'
+        customer_message: data.CustomerMessage || 'STK push sent.'
       };
     }
     return { simulated: false, success: false, error: data.message || data.detail };
   } catch (e: any) {
     return { simulated: false, success: false, error: e.message };
   }
+}
+
+export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string) {
+  // Implement the API call to query transaction status from SasaPay
+  // Usually GET /payments/transaction-status/?CheckoutRequestID=...
+  const token = await getToken(env);
+  const res = await fetch(`${baseUrl(env)}/payments/transaction-status/?CheckoutRequestID=${checkoutRequestId}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  return await res.json();
 }
