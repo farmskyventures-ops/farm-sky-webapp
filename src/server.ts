@@ -66,9 +66,18 @@ root.all('*', (c) => app.fetch(c.req.raw, ENV as any))
 const PORT = Number(process.env.PORT || 8080)
 serve({ fetch: root.fetch, port: PORT }, (info) => {
   console.log(`Farmsky server running on http://0.0.0.0:${info.port}`)
+  
+  // Status check for M-Pesa
   console.log(
     process.env.MPESA_CONSUMER_KEY
       ? 'M-Pesa: LIVE credentials detected (' + (process.env.MPESA_ENV || 'sandbox') + ')'
       : 'M-Pesa: SIMULATION mode (no Daraja credentials set).'
+  )
+
+  // Status check for SasaPay
+  console.log(
+    process.env.SASAPAY_CLIENT_ID
+      ? 'SasaPay: LIVE credentials detected (' + (process.env.SASAPAY_ENV || 'sandbox') + ')'
+      : 'SasaPay: SIMULATION mode (no SasaPay credentials set).'
   )
 })
