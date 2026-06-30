@@ -35,10 +35,15 @@ export function sasapayConfigured(env: SasaPayEnv): boolean {
   return !!(env.SASAPAY_MERCHANT_CODE && env.SASAPAY_CONSUMER_KEY && env.SASAPAY_CONSUMER_SECRET);
 }
 
-// Mocked Token Helper - Ensure this implementation matches your existing auth flow
+// UPDATED: Real token retrieval logic for SasaPay
 async function getToken(env: SasaPayEnv): Promise<string> {
-  // Replace with your actual OAuth/Token retrieval logic
-  return "YOUR_ACCESS_TOKEN"; 
+  const auth = btoa(`${env.SASAPAY_CONSUMER_KEY}:${env.SASAPAY_CONSUMER_SECRET}`);
+  const res = await fetch(`${baseUrl(env)}/auth/token/?grant_type=client_credentials`, {
+    method: 'GET',
+    headers: { 'Authorization': `Basic ${auth}` }
+  });
+  const data = await res.json();
+  return data.access_token;
 }
 
 export async function sasapayStkPush(
@@ -57,7 +62,7 @@ export async function sasapayStkPush(
 
   try {
     const token = await getToken(env);
-    const phone = opts.phone.replace('+', ''); // Ensure format 254...
+    const phone = opts.phone.replace('+', ''); 
     const networkCode = opts.networkCode || '63902'; 
 
     const body = {
@@ -97,11 +102,11 @@ export async function sasapayStkPush(
   }
 }
 
+// UPDATED: Standard query implementation
 export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string) {
-  // Implement the API call to query transaction status from SasaPay
-  // Usually GET /payments/transaction-status/?CheckoutRequestID=...
   const token = await getToken(env);
   const res = await fetch(`${baseUrl(env)}/payments/transaction-status/?CheckoutRequestID=${checkoutRequestId}`, {
+    method: 'GET',
     headers: { Authorization: `Bearer ${token}` }
   });
   return await res.json();
