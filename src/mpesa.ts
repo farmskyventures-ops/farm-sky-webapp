@@ -18,17 +18,29 @@ export type MpesaEnv = {
 
 // Helper to read from either Render Secret Files or standard Environment Variables
 function getSecret(name: string): string | undefined {
-  // 1. Try to read from Render Secret Files mount
+  // 1. Try to read from Render Secret Files mount (/etc/secrets/)
   const secretPath = path.join('/etc/secrets/', name);
-  if (fs.existsSync(secretPath)) {
+  const fileExists = fs.existsSync(secretPath);
+  
+  if (fileExists) {
     try {
-      return fs.readFileSync(secretPath, 'utf8').trim();
+      const val = fs.readFileSync(secretPath, 'utf8').trim();
+      console.log(`DEBUG: Successfully read secret ${name} from file system.`);
+      return val;
     } catch (err) {
-      console.error(`Error reading secret file: ${name}`, err);
+      console.error(`DEBUG: Error reading secret file: ${name}`, err);
     }
+  } else {
+    console.log(`DEBUG: Secret file not found for ${name} at ${secretPath}. Checking process.env...`);
   }
+
   // 2. Fallback to standard Environment Variable
-  return process.env[name];
+  const envVal = process.env[name];
+  if (envVal) {
+    console.log(`DEBUG: Found ${name} in process.env.`);
+  }
+  
+  return envVal;
 }
 
 // Updated Helper to resolve env variables from all possible sources
@@ -92,6 +104,7 @@ export type StkResult = {
 
 export async function stkPush(env: MpesaEnv, opts: { phone: string; amount: number; account: string; description: string }): Promise<StkResult> {
   if (!mpesaConfigured(env)) {
+    console.log("DEBUG: mpesaConfigured returned FALSE. Simulation mode active.");
     return {
       simulated: true,
       success: true,
