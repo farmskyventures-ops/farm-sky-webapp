@@ -1,9 +1,11 @@
 // =====================================================================
 // M-Pesa Daraja (Lipa na M-Pesa Online / STK Push) integration
-// Updated to support both Cloudflare (c.env) and Render (process.env)
+// Supports Cloudflare (c.env), Render Env Vars, and Render Secret Files
 // =====================================================================
 
 import { env } from 'hono/adapter'
+import fs from 'fs';
+import path from 'path';
 
 export type MpesaEnv = {
   MPESA_CONSUMER_KEY?: string
@@ -14,16 +16,31 @@ export type MpesaEnv = {
   MPESA_CALLBACK_URL?: string
 }
 
-// Helper to resolve environment variables regardless of platform
+// Helper to read from either Render Secret Files or standard Environment Variables
+function getSecret(name: string): string | undefined {
+  // 1. Try to read from Render Secret Files mount
+  const secretPath = path.join('/etc/secrets/', name);
+  if (fs.existsSync(secretPath)) {
+    try {
+      return fs.readFileSync(secretPath, 'utf8').trim();
+    } catch (err) {
+      console.error(`Error reading secret file: ${name}`, err);
+    }
+  }
+  // 2. Fallback to standard Environment Variable
+  return process.env[name];
+}
+
+// Updated Helper to resolve env variables from all possible sources
 export function getMpesaEnv(c: any): MpesaEnv {
   const hEnv = env<MpesaEnv>(c)
   return {
-    MPESA_CONSUMER_KEY: hEnv.MPESA_CONSUMER_KEY || process.env.MPESA_CONSUMER_KEY,
-    MPESA_CONSUMER_SECRET: hEnv.MPESA_CONSUMER_SECRET || process.env.MPESA_CONSUMER_SECRET,
-    MPESA_SHORTCODE: hEnv.MPESA_SHORTCODE || process.env.MPESA_SHORTCODE,
-    MPESA_PASSKEY: hEnv.MPESA_PASSKEY || process.env.MPESA_PASSKEY,
-    MPESA_ENV: hEnv.MPESA_ENV || process.env.MPESA_ENV,
-    MPESA_CALLBACK_URL: hEnv.MPESA_CALLBACK_URL || process.env.MPESA_CALLBACK_URL,
+    MPESA_CONSUMER_KEY: hEnv.MPESA_CONSUMER_KEY || getSecret('MPESA_CONSUMER_KEY'),
+    MPESA_CONSUMER_SECRET: hEnv.MPESA_CONSUMER_SECRET || getSecret('MPESA_CONSUMER_SECRET'),
+    MPESA_SHORTCODE: hEnv.MPESA_SHORTCODE || getSecret('MPESA_SHORTCODE'),
+    MPESA_PASSKEY: hEnv.MPESA_PASSKEY || getSecret('MPESA_PASSKEY'),
+    MPESA_ENV: hEnv.MPESA_ENV || getSecret('MPESA_ENV'),
+    MPESA_CALLBACK_URL: hEnv.MPESA_CALLBACK_URL || getSecret('MPESA_CALLBACK_URL'),
   }
 }
 
@@ -80,7 +97,7 @@ export async function stkPush(env: MpesaEnv, opts: { phone: string; amount: numb
       success: true,
       checkout_request_id: 'ws_CO_SIM_' + crypto.randomUUID().slice(0, 12),
       merchant_request_id: 'SIM_' + crypto.randomUUID().slice(0, 8),
-      customer_message: 'Simulated STK push sent. (Configure Daraja keys for live payments.)'
+      customer_message: 'Simulated STK push sent. (Credentials not detected.)'
     }
   }
   try {
