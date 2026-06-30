@@ -702,7 +702,7 @@ app.post('/api/murabaha/:id/dispatch', requireAuth, requireRole('admin', 'super_
 })
 
 // ----------------------------------------------------------------------------
-// CENTRAL PAYMENT PROCESSING
+// PAYMENTS - M-Pesa Daraja STK Push (real when configured, simulated otherwise)
 // ----------------------------------------------------------------------------
 async function applyPayment(c: any, contract: any, amt: number, receipt: string, method: string, phone: string) {
   const isCash = contract.payment_type === 'cash'
@@ -710,20 +710,18 @@ async function applyPayment(c: any, contract: any, amt: number, receipt: string,
   const totalDue = numberVal(contract.murabaha_price, 0)
   const newPaid = roundMoney(currentPaid + amt)
   const newOutstanding = roundMoney(Math.max(0, totalDue - newPaid))
-  
   const firstCashCollection = isCash && !contract.ownership_recorded
   if (firstCashCollection) {
     await c.env.DB.prepare(`UPDATE products SET quantity = quantity - ? WHERE id=?`).bind(contract.quantity, contract.product_id).run()
     await c.env.DB.prepare(`INSERT INTO stock_movements (product_id,movement_type,quantity,reference) VALUES (?,?,?,?)`).bind(contract.product_id, 'sale', contract.quantity, contract.contract_ref).run()
-    await c.env.DB.prepare(`INSERT INTO invoices (invoice_ref,contract_id,customer_id,amount,status) VALUES (?,?,?,?,?)`).bind(ref('INV'), contract.id, contract.customer_id, totalDue, newOutstanding <= 0 ? 'paid' : 'partial').run()
+    await c.env.DB.prepare(`INSERT INTO invoices (invoice_ref,contract_id,customer_id,amount,status) VALUES (?,?,?,?, ?)`).bind(ref('INV'), contract.id, contract.customer_id, totalDue, newOutstanding <= 0 ? 'paid' : 'partial').run()
   }
-
   await c.env.DB.prepare(`INSERT INTO transactions (txn_ref,contract_id,customer_id,amount,method,type,mpesa_receipt,phone,status) VALUES (?,?,?,?,?,?,?,?, 'success')`)
     .bind(ref('TXN'), contract.id, contract.customer_id, amt, method, isCash ? 'cash_sale' : (contract.financing_model === 'paygo' ? 'paygo_repayment' : 'repayment'), receipt, phone).run()
-
-  const status = isCash ? (newOutstanding <= 0 ? 'completed' : 'awaiting_cash_balance') : (newOutstanding <= 0 ? 'completed' : 'active')
+  const status = isCash
+    ? (newOutstanding <= 0 ? 'completed' : 'awaiting_cash_balance')
+    : (newOutstanding <= 0 ? 'completed' : 'active')
   await c.env.DB.prepare(`UPDATE murabaha_contracts SET amount_paid=?, outstanding=?, status=?, ownership_recorded=1 WHERE id=?`).bind(newPaid, newOutstanding, status, contract.id).run()
-
   let remaining = amt
   const { results: due } = await c.env.DB.prepare(`SELECT * FROM repayments WHERE contract_id=? AND status!='completed' ORDER BY installment_no`).bind(contract.id).all<any>()
   for (const inst of due) {
@@ -738,72 +736,219 @@ async function applyPayment(c: any, contract: any, amt: number, receipt: string,
   await c.env.DB.prepare(`UPDATE invoices SET status=? WHERE contract_id=?`).bind(newOutstanding <= 0 ? 'paid' : 'partial', contract.id).run()
   return { amount_paid: newPaid, outstanding: newOutstanding, status }
 }
-
-// ----------------------------------------------------------------------------
-// M-PESA DARAJA
-// ----------------------------------------------------------------------------
 app.post('/api/mpesa/stkpush', requireAuth, async (c) => {
   const { contract_id, amount, phone } = await c.req.json()
   const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first<any>()
   if (!contract) return c.json({ error: 'Contract not found' }, 404)
-  
+  if (contract.payment_type === 'cash' && ['pending_payment', 'awaiting_cash_balance', 'completed'].includes(contract.status)) {
+    const p = await c.env.DB.prepare(`SELECT quantity FROM products WHERE id=?`).bind(contract.product_id).first<any>()
+    if ((!contract.ownership_recorded) && (!p || p.quantity < contract.quantity)) return c.json({ error: 'This item is now out of stock.' }, 409)
+  } else if (contract.payment_type !== 'cash' && !['active', 'completed'].includes(contract.status)) {
+    return c.json({ error: 'This purchase is not open for payment.' }, 400)
+  }
   const amt = Number(amount)
   if (amt <= 0) return c.json({ error: 'Invalid amount' }, 400)
   if (amt > Number(contract.outstanding || 0)) return c.json({ error: 'Amount exceeds outstanding balance' }, 400)
-  
-  const desc = contract.payment_type === 'cash' ? 'Cash Equipment Purchase' : 'Equipment Financing Payment'
+  const desc = contract.payment_type === 'cash' ? 'Cash Equipment Purchase' : (contract.financing_model === 'paygo' ? 'PAYGO Equipment Payment' : 'Equipment Financing Payment')
   const result = await stkPush(c.env, { phone: phone || c.get('user').phone, amount: amt, account: contract.contract_ref, description: desc })
-  
   if (!result.success) return c.json({ error: result.error || 'STK push failed' }, 502)
-  
   await c.env.DB.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`)
     .bind(result.checkout_request_id, result.merchant_request_id, contract_id, contract.customer_id, amt, normalizePhone(phone || c.get('user').phone), 'mpesa').run()
-  
+  await audit(c, c.get('user').id, 'stk_push', 'mpesa', `KES ${amt} to ${contract.contract_ref} (${result.simulated ? 'sim' : 'live'})`)
   return c.json({ ok: true, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message })
 })
+app.post('/api/mpesa/confirm', requireAuth, async (c) => {
+  const { checkout_request_id } = await c.req.json()
+  const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
+  if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
+  if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
+  let success = false, receipt = ''
+  if (!mpesaConfigured(c.env) || String(checkout_request_id).includes('SIM')) {
+    success = true; receipt = 'SLE' + Math.random().toString(36).slice(2, 9).toUpperCase()
+  } else {
+    const q = await stkQuery(c.env, checkout_request_id)
+    if (q.ResultCode === '0' || q.ResultCode === 0) { success = true; receipt = 'LIVE' + Date.now().toString().slice(-7) }
+    else if (q.ResultCode) return c.json({ ok: false, status: 'failed', result_desc: q.ResultDesc || 'Payment not completed' })
+    else return c.json({ ok: false, status: 'pending' })
+  }
+  if (success) {
+    const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+    const res = await applyPayment(c, contract, intent.amount, receipt, 'mpesa', intent.phone)
+    await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run()
+    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, ...res })
+  }
+  return c.json({ ok: false, status: 'pending' })
+})
+app.post('/api/mpesa/callback', async (c) => {
+  try {
+    const body: any = await c.req.json()
+    const cb = body?.Body?.stkCallback
+    if (!cb) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+    const checkout = cb.CheckoutRequestID
+    const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+    if (intent && intent.status === 'pending') {
+      if (cb.ResultCode === 0) {
+        const items = cb.CallbackMetadata?.Item || []
+        const receiptItem = items.find((i: any) => i.Name === 'MpesaReceiptNumber')
+        const receipt = receiptItem?.Value || 'LIVE' + Date.now()
+        const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+        if (contract) await applyPayment(c, contract, intent.amount, String(receipt), 'mpesa', intent.phone)
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, result_desc=? WHERE checkout_request_id=?`).bind(String(receipt), cb.ResultDesc || '', checkout).run()
+      } else {
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(cb.ResultDesc || 'Failed', checkout).run()
+      }
+    }
+    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+  } catch (e) {
+    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+  }
+})
+app.get('/api/mpesa/status', requireAuth, (c) => {
+  return c.json({ live: mpesaConfigured(c.env), mode: mpesaConfigured(c.env) ? (c.env.MPESA_ENV || 'sandbox') : 'simulation' })
+})
 
-// ... (Repeat pattern for /api/sasapay/stkpush and /api/buni/stkpush)
-
+// ----------------------------------------------------------------------------
+// PAYMENTS - SasaPay STK Push (real when configured, simulated otherwise)
+// Docs: https://developer.sasapay.app/docs/getting-started
+// ----------------------------------------------------------------------------
 app.post('/api/sasapay/stkpush', requireAuth, async (c) => {
   const { contract_id, amount, phone } = await c.req.json()
   const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first<any>()
   if (!contract) return c.json({ error: 'Contract not found' }, 404)
-  
+  if (contract.payment_type === 'cash' && ['pending_payment', 'awaiting_cash_balance', 'completed'].includes(contract.status)) {
+    const p = await c.env.DB.prepare(`SELECT quantity FROM products WHERE id=?`).bind(contract.product_id).first<any>()
+    if ((!contract.ownership_recorded) && (!p || p.quantity < contract.quantity)) return c.json({ error: 'This item is now out of stock.' }, 409)
+  } else if (contract.payment_type !== 'cash' && !['active', 'completed'].includes(contract.status)) {
+    return c.json({ error: 'This purchase is not open for payment.' }, 400)
+  }
   const amt = Number(amount)
-  const result = await sasapayStkPush(c.env, { 
-    phone: phone || c.get('user').phone, 
-    amount: amt, 
-    account: contract.contract_ref, 
-    description: 'Equipment Payment',
-    networkCode: '63902' // Default to M-PESA STK
-  })
-  
-  if (!result.success) return c.json({ error: result.error }, 502)
-  
+  if (amt <= 0) return c.json({ error: 'Invalid amount' }, 400)
+  if (amt > Number(contract.outstanding || 0)) return c.json({ error: 'Amount exceeds outstanding balance' }, 400)
+  const desc = contract.payment_type === 'cash' ? 'Cash Equipment Purchase' : 'Equipment Financing Payment'
+  const result = await sasapayStkPush(c.env, { phone: phone || c.get('user').phone, amount: amt, account: contract.contract_ref, description: desc })
+  if (!result.success) return c.json({ error: result.error || 'SasaPay STK push failed' }, 502)
   await c.env.DB.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`)
     .bind(result.checkout_request_id, result.merchant_request_id, contract_id, contract.customer_id, amt, normalizePhone(phone || c.get('user').phone), 'sasapay').run()
-    
-  return c.json({ ok: true, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message })
+  await audit(c, c.get('user').id, 'stk_push', 'sasapay', `KES ${amt} to ${contract.contract_ref} (${result.simulated ? 'sim' : 'live'})`)
+  return c.json({ ok: true, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message })
+})
+app.post('/api/sasapay/confirm', requireAuth, async (c) => {
+  const { checkout_request_id } = await c.req.json()
+  const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
+  if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
+  if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
+  let success = false, receipt = ''
+  if (!sasapayConfigured(c.env) || String(checkout_request_id).includes('SIM')) {
+    success = true; receipt = 'SP' + Math.random().toString(36).slice(2, 9).toUpperCase()
+  } else {
+    const q = await sasapayQuery(c.env, checkout_request_id)
+    const code = q.ResultCode ?? q.status_code
+    if (code === '0' || code === 0 || q.status === true) { success = true; receipt = 'SPL' + Date.now().toString().slice(-7) }
+    else if (code) return c.json({ ok: false, status: 'failed', result_desc: q.ResultDesc || q.message || 'Payment not completed' })
+    else return c.json({ ok: false, status: 'pending' })
+  }
+  if (success) {
+    const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+    const res = await applyPayment(c, contract, intent.amount, receipt, 'sasapay', intent.phone)
+    await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run()
+    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, ...res })
+  }
+  return c.json({ ok: false, status: 'pending' })
+})
+app.post('/api/sasapay/callback', async (c) => {
+  try {
+    const body: any = await c.req.json()
+    const checkout = body?.CheckoutRequestID || body?.MerchantRequestID
+    if (!checkout) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+    const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+    if (intent && intent.status === 'pending') {
+      const code = body.ResultCode ?? body.status_code
+      if (code === 0 || code === '0' || body.status === true) {
+        const receipt = body.TransactionID || body.MpesaReceiptNumber || 'SPL' + Date.now()
+        const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+        if (contract) await applyPayment(c, contract, intent.amount, String(receipt), 'sasapay', intent.phone)
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, result_desc=? WHERE checkout_request_id=?`).bind(String(receipt), body.ResultDesc || '', checkout).run()
+      } else {
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(body.ResultDesc || body.message || 'Failed', checkout).run()
+      }
+    }
+    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+  } catch { return c.json({ ResultCode: 0, ResultDesc: 'Accepted' }) }
+})
+app.get('/api/sasapay/status', requireAuth, (c) => {
+  return c.json({ live: sasapayConfigured(c.env), mode: sasapayConfigured(c.env) ? (c.env.SASAPAY_ENV || 'sandbox') : 'simulation' })
 })
 
 // ----------------------------------------------------------------------------
-// CALLBACKS (Shared logic structure)
+// PAYMENTS - KCB Buni STK Push (real when configured, simulated otherwise)
+// Docs: https://buni.kcbgroup.com/getting-started
 // ----------------------------------------------------------------------------
-app.post('/api/sasapay/callback', async (c) => {
-  const body: any = await c.req.json()
-  const checkout = body?.CheckoutRequestID || body?.MerchantRequestID
-  const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
-  
-  if (intent && intent.status === 'pending') {
-    const success = body.status === true || body.ResultCode === '0'
-    if (success) {
-      const receipt = body.TransactionID || 'SPL' + Date.now()
-      const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
-      await applyPayment(c, contract, intent.amount, String(receipt), 'sasapay', intent.phone)
-      await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout).run()
-    }
+app.post('/api/buni/stkpush', requireAuth, async (c) => {
+  const { contract_id, amount, phone } = await c.req.json()
+  const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first<any>()
+  if (!contract) return c.json({ error: 'Contract not found' }, 404)
+  if (contract.payment_type === 'cash' && ['pending_payment', 'awaiting_cash_balance', 'completed'].includes(contract.status)) {
+    const p = await c.env.DB.prepare(`SELECT quantity FROM products WHERE id=?`).bind(contract.product_id).first<any>()
+    if ((!contract.ownership_recorded) && (!p || p.quantity < contract.quantity)) return c.json({ error: 'This item is now out of stock.' }, 409)
+  } else if (contract.payment_type !== 'cash' && !['active', 'completed'].includes(contract.status)) {
+    return c.json({ error: 'This purchase is not open for payment.' }, 400)
   }
-  return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+  const amt = Number(amount)
+  if (amt <= 0) return c.json({ error: 'Invalid amount' }, 400)
+  if (amt > Number(contract.outstanding || 0)) return c.json({ error: 'Amount exceeds outstanding balance' }, 400)
+  const desc = contract.payment_type === 'cash' ? 'Cash Equipment Purchase' : 'Equipment Financing Payment'
+  const result = await buniStkPush(c.env, { phone: phone || c.get('user').phone, amount: amt, account: contract.contract_ref, description: desc })
+  if (!result.success) return c.json({ error: result.error || 'KCB Buni STK push failed' }, 502)
+  await c.env.DB.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`)
+    .bind(result.checkout_request_id, result.merchant_request_id, contract_id, contract.customer_id, amt, normalizePhone(phone || c.get('user').phone), 'buni').run()
+  await audit(c, c.get('user').id, 'stk_push', 'buni', `KES ${amt} to ${contract.contract_ref} (${result.simulated ? 'sim' : 'live'})`)
+  return c.json({ ok: true, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message })
+})
+app.post('/api/buni/confirm', requireAuth, async (c) => {
+  const { checkout_request_id } = await c.req.json()
+  const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
+  if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
+  if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
+  let success = false, receipt = ''
+  if (!buniConfigured(c.env) || String(checkout_request_id).includes('SIM')) {
+    success = true; receipt = 'BUNI' + Math.random().toString(36).slice(2, 9).toUpperCase()
+  } else {
+    const q = await buniQuery(c.env, checkout_request_id)
+    const code = q.ResultCode ?? q.status_code
+    if (code === '0' || code === 0 || q.status === true) { success = true; receipt = 'BUNI' + Date.now().toString().slice(-7) }
+    else if (code) return c.json({ ok: false, status: 'failed', result_desc: q.ResultDesc || q.message || 'Payment not completed' })
+    else return c.json({ ok: false, status: 'pending' })
+  }
+  if (success) {
+    const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+    const res = await applyPayment(c, contract, intent.amount, receipt, 'buni', intent.phone)
+    await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run()
+    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, ...res })
+  }
+  return c.json({ ok: false, status: 'pending' })
+})
+app.post('/api/buni/callback', async (c) => {
+  try {
+    const body: any = await c.req.json()
+    const checkout = body?.CheckoutRequestID || body?.TransactionID
+    if (!checkout) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+    const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+    if (intent && intent.status === 'pending') {
+      const code = body.ResultCode ?? body.status_code
+      if (code === 0 || code === '0' || body.status === true) {
+        const receipt = body.TransactionID || body.ReceiptNumber || 'BUNI' + Date.now()
+        const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+        if (contract) await applyPayment(c, contract, intent.amount, String(receipt), 'buni', intent.phone)
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, result_desc=? WHERE checkout_request_id=?`).bind(String(receipt), body.ResultDesc || '', checkout).run()
+      } else {
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(body.ResultDesc || body.message || 'Failed', checkout).run()
+      }
+    }
+    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+  } catch { return c.json({ ResultCode: 0, ResultDesc: 'Accepted' }) }
+})
+app.get('/api/buni/status', requireAuth, (c) => {
+  return c.json({ live: buniConfigured(c.env), mode: buniConfigured(c.env) ? (c.env.BUNI_ENV || 'sandbox') : 'simulation' })
 })
 
 // ----------------------------------------------------------------------------
