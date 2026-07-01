@@ -1,9 +1,15 @@
 // =====================================================================
 // SasaPay payment integration (Sandbox + Production)
 // Docs:
-//   Auth   : https://developer.sasapay.app/docs/apis/authentication
-//   C2B    : https://developer.sasapay.app/docs/apis/c2b
+//   Auth    : https://developer.sasapay.app/docs/apis/authentication
+//   C2B     : https://developer.sasapay.app/docs/apis/c2b
 //   Checkout: https://developer.sasapay.app/docs/apis/checkout-payments
+// =====================================================================
+//
+// Debugging note: if a call returns HTTP 4xx, the returned `error` field
+// contains the exact URL that was hit AND the raw response body so you can
+// see exactly what SasaPay is complaining about (invalid merchant code,
+// wrong network code, wrong callback URL, etc).
 // =====================================================================
 
 export interface SasaPayEnv {
@@ -37,25 +43,36 @@ export type SasaPayStkOpts = {
 }
 
 // ---------- URL helpers ------------------------------------------------------
-// SasaPay API base includes `/api/v1`. Auth + payment endpoints all sit under it.
 function baseUrl(env: SasaPayEnv) {
   return env.SASAPAY_ENV === 'production'
-    ? 'https://api.sasapay.app/api/v1'
-    : 'https://sandbox.sasapay.app/api/v1'
+    ? 'https://api.sasapay.app'
+    : 'https://sandbox.sasapay.app'
 }
 
+// SasaPay's C2B "request-payment" endpoint. Trailing slash matters — without
+// it SasaPay 301-redirects and some fetch runtimes convert POST → GET → 404.
+// If SasaPay 404s the v1 path (some legacy sandbox tenants still route to the
+// older waas path), we fall back to it automatically.
+const STK_PATHS = [
+  '/api/v1/payments/request-payment/',
+  '/waas/api/v1/payments/request-payment/'
+]
+
 function clientId(env: SasaPayEnv): string | undefined {
-  return env.SASAPAY_CLIENT_ID || env.SASAPAY_CONSUMER_KEY
+  return (env.SASAPAY_CLIENT_ID || env.SASAPAY_CONSUMER_KEY || '').trim() || undefined
 }
 function clientSecret(env: SasaPayEnv): string | undefined {
-  return env.SASAPAY_CLIENT_SECRET || env.SASAPAY_CONSUMER_SECRET
+  return (env.SASAPAY_CLIENT_SECRET || env.SASAPAY_CONSUMER_SECRET || '').trim() || undefined
+}
+function merchantCode(env: SasaPayEnv): string | undefined {
+  return (env.SASAPAY_MERCHANT_CODE || '').trim() || undefined
 }
 
 export function sasapayConfigured(env: SasaPayEnv): boolean {
-  return !!(env.SASAPAY_MERCHANT_CODE && clientId(env) && clientSecret(env))
+  return !!(merchantCode(env) && clientId(env) && clientSecret(env))
 }
 
-// Normalize to 2547XXXXXXXX (SasaPay only accepts the 254 format)
+// Normalize to 2547XXXXXXXX
 function normalizePhone(phone: string): string {
   let p = String(phone || '').replace(/[^0-9]/g, '')
   if (p.startsWith('0')) p = '254' + p.slice(1)
@@ -64,8 +81,15 @@ function normalizePhone(phone: string): string {
   return p
 }
 
+async function readBody(res: Response): Promise<{ json: any; text: string }> {
+  const text = await res.text().catch(() => '')
+  let json: any = null
+  try { json = text ? JSON.parse(text) : null } catch { json = null }
+  return { json, text }
+}
+
 // ---------- Auth ------------------------------------------------------------
-// GET /auth/token/?grant_type=client_credentials
+// GET /api/v1/auth/token/?grant_type=client_credentials
 // Header: Authorization: Basic base64(client_id:client_secret)
 async function getToken(env: SasaPayEnv): Promise<string> {
   const id = clientId(env)
@@ -73,22 +97,19 @@ async function getToken(env: SasaPayEnv): Promise<string> {
   if (!id || !secret) throw new Error('SasaPay client credentials are not configured')
 
   const auth = btoa(`${id}:${secret}`)
-  const url = `${baseUrl(env)}/auth/token/?grant_type=client_credentials`
+  const url = `${baseUrl(env)}/api/v1/auth/token/?grant_type=client_credentials`
   const res = await fetch(url, {
     method: 'GET',
-    headers: { Authorization: `Basic ${auth}` }
+    redirect: 'follow',
+    headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' }
   })
 
-  let data: any = null
-  try { data = await res.json() } catch {
-    const text = await res.text().catch(() => '')
-    throw new Error(`SasaPay auth returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`)
+  const { json, text } = await readBody(res)
+  if (!res.ok || !json?.access_token) {
+    const msg = json?.detail || json?.message || json?.error || (text ? text.slice(0, 200) : `HTTP ${res.status}`)
+    throw new Error(`SasaPay auth failed [${res.status}] at ${url} :: ${msg}`)
   }
-  if (!res.ok || !data?.access_token) {
-    const msg = data?.detail || data?.message || data?.error || `HTTP ${res.status}`
-    throw new Error(`SasaPay auth failed: ${msg}`)
-  }
-  return String(data.access_token)
+  return String(json.access_token)
 }
 
 // ---------- STK Push (C2B request-payment) ----------------------------------
@@ -103,64 +124,75 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
     }
   }
 
-  try {
-    const token = await getToken(env)
-    const phone = normalizePhone(opts.phone)
-    // Default to M-PESA network so the customer gets an STK prompt (no OTP flow).
-    const networkCode = opts.networkCode || '63902'
+  let token: string
+  try { token = await getToken(env) }
+  catch (e: any) { return { simulated: false, success: false, error: e?.message || 'SasaPay auth failed' } }
 
-    const body = {
-      MerchantCode: env.SASAPAY_MERCHANT_CODE,
-      NetworkCode: networkCode,
-      PhoneNumber: phone,
-      TransactionDesc: String(opts.description || 'Farmsky payment').slice(0, 20),
-      AccountReference: String(opts.account || '').slice(0, 20),
-      Currency: 'KES',
-      Amount: String(Math.max(1, Math.round(opts.amount))),
-      CallBackURL: env.SASAPAY_CALLBACK_URL || 'https://example.com/api/v1/payments/callbacks/sasapay'
+  const phone = normalizePhone(opts.phone)
+  const networkCode = opts.networkCode || '63902' // M-PESA STK by default
+  const callbackUrl = env.SASAPAY_CALLBACK_URL || ''
+  if (!callbackUrl) {
+    return { simulated: false, success: false, error: 'SasaPay: SASAPAY_CALLBACK_URL env var is required in live mode' }
+  }
+
+  const body = {
+    MerchantCode: merchantCode(env),
+    NetworkCode: networkCode,
+    PhoneNumber: phone,
+    TransactionDesc: String(opts.description || 'Farmsky payment').slice(0, 20),
+    AccountReference: String(opts.account || '').slice(0, 20),
+    Currency: 'KES',
+    Amount: String(Math.max(1, Math.round(opts.amount))),
+    CallBackURL: callbackUrl
+  }
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    'Content-Type': 'application/json',
+    Accept: 'application/json'
+  }
+
+  const attempts: { url: string; status: number; body: string }[] = []
+
+  for (const path of STK_PATHS) {
+    const url = `${baseUrl(env)}${path}`
+    let res: Response
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        redirect: 'follow',
+        headers,
+        body: JSON.stringify(body)
+      })
+    } catch (e: any) {
+      attempts.push({ url, status: 0, body: e?.message || 'network error' })
+      continue
     }
 
-    const res = await fetch(`${baseUrl(env)}/payments/request-payment/`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body)
-    })
+    const { json, text } = await readBody(res)
 
-    let data: any = null
-    try { data = await res.json() } catch {
-      const text = await res.text().catch(() => '')
-      return {
-        simulated: false,
-        success: false,
-        error: `SasaPay returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`
-      }
-    }
-
-    // SasaPay success: { status: true, ResponseCode: "0", CheckoutRequestID, MerchantRequestID, CustomerMessage, ... }
-    if (data?.status === true && (data.ResponseCode === '0' || data.ResponseCode === 0)) {
+    // Success shape: { status: true, ResponseCode: "0", CheckoutRequestID, ... }
+    if (res.ok && json?.status === true && (json.ResponseCode === '0' || json.ResponseCode === 0)) {
       return {
         simulated: false,
         success: true,
-        checkout_request_id: String(data.CheckoutRequestID || data.MerchantRequestID || ''),
-        merchant_request_id: String(data.MerchantRequestID || data.CheckoutRequestID || ''),
-        customer_message: data.CustomerMessage || data.ResponseDescription || data.detail || 'STK push sent.'
+        checkout_request_id: String(json.CheckoutRequestID || json.MerchantRequestID || ''),
+        merchant_request_id: String(json.MerchantRequestID || json.CheckoutRequestID || ''),
+        customer_message: json.CustomerMessage || json.ResponseDescription || json.detail || 'STK push sent.'
       }
     }
 
-    // Extract the most informative error message SasaPay returned
-    const errMsg =
-      data?.detail ||
-      data?.message ||
-      data?.error ||
-      data?.ResponseDescription ||
-      data?.errors?.[0]?.errorMessage ||
-      `HTTP ${res.status}`
-    return { simulated: false, success: false, error: `SasaPay: ${errMsg}` }
-  } catch (e: any) {
-    return { simulated: false, success: false, error: e?.message || 'SasaPay request failed' }
+    // If it's a 404, keep the attempt and try the next fallback path
+    attempts.push({ url, status: res.status, body: text.slice(0, 300) })
+    if (res.status !== 404) break // any non-404 is a real answer — stop retrying
+  }
+
+  // All attempts failed — return the most informative error we have
+  const last = attempts[attempts.length - 1]
+  return {
+    simulated: false,
+    success: false,
+    error: `SasaPay push failed. Tried ${attempts.length} path(s). Last: [${last.status}] ${last.url} -- ${last.body || 'no body'}`
   }
 }
 
@@ -169,11 +201,14 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string): 
   if (!sasapayConfigured(env)) return { ResultCode: '0', ResultDesc: 'Simulated success' }
   try {
     const token = await getToken(env)
-    const res = await fetch(`${baseUrl(env)}/payments/transaction-status/?CheckoutRequestID=${encodeURIComponent(checkoutRequestId)}`, {
+    const url = `${baseUrl(env)}/api/v1/payments/transaction-status/?CheckoutRequestID=${encodeURIComponent(checkoutRequestId)}`
+    const res = await fetch(url, {
       method: 'GET',
-      headers: { Authorization: `Bearer ${token}` }
+      redirect: 'follow',
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
     })
-    try { return await res.json() } catch { return { ResultCode: 'ERR', ResultDesc: `HTTP ${res.status}` } }
+    const { json, text } = await readBody(res)
+    return json || { ResultCode: 'ERR', ResultDesc: text || `HTTP ${res.status}` }
   } catch (e: any) {
     return { ResultCode: 'ERR', ResultDesc: e?.message || 'Query failed' }
   }
