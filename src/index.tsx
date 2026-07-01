@@ -842,10 +842,16 @@ app.post('/api/sasapay/confirm', requireAuth, async (c) => {
     success = true; receipt = 'SP' + Math.random().toString(36).slice(2, 9).toUpperCase()
   } else {
     const q = await sasapayQuery(c.env, checkout_request_id)
+    // Adapter marks not-yet-known transactions as `pending:true` so we keep polling.
+    if (q?.pending === true) return c.json({ ok: false, status: 'pending' })
     const code = q.ResultCode ?? q.status_code
     if (code === '0' || code === 0 || q.status === true) { success = true; receipt = 'SPL' + Date.now().toString().slice(-7) }
-    else if (code) return c.json({ ok: false, status: 'failed', result_desc: q.ResultDesc || q.message || 'Payment not completed' })
-    else return c.json({ ok: false, status: 'pending' })
+    else if (code !== undefined && code !== null && code !== '' && code !== 'ERR') {
+      // Only surface strings that look like real, safe error messages.
+      const rawDesc = String(q.ResultDesc || q.message || 'Payment not completed')
+      const safeDesc = /</.test(rawDesc) ? 'Payment not completed' : rawDesc
+      return c.json({ ok: false, status: 'failed', result_desc: safeDesc })
+    } else return c.json({ ok: false, status: 'pending' })
   }
   if (success) {
     const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
