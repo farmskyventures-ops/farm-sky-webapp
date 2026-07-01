@@ -31,8 +31,11 @@ const ENV = {
   MPESA_PASSKEY: process.env.MPESA_PASSKEY,
   MPESA_ENV: process.env.MPESA_ENV,
   MPESA_CALLBACK_URL: process.env.MPESA_CALLBACK_URL,
-  SASAPAY_CLIENT_ID: process.env.SASAPAY_CLIENT_ID,
-  SASAPAY_CLIENT_SECRET: process.env.SASAPAY_CLIENT_SECRET,
+  // SasaPay - accept either CLIENT_* or CONSUMER_* naming (auto-alias)
+  SASAPAY_CLIENT_ID:     process.env.SASAPAY_CLIENT_ID     || process.env.SASAPAY_CONSUMER_KEY,
+  SASAPAY_CLIENT_SECRET: process.env.SASAPAY_CLIENT_SECRET || process.env.SASAPAY_CONSUMER_SECRET,
+  SASAPAY_CONSUMER_KEY:    process.env.SASAPAY_CONSUMER_KEY    || process.env.SASAPAY_CLIENT_ID,
+  SASAPAY_CONSUMER_SECRET: process.env.SASAPAY_CONSUMER_SECRET || process.env.SASAPAY_CLIENT_SECRET,
   SASAPAY_MERCHANT_CODE: process.env.SASAPAY_MERCHANT_CODE,
   SASAPAY_ENV: process.env.SASAPAY_ENV,
   SASAPAY_CALLBACK_URL: process.env.SASAPAY_CALLBACK_URL,
@@ -75,9 +78,12 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
   )
 
   // Status check for SasaPay
+  const sasapayId = process.env.SASAPAY_CLIENT_ID || process.env.SASAPAY_CONSUMER_KEY
+  const sasapaySecret = process.env.SASAPAY_CLIENT_SECRET || process.env.SASAPAY_CONSUMER_SECRET
+  const sasapayMerchant = process.env.SASAPAY_MERCHANT_CODE
   console.log(
-    process.env.SASAPAY_CLIENT_ID
+    (sasapayId && sasapaySecret && sasapayMerchant)
       ? 'SasaPay: LIVE credentials detected (' + (process.env.SASAPAY_ENV || 'sandbox') + ')'
-      : 'SasaPay: SIMULATION mode (no SasaPay credentials set).'
+      : `SasaPay: SIMULATION mode (missing ${[!sasapayId && 'CLIENT_ID', !sasapaySecret && 'CLIENT_SECRET', !sasapayMerchant && 'MERCHANT_CODE'].filter(Boolean).join(', ') || 'credentials'}).`
   )
 })
