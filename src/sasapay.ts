@@ -197,6 +197,11 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
 }
 
 // ---------- Transaction status query ----------------------------------------
+// While SasaPay's async pipeline is still processing (typically the first few
+// seconds after we send the STK push), the transaction-status endpoint can
+// respond with 404 ("not found yet"). We MUST NOT surface that as a failure
+// or an HTML error string — the correct interpretation is "still pending",
+// so the front-end keeps polling and eventually the C2B callback resolves it.
 export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string): Promise<any> {
   if (!sasapayConfigured(env)) return { ResultCode: '0', ResultDesc: 'Simulated success' }
   try {
@@ -208,8 +213,17 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string): 
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
     })
     const { json, text } = await readBody(res)
-    return json || { ResultCode: 'ERR', ResultDesc: text || `HTTP ${res.status}` }
+
+    // Happy path: SasaPay returned a real JSON status document.
+    if (json && (json.ResultCode !== undefined || json.status_code !== undefined || json.status !== undefined)) {
+      return json
+    }
+
+    // 404 / HTML / any non-JSON → treat as PENDING so the poller keeps polling.
+    // Never leak provider HTML to the front-end.
+    return { pending: true, status_code: null, ResultDesc: 'Transaction still processing' }
   } catch (e: any) {
-    return { ResultCode: 'ERR', ResultDesc: e?.message || 'Query failed' }
+    // Network / auth errors also become pending, not failed.
+    return { pending: true, status_code: null, ResultDesc: 'Transaction still processing' }
   }
 }
