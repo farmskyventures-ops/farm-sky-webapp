@@ -57,6 +57,34 @@ function refreshPermissionChecklist(prefix, roleSelectId, readOnly = false) {
   if (!box || !$(roleSelectId)) return
   box.innerHTML = permissionChecklist(prefix, templatePermissions($(roleSelectId).value), readOnly)
 }
+const _WEEK_DAYS = [['mon', 'Mon'], ['tue', 'Tue'], ['wed', 'Wed'], ['thu', 'Thu'], ['fri', 'Fri'], ['sat', 'Sat'], ['sun', 'Sun']]
+// Renders a Time-Based Access Control (login window) editor block.
+function scheduleEditor(prefix, sched = {}, readOnly = false) {
+  const enabled = !!sched.schedule_enabled
+  const days = Array.isArray(sched.access_days) ? sched.access_days : []
+  const dis = readOnly ? 'disabled' : ''
+  return `<div class="border rounded-xl p-3 bg-slate-50 text-sm">
+    <label class="flex items-center gap-2 mb-2"><input type="checkbox" id="${prefix}_sched_on" ${enabled ? 'checked' : ''} ${dis}><span class="font-medium">Restrict login to a time window</span></label>
+    <div class="field-label">Active days</div>
+    <div class="flex flex-wrap gap-2 mb-3">
+      ${_WEEK_DAYS.map(([k, lbl]) => `<label class="flex items-center gap-1 text-xs border rounded-lg px-2 py-1 bg-white"><input type="checkbox" value="${k}" data-sched-day="${prefix}" ${days.includes(k) ? 'checked' : ''} ${dis}>${lbl}</label>`).join('')}
+    </div>
+    <div class="responsive-grid cols-2">
+      <div><label class="field-label">Active from</label><input type="time" id="${prefix}_sched_start" value="${esc(sched.access_start || '09:00')}" class="px-3 py-2 border rounded-lg w-full" ${dis}></div>
+      <div><label class="field-label">Active until</label><input type="time" id="${prefix}_sched_end" value="${esc(sched.access_end || '16:00')}" class="px-3 py-2 border rounded-lg w-full" ${dis}></div>
+    </div>
+    <div class="help-text">Access is blocked outside these days/hours (server time). Leave unchecked for 24/7 access.</div>
+  </div>`
+}
+function collectSchedule(prefix) {
+  const days = Array.from(document.querySelectorAll(`[data-sched-day="${prefix}"]:checked`)).map(el => el.value)
+  return {
+    schedule_enabled: !!($(prefix + '_sched_on') && $(prefix + '_sched_on').checked),
+    access_days: days,
+    access_start: $(prefix + '_sched_start') ? $(prefix + '_sched_start').value : '',
+    access_end: $(prefix + '_sched_end') ? $(prefix + '_sched_end').value : ''
+  }
+}
 function canDo(perm) {
   if (!state.user) return false
   if (['super_admin', 'admin'].includes(state.user.role)) return true
@@ -389,6 +417,7 @@ function navItems() {
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
+    { k: 'settings', i: 'fa-sliders', t: 'Financing Settings' },
     { k: 'exports', i: 'fa-database', t: 'Data Export' }]
   if (r === 'operations_finance') return [...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
@@ -444,9 +473,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -717,31 +746,25 @@ window.dispatchContract = async (id) => {
 window.payModal = async (id, amount, outstanding, kind) => {
   kind = kind || 'repay'
   const isCash = kind === 'cash'
-  let mpMode = { mode: 'simulation', live: false }, spMode = { mode: 'simulation', live: false }, bnMode = { mode: 'simulation', live: false }
+  let mpMode = { mode: 'simulation', live: false }, spMode = { mode: 'simulation', live: false }
   try { mpMode = (await api.get('/mpesa/status')).data } catch {}
   try { spMode = (await api.get('/sasapay/status')).data } catch {}
-  try { bnMode = (await api.get('/buni/status')).data } catch {}
   const modeBadge = (m) => m.live
     ? `<span class="text-[10px] text-emerald-700">live · ${esc(m.mode)}</span>`
     : `<span class="text-[10px] text-amber-700">simulation</span>`
   showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-mobile-alt text-teal-600 mr-2"></i>${isCash ? 'Cash Checkout' : 'Repayment'}</h3>
     <p class="text-xs text-slate-500 mb-3">${isCash ? 'Amount due' : 'Outstanding'}: ${fmt(outstanding)}</p>
     <label class="text-sm font-medium block mb-2">Choose payment method</label>
-    <div class="grid grid-cols-3 gap-2 mb-3">
-      <label class="border rounded-lg p-2 text-center cursor-pointer bg-emerald-50 border-emerald-300 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500">
+    <div class="grid grid-cols-2 gap-3 mb-3">
+      <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500 has-[:checked]:border-emerald-400">
         <input type="radio" name="paymethod" value="mpesa" checked class="hidden">
-        <i class="fas fa-mobile-screen-button text-emerald-600 text-lg block"></i>
-        <span class="text-xs font-medium">M-Pesa</span><div>${modeBadge(mpMode)}</div>
+        <img src="/static/mpesa-logo.svg" alt="M-Pesa" class="h-10 mx-auto mb-1 object-contain">
+        <div>${modeBadge(mpMode)}</div>
       </label>
-      <label class="border rounded-lg p-2 text-center cursor-pointer bg-blue-50 border-blue-300 has-[:checked]:ring-2 has-[:checked]:ring-blue-500">
+      <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-green-500 has-[:checked]:border-green-400">
         <input type="radio" name="paymethod" value="sasapay" class="hidden">
-        <i class="fas fa-wallet text-blue-600 text-lg block"></i>
-        <span class="text-xs font-medium">SasaPay</span><div>${modeBadge(spMode)}</div>
-      </label>
-      <label class="border rounded-lg p-2 text-center cursor-pointer bg-amber-50 border-amber-300 has-[:checked]:ring-2 has-[:checked]:ring-amber-500">
-        <input type="radio" name="paymethod" value="buni" class="hidden">
-        <i class="fas fa-building-columns text-amber-700 text-lg block"></i>
-        <span class="text-xs font-medium">KCB Buni</span><div>${modeBadge(bnMode)}</div>
+        <img src="/static/sasapay-logo.svg" alt="SasaPay" class="h-10 mx-auto mb-1 object-contain">
+        <div>${modeBadge(spMode)}</div>
       </label>
     </div>
     <label class="text-sm font-medium">Phone</label><input id="mpphone" value="${esc(state.user.phone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg">
@@ -753,9 +776,9 @@ window.payModal = async (id, amount, outstanding, kind) => {
 window.doPay = async (id, kind) => {
   const isCash = kind === 'cash'
   const method = document.querySelector('input[name="paymethod"]:checked')?.value || 'mpesa'
-  const endpoint = method === 'sasapay' ? '/sasapay/stkpush' : method === 'buni' ? '/buni/stkpush' : '/mpesa/stkpush'
-  const confirmEndpoint = method === 'sasapay' ? '/sasapay/confirm' : method === 'buni' ? '/buni/confirm' : '/mpesa/confirm'
-  const methodLabel = method === 'sasapay' ? 'SasaPay' : method === 'buni' ? 'KCB Buni' : 'M-Pesa'
+  const endpoint = method === 'sasapay' ? '/sasapay/stkpush' : '/mpesa/stkpush'
+  const confirmEndpoint = method === 'sasapay' ? '/sasapay/confirm' : '/mpesa/confirm'
+  const methodLabel = method === 'sasapay' ? 'SasaPay' : 'M-Pesa'
   const btn = $('payBtn'); btn.disabled = true; btn.classList.add('opacity-50')
   $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Sending ${methodLabel} STK push...</div>`
   try {
@@ -1342,6 +1365,10 @@ window.openAccessManager = async (editRoleKey = '') => {
         <div class="field-label">Permission check-boxes shown for this role</div>
         <div id="rt_perm_box" class="responsive-grid cols-2">${permissionChecklist('rt_perm', role?.permissions || {}, false)}</div>
       </div>
+      <div class="mt-4">
+        <div class="field-label">Time-Based Access Control (login window)</div>
+        ${scheduleEditor('rt', { schedule_enabled: role?.schedule_enabled, access_days: role?.access_days, access_start: role?.access_start, access_end: role?.access_end }, false)}
+      </div>
       <div class="flex gap-2 mt-4 flex-wrap">
         <button onclick="saveRoleTemplate('${esc(role?.role_key || '')}')" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm">Save Role Category</button>
         ${role && !role.is_system ? `<button onclick="deleteRoleTemplate('${esc(role.role_key)}')" class="btn bg-red-100 text-red-700 px-4 py-2 rounded-lg text-sm">Delete Role Category</button>` : ''}
@@ -1378,11 +1405,16 @@ window.deletePermissionCatalog = async (key) => {
 window.saveRoleTemplate = async () => {
   if (!confirmEdit('Save this role category and permission selection?')) return
   try {
+    const sched = collectSchedule('rt')
     await api.post('/role-templates', {
       role_key: $('role_key').value,
       label: $('role_label').value,
       description: $('role_desc').value,
-      permissions: selectedPermissions('rt_perm')
+      permissions: selectedPermissions('rt_perm'),
+      schedule_enabled: sched.schedule_enabled,
+      access_days: sched.access_days,
+      access_start: sched.access_start,
+      access_end: sched.access_end
     })
     _permMeta = { permissions: [], roles: [] }
     await ensurePermissionMeta()
@@ -1413,6 +1445,7 @@ window.addUserModal = async () => {
       <input id="nu_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_pwd" placeholder="Password (optional — auto-generated if blank)" class="w-full px-3 py-2 border rounded-lg">
       <div><div class="field-label">Permission check-boxes</div><div id="nu_perm_box" class="responsive-grid cols-2">${permissionChecklist('nu_perm', templatePermissions(defaultRole), !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Toggle the exact permissions to assign to this user.' : 'Only Super Admin can customize the check-box selection. Admin users see role-based defaults.'}</div></div>
+      ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control (login window)</div>${scheduleEditor('nu', {}, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
     </div>
     <div class="flex gap-2 mt-4"><button onclick="doAddUser()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create User</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
   $('nu_role').onchange = () => refreshPermissionChecklist('nu_perm', 'nu_role', !allowCustomPerms)
@@ -1421,7 +1454,7 @@ window.doAddUser = async () => {
   try {
     const body = { full_name: $('nu_name').value, phone: $('nu_phone').value, email: $('nu_email').value, role: $('nu_role').value, label: $('nu_label').value, region: $('nu_region').value }
     if ($('nu_pwd').value) body.password = $('nu_pwd').value
-    if (state.user.role === 'super_admin') body.permissions = selectedPermissions('nu_perm')
+    if (state.user.role === 'super_admin') { body.permissions = selectedPermissions('nu_perm'); Object.assign(body, collectSchedule('nu')) }
     const { data } = await api.post('/users', body)
     closeModal()
     showCredential('User Created', body.full_name, body.phone, data.password, data.password_was_set_by_admin)
@@ -1440,6 +1473,7 @@ window.editUserModal = async (id) => {
     <input id="eu_label" value="${esc(u.label || '')}" placeholder="Label" class="w-full px-3 py-2 border rounded-lg">
     <input id="eu_region" value="${esc(u.region || '')}" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
     <div><div class="field-label">Permission check-boxes</div><div id="eu_perm_box" class="responsive-grid cols-2">${permissionChecklist('eu_perm', u.permissions || {}, !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Update the assigned permission check-boxes, then confirm to save.' : 'Only Super Admin can customize the permission check-boxes.'}</div></div>
+    ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control (login window)</div>${scheduleEditor('eu', { schedule_enabled: u.schedule_enabled, access_days: u.access_days, access_start: u.access_start, access_end: u.access_end }, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
     <input id="eu_pwd" placeholder="New password (leave blank to keep)" class="w-full px-3 py-2 border rounded-lg">
   </div><div class="flex gap-2 mt-4"><button onclick="doEditUser(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
   $('eu_role').onchange = () => refreshPermissionChecklist('eu_perm', 'eu_role', !allowCustomPerms)
@@ -1449,7 +1483,7 @@ window.doEditUser = async (id) => {
   try {
     const body = { full_name: $('eu_name').value, phone: $('eu_phone').value, email: $('eu_email').value, role: $('eu_role').value, label: $('eu_label').value, region: $('eu_region').value }
     if ($('eu_pwd').value) body.password = $('eu_pwd').value
-    if (state.user.role === 'super_admin') body.permissions = selectedPermissions('eu_perm')
+    if (state.user.role === 'super_admin') { body.permissions = selectedPermissions('eu_perm'); Object.assign(body, collectSchedule('eu')) }
     await api.put('/users/' + id, body)
     closeModal(); toast('User updated'); viewUsers()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
@@ -1474,6 +1508,100 @@ async function viewRepayments() {
     <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Contract</th><th class="text-left px-4 py-3">Customer</th><th class="text-left px-4 py-3">Inst.</th><th class="text-left px-4 py-3">Due Date</th><th class="text-right px-4 py-3">Amount</th><th class="text-right px-4 py-3">Paid</th><th class="text-left px-4 py-3">Status</th></tr></thead>
     <tbody>${data.repayments.map(r => `<tr class="border-t border-slate-100"><td class="px-4 py-3 font-mono text-xs">${esc(r.contract_ref)}</td><td class="px-4 py-3">${esc(r.customer)}</td><td class="px-4 py-3">#${r.installment_no}</td><td class="px-4 py-3">${r.due_date}</td><td class="px-4 py-3 text-right">${fmt(r.amount_due)}</td><td class="px-4 py-3 text-right">${fmt(r.amount_paid)}</td><td class="px-4 py-3">${badge(r.status)}</td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No repayments</td></tr>'}</tbody>
   </table></div>`
+}
+
+// ---------------------------------------------------------------------------
+// FINANCING & MARKUP SETTINGS (processing fee + markup)
+// ---------------------------------------------------------------------------
+let _feeState = { enabled: false, mode: 'percentage', percentage_rate: 0, tiers: [] }
+async function viewSettings() {
+  let cfg = {}
+  try { cfg = (await api.get('/settings/financing')).data } catch (e) { $('content').innerHTML = '<div class="card p-6 text-sm text-red-600">Unable to load settings.</div>'; return }
+  const canFee = cfg.can_manage_processing_fees
+  const canMarkup = cfg.can_manage_markup
+  const pf = cfg.processing_fee || {}
+  _feeState = { enabled: !!pf.enabled, mode: pf.mode === 'tiered' ? 'tiered' : 'percentage', percentage_rate: Number(pf.percentage_rate || 0), tiers: Array.isArray(pf.tiers) ? pf.tiers.map(t => ({ min: Number(t.min || 0), max: Number(t.max || 0), fee: Number(t.fee || 0) })) : [] }
+  const fm = cfg.financing_markup || {}
+  $('content').innerHTML = `
+    <div class="space-y-6 max-w-3xl">
+      <!-- Financing Markup -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-percent text-teal-600 mr-2"></i>Financing Markup Percentage</h3>
+        <p class="text-xs text-slate-500 mb-4">Default markup percentages applied when new equipment is added. ${canMarkup ? '' : '<span class="text-amber-600">You do not have permission to edit these.</span>'}</p>
+        <div class="responsive-grid cols-2 text-sm">
+          <div><label class="field-label">Default cash markup %</label><input id="mk_cash" type="number" step="0.1" value="${Number(fm.default_cash_markup_pct ?? 10)}" class="px-3 py-2 border rounded-lg w-full" ${canMarkup ? '' : 'disabled'}></div>
+          <div><label class="field-label">Default financing markup %</label><input id="mk_credit" type="number" step="0.1" value="${Number(fm.default_credit_markup_pct ?? 20)}" class="px-3 py-2 border rounded-lg w-full" ${canMarkup ? '' : 'disabled'}></div>
+        </div>
+        ${canMarkup ? '<button onclick="saveMarkup()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm mt-4">Save Markup</button>' : ''}
+      </div>
+
+      <!-- Processing Fee -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-receipt text-teal-600 mr-2"></i>Processing Fee</h3>
+        <p class="text-xs text-slate-500 mb-4">Configure a processing fee applied to the amount borrowed on financed purchases. ${canFee ? '' : '<span class="text-amber-600">You do not have permission to edit these.</span>'}</p>
+        <label class="flex items-center gap-2 text-sm mb-4">
+          <input type="checkbox" id="pf_enabled" ${_feeState.enabled ? 'checked' : ''} ${canFee ? '' : 'disabled'} onchange="_feeState.enabled=this.checked">
+          <span class="font-medium">Enable processing fee</span>
+        </label>
+        <div class="mb-4">
+          <div class="field-label mb-1">Fee structure</div>
+          <div class="flex gap-2">
+            <label class="flex-1 border rounded-lg p-3 text-sm cursor-pointer ${_feeState.mode === 'percentage' ? 'ring-2 ring-teal-500 border-teal-400' : 'border-slate-200'}">
+              <input type="radio" name="pf_mode" value="percentage" class="mr-2" ${_feeState.mode === 'percentage' ? 'checked' : ''} ${canFee ? '' : 'disabled'} onchange="setFeeMode('percentage')">
+              <b>Option 1 — Percentage-Based</b><div class="text-xs text-slate-400 ml-5">A flat % of the total amount borrowed.</div>
+            </label>
+            <label class="flex-1 border rounded-lg p-3 text-sm cursor-pointer ${_feeState.mode === 'tiered' ? 'ring-2 ring-teal-500 border-teal-400' : 'border-slate-200'}">
+              <input type="radio" name="pf_mode" value="tiered" class="mr-2" ${_feeState.mode === 'tiered' ? 'checked' : ''} ${canFee ? '' : 'disabled'} onchange="setFeeMode('tiered')">
+              <b>Option 2 — Tiered Range Fee</b><div class="text-xs text-slate-400 ml-5">A flat fee per amount-borrowed bracket.</div>
+            </label>
+          </div>
+        </div>
+        <div id="pf_body"></div>
+        ${canFee ? '<button onclick="saveProcessingFee()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm mt-4">Save Processing Fee</button>' : ''}
+      </div>
+    </div>`
+  renderFeeBody(canFee)
+}
+window.setFeeMode = (mode) => { _feeState.mode = mode; viewSettings() }
+function renderFeeBody(canFee) {
+  const box = $('pf_body'); if (!box) return
+  if (_feeState.mode === 'percentage') {
+    box.innerHTML = `<div class="text-sm max-w-xs"><label class="field-label">Percentage rate (%)</label>
+      <input id="pf_rate" type="number" step="0.1" value="${Number(_feeState.percentage_rate || 0)}" placeholder="e.g. 2.5" class="px-3 py-2 border rounded-lg w-full" ${canFee ? '' : 'disabled'} oninput="_feeState.percentage_rate=Number(this.value||0)">
+      <div class="help-text">Fee = borrowed amount × this percentage.</div></div>`
+  } else {
+    const rows = _feeState.tiers.map((t, i) => `<tr class="border-t border-slate-100">
+      <td class="px-2 py-2"><input type="number" value="${Number(t.min)}" class="px-2 py-1 border rounded w-full text-sm" ${canFee ? '' : 'disabled'} onchange="updateTier(${i},'min',this.value)"></td>
+      <td class="px-2 py-2"><input type="number" value="${Number(t.max)}" class="px-2 py-1 border rounded w-full text-sm" ${canFee ? '' : 'disabled'} onchange="updateTier(${i},'max',this.value)"></td>
+      <td class="px-2 py-2"><input type="number" value="${Number(t.fee)}" class="px-2 py-1 border rounded w-full text-sm" ${canFee ? '' : 'disabled'} onchange="updateTier(${i},'fee',this.value)"></td>
+      <td class="px-2 py-2 text-right">${canFee ? `<button onclick="removeTier(${i})" class="text-red-600 hover:underline text-xs">Delete</button>` : ''}</td>
+    </tr>`).join('')
+    box.innerHTML = `<div class="border rounded-xl overflow-hidden">
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-2 py-2">From (KES)</th><th class="text-left px-2 py-2">To (KES)</th><th class="text-left px-2 py-2">Flat Fee (KES)</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4" class="text-center py-6 text-slate-400 text-xs">No tiers yet. Add one below.</td></tr>'}</tbody>
+      </table></div>
+      ${canFee ? '<button onclick="addTier()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm mt-3"><i class="fas fa-plus mr-1"></i>Add Tier</button>' : ''}
+      <div class="help-text mt-2">Example: 100,000 to 200,000 → Flat Fee 8,000.</div>`
+  }
+}
+window.addTier = () => { _feeState.tiers.push({ min: 0, max: 0, fee: 0 }); renderFeeBody(true) }
+window.removeTier = (i) => { _feeState.tiers.splice(i, 1); renderFeeBody(true) }
+window.updateTier = (i, key, val) => { if (_feeState.tiers[i]) _feeState.tiers[i][key] = Number(val || 0) }
+window.saveMarkup = async () => {
+  try {
+    await api.put('/settings/financing-markup', { default_cash_markup_pct: Number($('mk_cash').value || 0), default_credit_markup_pct: Number($('mk_credit').value || 0) })
+    toast('Markup settings saved')
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.saveProcessingFee = async () => {
+  const body = { enabled: _feeState.enabled, mode: _feeState.mode, percentage_rate: Number(_feeState.percentage_rate || 0), tiers: _feeState.tiers }
+  if (_feeState.mode === 'tiered') {
+    const bad = body.tiers.find(t => Number(t.max) < Number(t.min))
+    if (bad) return toast('Each tier "To" value must be greater than or equal to "From".', false)
+  }
+  try { await api.put('/settings/processing-fee', body); toast('Processing fee saved') }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 
 // ---------------------------------------------------------------------------

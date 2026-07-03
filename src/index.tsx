@@ -67,6 +67,25 @@ function hasPermission(user: SessionUser, perm: string) {
   if (['super_admin', 'admin'].includes(user.role)) return true
   return Boolean(user.permissions?.[perm])
 }
+// Visibility permissions are opt-out: absent key = allowed (backward compatible),
+// explicit false = hidden. Admins always allowed.
+function hasVisibility(user: SessionUser, perm: string) {
+  if (['super_admin', 'admin'].includes(user.role)) return true
+  const v = user.permissions?.[perm]
+  return v === undefined ? true : Boolean(v)
+}
+// Redact farmer records based on Data Object Visibility permissions.
+const FINANCIAL_FIELDS = ['existing_loans', 'credit_score', 'risk_band', 'annual_production']
+const PROFILE_FIELDS = ['value_chain', 'value_chain_type', 'county', 'sub_county', 'ward', 'village', 'acreage', 'herd_size', 'farm_experience', 'sacco_membership', 'date_of_birth', 'gender', 'latitude', 'longitude']
+const DOCUMENT_FIELDS = ['id_front_url', 'id_back_url', 'selfie_url', 'passport_photo_url']
+function redactCustomer(user: SessionUser, cust: any) {
+  if (!cust) return cust
+  const out = { ...cust }
+  if (!hasVisibility(user, 'view_financial_data')) for (const f of FINANCIAL_FIELDS) if (f in out) out[f] = null
+  if (!hasVisibility(user, 'view_farmer_profile_data')) for (const f of PROFILE_FIELDS) if (f in out) out[f] = null
+  if (!hasVisibility(user, 'view_document_attachments')) for (const f of DOCUMENT_FIELDS) if (f in out) out[f] = null
+  return out
+}
 function numberVal(value: any, fallback = 0) {
   const n = Number(value)
   return Number.isFinite(n) ? n : fallback
@@ -78,6 +97,83 @@ function boolInt(value: any, fallback = true) {
 }
 function roundMoney(value: number) {
   return Math.round((Number(value) || 0) * 100) / 100
+}
+// ---- App settings (key/value JSON store) ----
+async function getSetting<T = any>(c: any, key: string, fallback: T): Promise<T> {
+  try {
+    const row = await c.env.DB.prepare(`SELECT setting_value FROM app_settings WHERE setting_key=?`).bind(key).first<any>()
+    if (row?.setting_value) return safeJson<T>(row.setting_value, fallback)
+  } catch (_) {}
+  return fallback
+}
+async function setSetting(c: any, key: string, value: any): Promise<void> {
+  const json = JSON.stringify(value)
+  const existing = await c.env.DB.prepare(`SELECT setting_key FROM app_settings WHERE setting_key=?`).bind(key).first<any>()
+  if (existing) {
+    await c.env.DB.prepare(`UPDATE app_settings SET setting_value=?, updated_at=CURRENT_TIMESTAMP WHERE setting_key=?`).bind(json, key).run()
+  } else {
+    await c.env.DB.prepare(`INSERT INTO app_settings (setting_key, setting_value) VALUES (?,?)`).bind(key, json).run()
+  }
+}
+const DEFAULT_PROCESSING_FEE = { enabled: false, mode: 'percentage', percentage_rate: 0, tiers: [] as Array<{ min: number; max: number; fee: number }> }
+function normalizeProcessingFee(raw: any) {
+  const cfg: any = { ...DEFAULT_PROCESSING_FEE, ...(raw && typeof raw === 'object' ? raw : {}) }
+  cfg.enabled = Boolean(cfg.enabled)
+  cfg.mode = cfg.mode === 'tiered' ? 'tiered' : 'percentage'
+  cfg.percentage_rate = numberVal(cfg.percentage_rate, 0)
+  cfg.tiers = Array.isArray(cfg.tiers)
+    ? cfg.tiers
+        .map((t: any) => ({ min: numberVal(t.min, 0), max: numberVal(t.max, 0), fee: numberVal(t.fee, 0) }))
+        .filter((t: any) => t.max >= t.min)
+    : []
+  return cfg
+}
+// Compute the processing fee applied to a borrowed (financed) amount.
+function computeProcessingFee(cfg: any, borrowedAmount: number): number {
+  const c = normalizeProcessingFee(cfg)
+  if (!c.enabled) return 0
+  const amount = Number(borrowedAmount) || 0
+  if (c.mode === 'percentage') return roundMoney(amount * (c.percentage_rate / 100))
+  const tier = c.tiers.find((t: any) => amount >= t.min && amount <= t.max)
+  return tier ? roundMoney(tier.fee) : 0
+}
+// ---- Time-based access windows ----
+const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']
+function parseHM(value: any): number | null {
+  const m = String(value || '').match(/^(\d{1,2}):(\d{2})$/)
+  if (!m) return null
+  return Number(m[1]) * 60 + Number(m[2])
+}
+// Returns { allowed:boolean, reason?:string } given a schedule config and current time.
+function checkAccessWindow(schedule: { enabled?: any; days?: any; start?: any; end?: any }, now = new Date()): { allowed: boolean; reason?: string } {
+  if (!schedule || !schedule.enabled) return { allowed: true }
+  const days: string[] = Array.isArray(schedule.days) ? schedule.days.map((d: string) => String(d).toLowerCase()) : []
+  const today = DAY_KEYS[now.getDay()]
+  if (days.length && !days.includes(today)) {
+    return { allowed: false, reason: 'Access is not permitted on this day for your role.' }
+  }
+  const start = parseHM(schedule.start)
+  const end = parseHM(schedule.end)
+  if (start !== null && end !== null) {
+    const cur = now.getHours() * 60 + now.getMinutes()
+    if (cur < start || cur > end) {
+      return { allowed: false, reason: `Access is only permitted between ${schedule.start} and ${schedule.end}.` }
+    }
+  }
+  return { allowed: true }
+}
+// Resolve the effective login window for a user (user override, else role template).
+async function resolveAccessWindow(c: any, user: any): Promise<{ enabled: boolean; days: string[]; start: string; end: string }> {
+  if (Number(user.schedule_enabled) === 1) {
+    return { enabled: true, days: safeJson<string[]>(user.access_days, []), start: user.access_start || '', end: user.access_end || '' }
+  }
+  try {
+    const row = await c.env.DB.prepare(`SELECT schedule_enabled, access_days, access_start, access_end FROM role_templates WHERE role_key=?`).bind(user.role).first<any>()
+    if (row && Number(row.schedule_enabled) === 1) {
+      return { enabled: true, days: safeJson<string[]>(row.access_days, []), start: row.access_start || '', end: row.access_end || '' }
+    }
+  } catch (_) {}
+  return { enabled: false, days: [], start: '', end: '' }
 }
 function normalizeProductPayload(b: any) {
   const buying = numberVal(b.buying_price)
@@ -119,7 +215,7 @@ function normalizeProductPayload(b: any) {
     transunion_product_code: b.transunion_product_code || null
   }
 }
-function financingQuote(p: any, quantity: any, paymentType: string, termMonths: any) {
+function financingQuote(p: any, quantity: any, paymentType: string, termMonths: any, processingFeeCfg?: any) {
   const qty = Math.max(1, numberVal(quantity, 1))
   const supplier_cost = roundMoney(numberVal(p.buying_price) * qty)
   if (paymentType === 'cash') {
@@ -160,7 +256,9 @@ function financingQuote(p: any, quantity: any, paymentType: string, termMonths: 
   const financing_charge = model === 'loan_interest'
     ? roundMoney(finance_principal * (interestRate / 100) * (term / 12))
     : roundMoney(finance_principal * (interestRate / 100) * (term / 12))
-  const financed_total = roundMoney(finance_principal + financing_charge)
+  // Processing fee is calculated on the amount borrowed (finance principal).
+  const processing_fee = computeProcessingFee(processingFeeCfg, finance_principal)
+  const financed_total = roundMoney(finance_principal + financing_charge + processing_fee)
   const installment_amount = installment_count > 0 ? roundMoney(financed_total / installment_count) : financed_total
   const total_payable = roundMoney(deposit_amount + financed_total)
   return {
@@ -173,6 +271,7 @@ function financingQuote(p: any, quantity: any, paymentType: string, termMonths: 
     deposit_pct,
     deposit_amount,
     finance_principal,
+    processing_fee,
     interest_rate_pct: interestRate,
     term_months: term,
     payment_frequency: frequency,
@@ -182,9 +281,10 @@ function financingQuote(p: any, quantity: any, paymentType: string, termMonths: 
     total_price: principalBase,
     total_payable,
     outstanding_after_deposit: financed_total,
-    disclosure_note: model === 'paygo'
+    disclosure_note: (model === 'paygo'
       ? 'PAYGO financing uses an upfront deposit and scheduled unlock payments similar to M-KOPA, adapted for agricultural equipment.'
-      : 'Normal financing applies the configured flat interest across the selected term.',
+      : 'Normal financing applies the configured flat interest across the selected term.')
+      + (processing_fee > 0 ? ` A processing fee of ${processing_fee.toLocaleString()} applies to the financed amount.` : ''),
     terms_text: p.financing_terms_text || null,
     terms_document_url: p.financing_terms_doc_url || null
   }
@@ -193,12 +293,17 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
   const token = getCookie(c, 'session') || c.req.header('Authorization')?.replace('Bearer ', '')
   if (!token) return null
   const row = await c.env.DB.prepare(
-    `SELECT u.id, u.full_name, u.phone, u.role, u.region, u.label, u.permissions, u.status, s.expires_at
+    `SELECT u.id, u.full_name, u.phone, u.role, u.region, u.label, u.permissions, u.status,
+            u.schedule_enabled, u.access_days, u.access_start, u.access_end, s.expires_at
      FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`
-  ).bind(token).first()
+  ).bind(token).first<any>()
   if (!row) return null
   if (Number(row.expires_at) < Date.now()) return null
   if (row.status !== 'active') return null
+  // Enforce time-based access window on every request.
+  const window = await resolveAccessWindow(c, row)
+  const access = checkAccessWindow({ enabled: window.enabled, days: window.days, start: window.start, end: window.end })
+  if (!access.allowed) return null
   const fallback = await loadRoleTemplate(c, row.role)
   return {
     id: row.id,
@@ -285,6 +390,10 @@ app.post('/api/login', async (c) => {
   let user = await c.env.DB.prepare(`SELECT * FROM users WHERE phone = ? OR phone = ?`).bind(raw, norm).first<any>()
   if (!user || user.password !== String(password)) return c.json({ error: 'Invalid phone number or password' }, 401)
   if (user.status !== 'active') return c.json({ error: 'Account suspended' }, 403)
+  // Enforce time-based access windows (per-user override, else role template).
+  const window = await resolveAccessWindow(c, user)
+  const access = checkAccessWindow({ enabled: window.enabled, days: window.days, start: window.start, end: window.end })
+  if (!access.allowed) return c.json({ error: access.reason || 'Access is restricted at this time.' }, 403)
   const token = await createSession(c, user)
   await audit(c, user.id, 'login', 'user', `${user.role} logged in`)
   const loginFallback = await loadRoleTemplate(c, user.role)
@@ -436,14 +545,16 @@ app.get('/api/customers', requireAuth, async (c) => {
   if (user.role === 'agent') { query += ` WHERE agent_id = ?`; binds = [user.id] }
   query += ` ORDER BY created_at DESC`
   const { results } = await c.env.DB.prepare(query).bind(...binds).all()
-  return c.json({ customers: results })
+  return c.json({ customers: (results as any[]).map((r) => redactCustomer(user, r)) })
 })
 app.get('/api/customers/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
   const cust = await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(c.req.param('id')).first()
   if (!cust) return c.json({ error: 'Not found' }, 404)
   const tu = await c.env.DB.prepare(`SELECT * FROM transunion_checks WHERE customer_id=? ORDER BY id DESC LIMIT 1`).bind(c.req.param('id')).first()
   const idv = await c.env.DB.prepare(`SELECT * FROM id_verifications WHERE customer_id=? ORDER BY id DESC LIMIT 1`).bind(c.req.param('id')).first()
-  return c.json({ customer: cust, transunion: tu, id_verification: idv })
+  const showFinancial = hasVisibility(user, 'view_financial_data')
+  return c.json({ customer: redactCustomer(user, cust), transunion: showFinancial ? tu : null, id_verification: idv })
 })
 app.post('/api/customers', requireAuth, requireRole('agent', 'admin', 'super_admin'), async (c) => {
   const b = await c.req.json()
@@ -577,7 +688,8 @@ app.post('/api/murabaha/quote', requireAuth, async (c) => {
   if (!p) return c.json({ error: 'Product not found' }, 404)
   if (payment_type === 'cash' && !p.cash_enabled) return c.json({ error: 'Cash purchase is not enabled for this equipment' }, 400)
   if (payment_type !== 'cash' && !p.financing_enabled) return c.json({ error: 'Financing is not enabled for this equipment' }, 400)
-  const q = financingQuote(p, quantity, payment_type === 'cash' ? 'cash' : 'financing', term_months)
+  const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
+  const q = financingQuote(p, quantity, payment_type === 'cash' ? 'cash' : 'financing', term_months, feeCfg)
   return c.json({ product: p.name, ...q })
 })
 app.post('/api/murabaha/apply', requireAuth, async (c) => {
@@ -603,7 +715,8 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
       customer_id: custId
     }, 412)
   }
-  const q = financingQuote(p, qty, normalizedPaymentType, term_months)
+  const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
+  const q = financingQuote(p, qty, normalizedPaymentType, term_months, feeCfg)
   const contractRef = ref(normalizedPaymentType === 'cash' ? 'CSH' : (q.financing_model === 'paygo' ? 'PGO' : 'FIN'))
   const status = normalizedPaymentType === 'cash'
     ? (q.amount_due_now > 0 ? 'pending_payment' : 'awaiting_cash_balance')
@@ -639,11 +752,20 @@ app.get('/api/murabaha', requireAuth, async (c) => {
   let q = `SELECT mc.*, p.name as product_name, cu.full_name as customer_name
            FROM murabaha_contracts mc JOIN products p ON p.id = mc.product_id JOIN customers cu ON cu.id = mc.customer_id`
   const binds: any[] = []
-  if (user.role === 'agent') { q += ` WHERE mc.agent_id = ?`; binds.push(user.id) }
+  const where: string[] = []
+  if (user.role === 'agent') { where.push(`mc.agent_id = ?`); binds.push(user.id) }
   else if (user.role === 'customer') {
     const myCust = await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(user.id).first<any>()
-    q += ` WHERE mc.customer_id = ?`; binds.push(myCust?.id || -1)
+    where.push(`mc.customer_id = ?`); binds.push(myCust?.id || -1)
+  } else {
+    // Staff roles: enforce Sales Visibility permissions (cash vs financed).
+    const canCash = hasVisibility(user, 'view_cash_sales')
+    const canFin = hasVisibility(user, 'view_financed_sales')
+    if (!canCash && !canFin) { where.push(`1 = 0`) }
+    else if (canCash && !canFin) { where.push(`mc.payment_type = 'cash'`) }
+    else if (!canCash && canFin) { where.push(`mc.payment_type = 'financing'`) }
   }
+  if (where.length) q += ` WHERE ` + where.join(' AND ')
   q += ` ORDER BY mc.created_at DESC`
   const { results } = await c.env.DB.prepare(q).bind(...binds).all()
   return c.json({ contracts: results })
@@ -954,7 +1076,9 @@ app.post('/api/buni/callback', async (c) => {
   } catch { return c.json({ ResultCode: 0, ResultDesc: 'Accepted' }) }
 })
 app.get('/api/buni/status', requireAuth, (c) => {
-  return c.json({ live: buniConfigured(c.env), mode: buniConfigured(c.env) ? (c.env.BUNI_ENV || 'sandbox') : 'simulation' })
+  // Buni is hidden from the front-end user. The gateway routes remain
+  // functional for server-to-server integrations, but the UI never exposes it.
+  return c.json({ live: buniConfigured(c.env), mode: buniConfigured(c.env) ? (c.env.BUNI_ENV || 'sandbox') : 'simulation', hidden: true })
 })
 
 // ----------------------------------------------------------------------------
@@ -1061,11 +1185,11 @@ app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), asy
 // USER ACCOUNTS (admin) - create, edit, activate/deactivate, delete
 // ----------------------------------------------------------------------------
 app.get('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
-  const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, email, role, label, permissions, status, region, created_at FROM users ORDER BY id`).all()
+  const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, email, role, label, permissions, status, region, schedule_enabled, access_days, access_start, access_end, created_at FROM users ORDER BY id`).all()
   const usersWithPerms = [] as any[]
   for (const u of results as any[]) {
     const fallback = await loadRoleTemplate(c, u.role)
-    usersWithPerms.push({ ...u, permissions: parsePermissions(u.permissions, u.role, fallback) })
+    usersWithPerms.push({ ...u, permissions: parsePermissions(u.permissions, u.role, fallback), access_days: safeJson(u.access_days, []) })
   }
   return c.json({ users: usersWithPerms })
 })
@@ -1080,7 +1204,9 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const perms = await permissionsForRole(c, String(b.role), b.permissions || {})
   const templateRow = await c.env.DB.prepare(`SELECT label FROM role_templates WHERE role_key=?`).bind(String(b.role)).first<any>()
   const label = b.label || templateRow?.label || (String(b.role) === 'operations_finance' ? 'Operations & Finance' : String(b.role).replace(/_/g, ' '))
-  const r = await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set) VALUES (?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, pwd, b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided).run()
+  const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
+  const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
+  const r = await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, pwd, b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
   await audit(c, c.get('user').id, 'create', 'user', `${b.full_name} (${b.role})`)
   return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: provided })
@@ -1089,10 +1215,12 @@ app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), asyn
   const id = c.req.param('id')
   const b = await c.req.json()
   const perms = await permissionsForRole(c, String(b.role), b.permissions || {})
+  const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
+  const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
   if (b.password) {
-    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, password=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, String(b.password), id).run()
+    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=?, password=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, String(b.password), id).run()
   } else {
-    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, id).run()
+    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, id).run()
   }
   if (b.role === 'agent') {
     const exists = await c.env.DB.prepare(`SELECT user_id FROM agents WHERE user_id=?`).bind(id).first<any>()
@@ -1127,10 +1255,10 @@ app.delete('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), a
 // ----------------------------------------------------------------------------
 app.get('/api/permissions', requireAuth, async (c) => {
   const { results } = await c.env.DB.prepare(`SELECT permission_key, label, description, category FROM permission_catalog ORDER BY category, label`).all()
-  const { results: roles } = await c.env.DB.prepare(`SELECT role_key, label, description, permissions, is_system FROM role_templates ORDER BY label`).all()
+  const { results: roles } = await c.env.DB.prepare(`SELECT role_key, label, description, permissions, is_system, schedule_enabled, access_days, access_start, access_end FROM role_templates ORDER BY label`).all()
   return c.json({
     permissions: results,
-    roles: (roles as any[]).map((r) => ({ ...r, permissions: safeJson(r.permissions, {}) }))
+    roles: (roles as any[]).map((r) => ({ ...r, permissions: safeJson(r.permissions, {}), access_days: safeJson(r.access_days, []) }))
   })
 })
 app.post('/api/permissions', requireAuth, requireRole('super_admin'), async (c) => {
@@ -1153,13 +1281,17 @@ app.post('/api/role-templates', requireAuth, requireRole('super_admin'), async (
   const key = String(b.role_key || '').trim().toLowerCase().replace(/[^a-z0-9_]+/g, '_')
   if (!key || !b.label) return c.json({ error: 'Role key and label are required' }, 400)
   const perms = b.permissions && typeof b.permissions === 'object' ? b.permissions : {}
+  const scheduleEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
+  const accessDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
+  const accessStart = b.access_start || null
+  const accessEnd = b.access_end || null
   const existing = await c.env.DB.prepare(`SELECT id, is_system FROM role_templates WHERE role_key=?`).bind(key).first<any>()
   if (existing) {
-    await c.env.DB.prepare(`UPDATE role_templates SET label=?, description=?, permissions=? WHERE role_key=?`)
-      .bind(b.label, b.description || null, JSON.stringify(perms), key).run()
+    await c.env.DB.prepare(`UPDATE role_templates SET label=?, description=?, permissions=?, schedule_enabled=?, access_days=?, access_start=?, access_end=? WHERE role_key=?`)
+      .bind(b.label, b.description || null, JSON.stringify(perms), scheduleEnabled, accessDays, accessStart, accessEnd, key).run()
   } else {
-    await c.env.DB.prepare(`INSERT INTO role_templates (role_key, label, description, permissions, is_system) VALUES (?,?,?,?, 0)`)
-      .bind(key, b.label, b.description || null, JSON.stringify(perms)).run()
+    await c.env.DB.prepare(`INSERT INTO role_templates (role_key, label, description, permissions, is_system, schedule_enabled, access_days, access_start, access_end) VALUES (?,?,?,?, 0, ?,?,?,?)`)
+      .bind(key, b.label, b.description || null, JSON.stringify(perms), scheduleEnabled, accessDays, accessStart, accessEnd).run()
   }
   await audit(c, c.get('user').id, existing ? 'update' : 'create', 'role_template', key)
   return c.json({ ok: true, role_key: key })
@@ -1174,6 +1306,38 @@ app.delete('/api/role-templates/:key', requireAuth, requireRole('super_admin'), 
   await c.env.DB.prepare(`DELETE FROM role_templates WHERE role_key=?`).bind(key).run()
   await audit(c, c.get('user').id, 'delete', 'role_template', key)
   return c.json({ ok: true })
+})
+
+// ----------------------------------------------------------------------------
+// FINANCING & MARKUP SETTINGS (processing fee + markup)
+// ----------------------------------------------------------------------------
+app.get('/api/settings/financing', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const processing_fee = normalizeProcessingFee(await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE))
+  const financing_markup = await getSetting(c, 'financing_markup', { default_cash_markup_pct: 10, default_credit_markup_pct: 20 })
+  return c.json({
+    processing_fee,
+    financing_markup,
+    can_manage_processing_fees: hasPermission(user, 'manage_processing_fees'),
+    can_manage_markup: hasPermission(user, 'manage_markup_pct')
+  })
+})
+app.put('/api/settings/processing-fee', requireAuth, requirePermission('manage_processing_fees'), async (c) => {
+  const b = await c.req.json()
+  const cfg = normalizeProcessingFee(b)
+  await setSetting(c, 'processing_fee', cfg)
+  await audit(c, c.get('user').id, 'update', 'settings', `processing_fee:${cfg.mode}`)
+  return c.json({ ok: true, processing_fee: cfg })
+})
+app.put('/api/settings/financing-markup', requireAuth, requirePermission('manage_markup_pct'), async (c) => {
+  const b = await c.req.json()
+  const cfg = {
+    default_cash_markup_pct: numberVal(b.default_cash_markup_pct, 10),
+    default_credit_markup_pct: numberVal(b.default_credit_markup_pct, 20)
+  }
+  await setSetting(c, 'financing_markup', cfg)
+  await audit(c, c.get('user').id, 'update', 'settings', 'financing_markup')
+  return c.json({ ok: true, financing_markup: cfg })
 })
 
 app.post('/api/change-requests', requireAuth, async (c) => {

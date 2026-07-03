@@ -25,6 +25,19 @@ A demo lending platform for agriculture & livestock. Customers buy farm inputs
 - **M-Pesa Daraja STK Push** payments (live when keys set, simulated otherwise)
 - Admin CRUD for users, agents, and inventory (edit / activate / deactivate / delete)
 - Role-aware dashboards & analytics
+- **Financing & Markup Settings** (Super Admin → *Financing Settings*): configure
+  default markup percentages and a flexible **Processing Fee** — either a
+  **percentage** of the amount borrowed, or a **tiered range table** (e.g.
+  `100,000–200,000 → flat 8,000`) with add / edit / delete rows.
+- **Dynamic role labelling & granular permissions**: Super Admins create custom
+  role labels via free-text (e.g. *Operations and Finance*, *Agent*, *Lender*) and
+  assign fine-grained permissions — Manage Processing Fees, Manage Markup %,
+  Sales Visibility (Cash vs Financed), and Data Object Visibility (Farmer Profile,
+  Financial Data, Document Attachments — Front/Back ID & passport photo).
+- **Time-Based Access Control**: per-role or per-user login windows (active days +
+  hour range). Access is blocked outside the configured window.
+- **Payments**: M-Pesa and SasaPay only (with brand logos). KCB Buni is hidden
+  from the front-end user.
 
 ## Configuration (env)
 All integrations are env-driven — at deploy you just **copy-paste** the
