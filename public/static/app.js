@@ -752,37 +752,123 @@ window.payModal = async (id, amount, outstanding, kind) => {
   const modeBadge = (m) => m.live
     ? `<span class="text-[10px] text-emerald-700">live · ${esc(m.mode)}</span>`
     : `<span class="text-[10px] text-amber-700">simulation</span>`
+  
   showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-mobile-alt text-teal-600 mr-2"></i>${isCash ? 'Cash Checkout' : 'Repayment'}</h3>
     <p class="text-xs text-slate-500 mb-3">${isCash ? 'Amount due' : 'Outstanding'}: ${fmt(outstanding)}</p>
+    
     <label class="text-sm font-medium block mb-2">Choose payment method</label>
     <div class="grid grid-cols-2 gap-3 mb-3">
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500 has-[:checked]:border-emerald-400">
-        <input type="radio" name="paymethod" value="mpesa" checked class="hidden">
+        <input type="radio" name="paymethod" value="mpesa" checked onchange="toggleSasaChannels()" class="hidden">
         <img src="/static/mpesa-logo.svg" alt="M-Pesa" class="h-10 mx-auto mb-1 object-contain">
         <div>${modeBadge(mpMode)}</div>
       </label>
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-green-500 has-[:checked]:border-green-400">
-        <input type="radio" name="paymethod" value="sasapay" class="hidden">
+        <input type="radio" name="paymethod" value="sasapay" onchange="toggleSasaChannels()" class="hidden">
         <img src="/static/sasapay-logo.svg" alt="SasaPay" class="h-10 mx-auto mb-1 object-contain">
         <div>${modeBadge(spMode)}</div>
       </label>
     </div>
+
+    <!-- Dynamic SasaPay Channel Customizer UI Block -->
+    <div id="sasapayChannelBlock" class="hidden mb-3 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
+      <div>
+        <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1">SasaPay Option</label>
+        <select id="spChannel" onchange="toggleSasaBankFields()" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm">
+          <option value="MOBILE_MONEY">Mobile Money Wallet Push</option>
+          <option value="BANK_CHECKOUT">Direct Bank Account Checkout</option>
+        </select>
+      </div>
+      
+      <div id="spBankFields" class="hidden space-y-2">
+        <div>
+          <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1">Select Bank</label>
+          <select id="spBankCode" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm">
+            <option value="">-- Choose Bank --</option>
+            <option value="063">Equity Bank</option>
+            <option value="001">KCB Bank</option>
+            <option value="011">Co-operative Bank</option>
+            <option value="003">Absa Bank</option>
+            <option value="044">Stanbic Bank</option>
+            <option value="012">NCBA Bank</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1">Account Number</label>
+          <input id="spAccNum" type="text" placeholder="e.g. 0123456789" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm">
+        </div>
+      </div>
+    </div>
+
     <label class="text-sm font-medium">Phone</label><input id="mpphone" value="${esc(state.user.phone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg">
     <label class="text-sm font-medium">Amount (KES)</label><input id="mpamt" type="number" value="${amount}" ${isCash ? 'readonly' : ''} class="w-full mt-1 mb-4 px-3 py-2 border border-slate-300 rounded-lg ${isCash ? 'bg-slate-50' : ''}">
     <div id="payStatus"></div>
     <div class="flex gap-2"><button id="payBtn" onclick="doPay(${id}, '${kind}')" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Send Payment Prompt</button>
     <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
+
+// Global UI toggle helpers invoked by custom onchange bindings inside the modal
+window.toggleSasaChannels = () => {
+  const method = document.querySelector('input[name="paymethod"]:checked')?.value;
+  const block = document.getElementById('sasapayChannelBlock');
+  if (block) {
+    if (method === 'sasapay') {
+      block.classList.remove('hidden');
+    } else {
+      block.classList.add('hidden');
+    }
+  }
+}
+
+window.toggleSasaBankFields = () => {
+  const channel = document.getElementById('spChannel')?.value;
+  const fields = document.getElementById('spBankFields');
+  if (fields) {
+    if (channel === 'BANK_CHECKOUT') {
+      fields.classList.remove('hidden');
+    } else {
+      fields.classList.add('hidden');
+    }
+  }
+}
+
 window.doPay = async (id, kind) => {
   const isCash = kind === 'cash'
   const method = document.querySelector('input[name="paymethod"]:checked')?.value || 'mpesa'
   const endpoint = method === 'sasapay' ? '/sasapay/stkpush' : '/mpesa/stkpush'
   const confirmEndpoint = method === 'sasapay' ? '/sasapay/confirm' : '/mpesa/confirm'
   const methodLabel = method === 'sasapay' ? 'SasaPay' : 'M-Pesa'
+  
+  // Construct dynamic payload base
+  const payload = { 
+    contract_id: id, 
+    amount: $('mpamt').value, 
+    phone: $('mpphone').value 
+  }
+
+  // Inject bank routing structures if setting up SasaPay specific options
+  if (method === 'sasapay') {
+    const channel = $('spChannel').value;
+    payload.channel = channel;
+    
+    if (channel === 'BANK_CHECKOUT') {
+      const bankCode = $('spBankCode').value;
+      const accNum = $('spAccNum').value;
+      
+      if (!bankCode || !accNum) {
+        $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Please select a bank and enter your account number.</div>`;
+        return;
+      }
+      payload.channelCode = bankCode;
+      payload.accountNumber = accNum;
+    }
+  }
+
   const btn = $('payBtn'); btn.disabled = true; btn.classList.add('opacity-50')
   $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Sending ${methodLabel} STK push...</div>`
+  
   try {
-    const { data } = await api.post(endpoint, { contract_id: id, amount: $('mpamt').value, phone: $('mpphone').value })
+    const { data } = await api.post(endpoint, payload)
     $('payStatus').innerHTML = `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'STK push sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Waiting for ${methodLabel} confirmation...</div>`
     let tries = 0
     const poll = async () => {
