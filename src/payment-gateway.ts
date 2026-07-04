@@ -2,9 +2,9 @@
 // Farmsky Central Payment Gateway
 // =====================================================================
 //   Single endpoint shared by all three Farmsky marketplaces:
-//     - equipment.farmsky.africa
-//     - feed.farmsky.africa
-//     - input.farmsky.africa
+//      - equipment.farmsky.africa
+//      - feed.farmsky.africa
+//      - input.farmsky.africa
 //
 //   Supported rails: M-Pesa Daraja, SasaPay, KCB Buni
 //
@@ -130,10 +130,10 @@ gateway.post('/initiate', async (c) => {
   const v = await verifySignature(client.hmac_secret, client_key, timestamp, nonce, rawBody, signature)
   if (!v.ok) return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
 
-  // Replay protection on nonce (best-effort): reject if same nonce seen recently
+  // Replay protection on nonce using SQLite datetime function expressions
   try {
     const seen = await c.env.DB.prepare(
-      `SELECT 1 FROM central_callbacks WHERE raw_payload LIKE ? AND received_at > NOW() - INTERVAL '5 minutes' LIMIT 1`
+      `SELECT 1 FROM central_callbacks WHERE raw_payload LIKE ? AND received_at > datetime('now', '-5 minutes') LIMIT 1`
     ).bind(`%${nonce}%`).first<any>()
     if (seen) return c.json({ success: false, error: 'Replay detected' }, 401)
   } catch (_) {}
@@ -157,7 +157,7 @@ gateway.post('/initiate', async (c) => {
   if (!Number.isFinite(amount) || amount <= 0) return c.json({ success: false, error: 'amount must be > 0' }, 400)
   if (!phone || phone.length < 11) return c.json({ success: false, error: 'phone is invalid' }, 400)
 
-  // Idempotency check
+  // Idempotency check matching schema configuration fields
   if (idempotencyKey) {
     const existing = await c.env.DB.prepare(
       `SELECT transaction_ref, payment_method, status FROM central_transactions WHERE origin_app = ? AND idempotency_key = ? LIMIT 1`
@@ -376,16 +376,16 @@ gateway.post('/callbacks/buni', async (c) => {
 // ----------------------------------------------------------------------------
 gateway.get('/admin/summary', async (c) => {
   const { results: byApp } = await c.env.DB.prepare(
-    `SELECT origin_app, COUNT(*)::int as count, COALESCE(SUM(amount),0)::numeric as total
-       FROM central_transactions WHERE status='SUCCESS' GROUP BY origin_app`
+    `SELECT origin_app, COUNT(*) as count, COALESCE(SUM(amount), 0) as total
+        FROM central_transactions WHERE status='SUCCESS' GROUP BY origin_app`
   ).all()
   const { results: byMethod } = await c.env.DB.prepare(
-    `SELECT payment_method, COUNT(*)::int as count, COALESCE(SUM(amount),0)::numeric as total
-       FROM central_transactions WHERE status='SUCCESS' GROUP BY payment_method`
+    `SELECT payment_method, COUNT(*) as count, COALESCE(SUM(amount), 0) as total
+        FROM central_transactions WHERE status='SUCCESS' GROUP BY payment_method`
   ).all()
   const { results: matrix } = await c.env.DB.prepare(
-    `SELECT origin_app, payment_method, COUNT(*)::int as count, COALESCE(SUM(amount),0)::numeric as total
-       FROM central_transactions WHERE status='SUCCESS' GROUP BY origin_app, payment_method`
+    `SELECT origin_app, payment_method, COUNT(*) as count, COALESCE(SUM(amount), 0) as total
+        FROM central_transactions WHERE status='SUCCESS' GROUP BY origin_app, payment_method`
   ).all()
   return c.json({ by_app: byApp, by_method: byMethod, matrix })
 })
