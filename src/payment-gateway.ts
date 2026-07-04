@@ -9,7 +9,7 @@
 //   Supported rails: M-Pesa Daraja, SasaPay, KCB Buni
 //
 //   Routes (mounted under /api/v1/payments/*):
-//     POST /initiate                   <- the calling app sends a signed request
+//     POST /initiate                    <- the calling app sends a signed request
 //     GET  /status/:transaction_ref    <- polled by the calling app
 //     POST /callbacks/mpesa            <- provider IPN
 //     POST /callbacks/sasapay          <- provider IPN
@@ -105,7 +105,7 @@ async function notifyOriginApp(c: any, client: any, tx: any) {
 
 // ----------------------------------------------------------------------------
 // POST /initiate
-// Body (JSON, exact): { amount, phone, payment_method, origin_reference?, description?, initiated_by_user? }
+// Body (JSON): { amount, phone, payment_method, origin_reference?, description?, initiated_by_user?, channel?, channelCode?, accountNumber? }
 // Headers (required):
 //   X-Farmsky-Client     : 'equipment' | 'feed' | 'input'
 //   X-Farmsky-Timestamp  : milliseconds since epoch
@@ -148,6 +148,11 @@ gateway.post('/initiate', async (c) => {
   const description = body.description ? String(body.description).slice(0, 200) : `${client.display_name} payment`
   const initiated_by_user = body.initiated_by_user ?? null
 
+  // Capture optional dynamic-channel options coming from the marketplaces
+  const channel = body.channel || 'MOBILE_MONEY'
+  const channelCode = body.channelCode || body.networkCode || undefined
+  const accountNumber = body.accountNumber || undefined
+
   if (!['mpesa', 'sasapay', 'buni'].includes(method)) return c.json({ success: false, error: 'payment_method must be mpesa | sasapay | buni' }, 400)
   if (!Number.isFinite(amount) || amount <= 0) return c.json({ success: false, error: 'amount must be > 0' }, 400)
   if (!phone || phone.length < 11) return c.json({ success: false, error: 'phone is invalid' }, 400)
@@ -174,9 +179,17 @@ gateway.post('/initiate', async (c) => {
   let providerResult: any
   try {
     if (method === 'mpesa') {
-      providerResult = await stkPush(c.env, { phone, amount, account: transaction_ref, description: desc })
+      providerResult = await stkPush(c.env, { phone, amount, account: transaction_ref, description: desc, networkCode: channelCode })
     } else if (method === 'sasapay') {
-      providerResult = await sasapayStkPush(c.env, { phone, amount, account: transaction_ref, description: desc })
+      providerResult = await sasapayStkPush(c.env, { 
+        phone, 
+        amount, 
+        account: transaction_ref, 
+        description: desc,
+        channel,
+        channelCode,
+        accountNumber
+      })
     } else {
       providerResult = await buniStkPush(c.env, { phone, amount, account: transaction_ref, description: desc })
     }
@@ -192,9 +205,9 @@ gateway.post('/initiate', async (c) => {
 
   await c.env.DB.prepare(
     `INSERT INTO central_transactions
-       (transaction_ref, idempotency_key, origin_app, origin_reference, payment_method,
-        provider_request_id, phone, amount, currency, description, status, initiated_by_user, ip_address)
-     VALUES (?,?,?,?,?,?,?,?,?,?, 'PENDING', ?, ?)`
+        (transaction_ref, idempotency_key, origin_app, origin_reference, payment_method,
+         provider_request_id, phone, amount, currency, description, status, initiated_by_user, ip_address)
+      VALUES (?,?,?,?,?,?,?,?,?,?, 'PENDING', ?, ?)`
   ).bind(
     transaction_ref, idempotencyKey, client_key, origin_reference, method,
     providerResult.checkout_request_id || null, phone, amount, 'KES', desc, initiated_by_user, ip
@@ -358,7 +371,7 @@ gateway.post('/callbacks/buni', async (c) => {
 })
 
 // ----------------------------------------------------------------------------
-// Admin reporting (this app's own admin only; mounted behind requireAuth in index.tsx)
+// Admin reporting (this app's own admin only)
 // Returns counts per origin_app and per payment_method.
 // ----------------------------------------------------------------------------
 gateway.get('/admin/summary', async (c) => {
