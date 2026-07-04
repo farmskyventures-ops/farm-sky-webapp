@@ -47,14 +47,28 @@ img, video { max-width: 100%; height: auto; }
 
 table tbody tr:hover { background:#f8fafc; }
 .modal-overlay { background: rgba(15,23,42,.55); backdrop-filter: blur(2px); }
+
+/* --- UPDATED INPUTS RULE --- */
 input, select, textarea {
   outline: none;
   font-size: 16px; /* prevent zoom on iOS */
   width: 100%;
+  color: #0f172a !important;            /* Explicitly dark slate text color */
+  background-color: #ffffff !important;   /* Explicitly white background */
 }
+
 input:focus, select:focus, textarea:focus {
   border-color: var(--brand);
   box-shadow: 0 0 0 3px rgba(15,118,110,.12);
+}
+
+/* --- ADDED AUTOFILL PROTECTION BARRIER --- */
+/* Fixes browser autofill rendering text invisible */
+input:-webkit-autofill,
+input:-webkit-autofill:hover, 
+input:-webkit-autofill:focus {
+  -webkit-text-fill-color: #0f172a !important;
+  transition: background-color 5000s ease-in-out 0s;
 }
 
 .field-label {
