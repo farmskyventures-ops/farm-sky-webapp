@@ -934,47 +934,97 @@ app.get('/api/mpesa/status', requireAuth, (c) => {
 // Docs: https://developer.sasapay.app/docs/getting-started
 // ----------------------------------------------------------------------------
 app.post('/api/sasapay/stkpush', requireAuth, async (c) => {
-  const { contract_id, amount, phone } = await c.req.json()
+  const { 
+    contract_id, 
+    amount, 
+    phone,
+    // Add C2B routing fields for channel elasticity
+    channel,           // 'MOBILE_MONEY' or 'BANK'
+    channel_code,      // Network code (e.g. '639021') or Bank Code (e.g. '01000')
+    account_number     // Customer's destination Bank Account number if channel === 'BANK'
+  } = await c.req.json()
+
   const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first<any>()
   if (!contract) return c.json({ error: 'Contract not found' }, 404)
+  
   if (contract.payment_type === 'cash' && ['pending_payment', 'awaiting_cash_balance', 'completed'].includes(contract.status)) {
     const p = await c.env.DB.prepare(`SELECT quantity FROM products WHERE id=?`).bind(contract.product_id).first<any>()
     if ((!contract.ownership_recorded) && (!p || p.quantity < contract.quantity)) return c.json({ error: 'This item is now out of stock.' }, 409)
   } else if (contract.payment_type !== 'cash' && !['active', 'completed'].includes(contract.status)) {
     return c.json({ error: 'This purchase is not open for payment.' }, 400)
   }
+
   const amt = Number(amount)
   if (amt <= 0) return c.json({ error: 'Invalid amount' }, 400)
   if (amt > Number(contract.outstanding || 0)) return c.json({ error: 'Amount exceeds outstanding balance' }, 400)
+
+  // Enforce mandatory bank credentials if the user explicitly switches the flow to Bank Transfer
+  const selectedChannel = channel === 'BANK' ? 'BANK' : 'MOBILE_MONEY'
+  if (selectedChannel === 'BANK' && (!account_number || !channel_code)) {
+    return c.json({ error: 'Bank Code (channel_code) and Bank Account number are required for Bank payments.' }, 400)
+  }
+
   const desc = contract.payment_type === 'cash' ? 'Cash Equipment Purchase' : 'Equipment Financing Payment'
-  const result = await sasapayStkPush(c.env, { phone: phone || c.get('user').phone, amount: amt, account: contract.contract_ref, description: desc })
-  if (!result.success) return c.json({ error: result.error || 'SasaPay STK push failed' }, 502)
-  await c.env.DB.prepare(`INSERT INTO payment_intents (checkout_request_id,merchant_request_id,contract_id,customer_id,amount,phone,method,status) VALUES (?,?,?,?,?,?,?, 'pending')`)
-    .bind(result.checkout_request_id, result.merchant_request_id, contract_id, contract.customer_id, amt, normalizePhone(phone || c.get('user').phone), 'sasapay').run()
-  await audit(c, c.get('user').id, 'stk_push', 'sasapay', `KES ${amt} to ${contract.contract_ref} (${result.simulated ? 'sim' : 'live'})`)
-  return c.json({ ok: true, simulated: result.simulated, checkout_request_id: result.checkout_request_id, customer_message: result.customer_message })
+  
+  // Forward parameters elegantly inside the options structure
+  const result = await sasapayStkPush(c.env, { 
+    phone: phone || c.get('user').phone, 
+    amount: amt, 
+    account: contract.contract_ref, 
+    description: desc,
+    channel: selectedChannel,
+    channelCode: channel_code || '639032', // Falls back safely to default Safaricom C2B token if empty
+    accountNumber: account_number || ''
+  })
+
+  if (!result.success) return c.json({ error: result.error || 'SasaPay transaction initialization failed' }, 502)
+
+  await c.env.DB.prepare(
+    `INSERT INTO payment_intents (checkout_request_id, merchant_request_id, contract_id, customer_id, amount, phone, method, status) 
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`
+  ).bind(
+    result.checkout_request_id, 
+    result.merchant_request_id, 
+    contract_id, 
+    contract.customer_id, 
+    amt, 
+    normalizePhone(phone || c.get('user').phone), 
+    `sasapay_${selectedChannel.toLowerCase()}` // Appending type signature simplifies trace visibility down the line
+  ).run()
+
+  await audit(c, c.get('user').id, 'stk_push', 'sasapay', `KES ${amt} via ${selectedChannel} to ${contract.contract_ref} (${result.simulated ? 'sim' : 'live'})`)
+  
+  return c.json({ 
+    ok: true, 
+    simulated: result.simulated, 
+    checkout_request_id: result.checkout_request_id, 
+    customer_message: result.customer_message || (selectedChannel === 'BANK' ? 'Bank push payment initiated successfully.' : 'STK Push sent.')
+  })
 })
+
 app.post('/api/sasapay/confirm', requireAuth, async (c) => {
   const { checkout_request_id } = await c.req.json()
   const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
   if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
   if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
+  
   let success = false, receipt = ''
   if (!sasapayConfigured(c.env) || String(checkout_request_id).includes('SIM')) {
     success = true; receipt = 'SP' + Math.random().toString(36).slice(2, 9).toUpperCase()
   } else {
     const q = await sasapayQuery(c.env, checkout_request_id)
-    // Adapter marks not-yet-known transactions as `pending:true` so we keep polling.
     if (q?.pending === true) return c.json({ ok: false, status: 'pending' })
+    
     const code = q.ResultCode ?? q.status_code
-    if (code === '0' || code === 0 || q.status === true) { success = true; receipt = 'SPL' + Date.now().toString().slice(-7) }
-    else if (code !== undefined && code !== null && code !== '' && code !== 'ERR') {
-      // Only surface strings that look like real, safe error messages.
+    if (code === '0' || code === 0 || q.status === true) { 
+      success = true; receipt = 'SPL' + Date.now().toString().slice(-7) 
+    } else if (code !== undefined && code !== null && code !== '' && code !== 'ERR') {
       const rawDesc = String(q.ResultDesc || q.message || 'Payment not completed')
       const safeDesc = /</.test(rawDesc) ? 'Payment not completed' : rawDesc
       return c.json({ ok: false, status: 'failed', result_desc: safeDesc })
     } else return c.json({ ok: false, status: 'pending' })
   }
+
   if (success) {
     const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
     const res = await applyPayment(c, contract, intent.amount, receipt, 'sasapay', intent.phone)
@@ -983,11 +1033,13 @@ app.post('/api/sasapay/confirm', requireAuth, async (c) => {
   }
   return c.json({ ok: false, status: 'pending' })
 })
+
 app.post('/api/sasapay/callback', async (c) => {
   try {
     const body: any = await c.req.json()
     const checkout = body?.CheckoutRequestID || body?.MerchantRequestID
     if (!checkout) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+    
     const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
     if (intent && intent.status === 'pending') {
       const code = body.ResultCode ?? body.status_code
@@ -1003,10 +1055,10 @@ app.post('/api/sasapay/callback', async (c) => {
     return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
   } catch { return c.json({ ResultCode: 0, ResultDesc: 'Accepted' }) }
 })
+
 app.get('/api/sasapay/status', requireAuth, (c) => {
   return c.json({ live: sasapayConfigured(c.env), mode: sasapayConfigured(c.env) ? (c.env.SASAPAY_ENV || 'sandbox') : 'simulation' })
 })
-
 // ----------------------------------------------------------------------------
 // PAYMENTS - KCB Buni STK Push (real when configured, simulated otherwise)
 // Docs: https://buni.kcbgroup.com/getting-started
