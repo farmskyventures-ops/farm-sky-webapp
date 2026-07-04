@@ -3,8 +3,11 @@
 -- granular permissions (feature config + data visibility).
 -- =====================================================================
 
+-- Fix for "column does not exist" error: Clean out the old/conflicting structure if it exists
+DROP TABLE IF EXISTS app_settings CASCADE;
+
 -- 1. Global application settings (using JSONB for native PostgreSQL JSON optimization)
-CREATE TABLE IF NOT EXISTS app_settings (
+CREATE TABLE app_settings (
     setting_key TEXT PRIMARY KEY,
     setting_value JSONB,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
