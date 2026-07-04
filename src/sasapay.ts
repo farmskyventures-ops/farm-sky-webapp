@@ -39,7 +39,10 @@ export type SasaPayStkOpts = {
   amount: number
   account: string
   description: string
-  networkCode?: string // "63902" M-PESA (default), "0" SasaPay wallet, "63903" Airtel, "63907" T-Kash
+  networkCode?: string    // "63902" M-PESA (default), "0" SasaPay wallet, "63903" Airtel, "63907" T-Kash
+  channel?: 'MOBILE_MONEY' | 'BANK' // Dynamic channel type tracking
+  channelCode?: string    // Clean wrapper payload field for flexibility across channels
+  accountNumber?: string  // Destination account identifier for BANK flows
 }
 
 // ---------- URL helpers ------------------------------------------------------
@@ -120,7 +123,7 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
       success: true,
       checkout_request_id: 'SP_SIM_' + crypto.randomUUID().slice(0, 12),
       merchant_request_id: 'SPM_SIM_' + crypto.randomUUID().slice(0, 8),
-      customer_message: 'Simulated SasaPay STK push sent. (Configure SasaPay keys for live payments.)'
+      customer_message: `Simulated SasaPay ${opts.channel || 'MOBILE_MONEY'} push sent. (Configure SasaPay keys for live payments.)`
     }
   }
 
@@ -129,21 +132,30 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
   catch (e: any) { return { simulated: false, success: false, error: e?.message || 'SasaPay auth failed' } }
 
   const phone = normalizePhone(opts.phone)
-  const networkCode = opts.networkCode || '63902' // M-PESA STK by default
+  // Support either custom channelCode identifier or backwards-compatible networkCode (Default: M-PESA 63902)
+  const finalNetworkCode = opts.channelCode || opts.networkCode || '63902' 
   const callbackUrl = env.SASAPAY_CALLBACK_URL || ''
   if (!callbackUrl) {
     return { simulated: false, success: false, error: 'SasaPay: SASAPAY_CALLBACK_URL env var is required in live mode' }
   }
 
-  const body = {
+  // Build the request body structural mapping
+  const body: Record<string, any> = {
     MerchantCode: merchantCode(env),
-    NetworkCode: networkCode,
-    PhoneNumber: phone,
+    NetworkCode: finalNetworkCode,
     TransactionDesc: String(opts.description || 'Farmsky payment').slice(0, 20),
     AccountReference: String(opts.account || '').slice(0, 20),
     Currency: 'KES',
     Amount: String(Math.max(1, Math.round(opts.amount))),
     CallBackURL: callbackUrl
+  }
+
+  // Handle differences between standard mobile network prompts and C2B Bank checkout
+  if (opts.channel === 'BANK') {
+    body.BillBankAccountNumber = opts.accountNumber || ''
+    body.PhoneNumber = phone // Included to track user reference correlation safely
+  } else {
+    body.PhoneNumber = phone
   }
 
   const headers = {
@@ -178,7 +190,7 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
         success: true,
         checkout_request_id: String(json.CheckoutRequestID || json.MerchantRequestID || ''),
         merchant_request_id: String(json.MerchantRequestID || json.CheckoutRequestID || ''),
-        customer_message: json.CustomerMessage || json.ResponseDescription || json.detail || 'STK push sent.'
+        customer_message: json.CustomerMessage || json.ResponseDescription || json.detail || 'Transaction processing initiated.'
       }
     }
 
@@ -212,7 +224,7 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string): 
       redirect: 'follow',
       headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
     })
-    const { json, text } = await readBody(res)
+    const { json } = await readBody(res)
 
     // Happy path: SasaPay returned a real JSON status document.
     if (json && (json.ResultCode !== undefined || json.status_code !== undefined || json.status !== undefined)) {
