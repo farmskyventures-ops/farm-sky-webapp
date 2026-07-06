@@ -1597,95 +1597,120 @@ async function viewRepayments() {
 }
 
 // ---------------------------------------------------------------------------
-// FINANCING & MARKUP SETTINGS (processing fee + markup)
+// FINANCING & MARKUP SETTINGS  (Processing Fee: percentage OR tiered range)
 // ---------------------------------------------------------------------------
-let _feeState = { enabled: false, mode: 'percentage', percentage_rate: 0, tiers: [] }
+let _feeCfg = { mode: 'none', percentage_rate: 0, tiers: [] }
+let _canManageFees = false, _canManageMarkup = false
 async function viewSettings() {
-  let cfg = {}
-  try { cfg = (await api.get('/settings/financing')).data } catch (e) { $('content').innerHTML = '<div class="card p-6 text-sm text-red-600">Unable to load settings.</div>'; return }
-  const canFee = cfg.can_manage_processing_fees
-  const canMarkup = cfg.can_manage_markup
-  const pf = cfg.processing_fee || {}
-  _feeState = { enabled: !!pf.enabled, mode: pf.mode === 'tiered' ? 'tiered' : 'percentage', percentage_rate: Number(pf.percentage_rate || 0), tiers: Array.isArray(pf.tiers) ? pf.tiers.map(t => ({ min: Number(t.min || 0), max: Number(t.max || 0), fee: Number(t.fee || 0) })) : [] }
-  const fm = cfg.financing_markup || {}
+  let data
+  try { data = (await api.get('/settings/financing')).data }
+  catch (err) { $('content').innerHTML = `<div class="card p-6 text-red-600 text-sm">${esc(err.response?.data?.error || 'Failed to load settings')}</div>`; return }
+  _feeCfg = data.processing_fee || { mode: 'none', percentage_rate: 0, tiers: [] }
+  if (!Array.isArray(_feeCfg.tiers)) _feeCfg.tiers = []
+  _canManageFees = !!data.can_manage_processing_fees
+  _canManageMarkup = !!data.can_manage_markup
+  const mk = data.finance_markup || { default_markup_pct: 20 }
   $('content').innerHTML = `
     <div class="space-y-6 max-w-3xl">
-      <!-- Financing Markup -->
+      <!-- Global Markup -->
       <div class="card p-6">
-        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-percent text-teal-600 mr-2"></i>Financing Markup Percentage</h3>
-        <p class="text-xs text-slate-500 mb-4">Default markup percentages applied when new equipment is added. ${canMarkup ? '' : '<span class="text-amber-600">You do not have permission to edit these.</span>'}</p>
-        <div class="responsive-grid cols-2 text-sm">
-          <div><label class="field-label">Default cash markup %</label><input id="mk_cash" type="number" step="0.1" value="${Number(fm.default_cash_markup_pct ?? 10)}" class="px-3 py-2 border rounded-lg w-full" ${canMarkup ? '' : 'disabled'}></div>
-          <div><label class="field-label">Default financing markup %</label><input id="mk_credit" type="number" step="0.1" value="${Number(fm.default_credit_markup_pct ?? 20)}" class="px-3 py-2 border rounded-lg w-full" ${canMarkup ? '' : 'disabled'}></div>
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-percent text-teal-600 mr-2"></i>Financing Markup</h3>
+        <p class="text-xs text-slate-500 mb-4">Default Murabaha markup applied to financed sales. Individual products can override this on their own form.</p>
+        <div class="flex items-end gap-3">
+          <div class="field-group">
+            <label class="field-label">Default Finance Markup (%)</label>
+            <input id="set_markup" type="number" step="0.1" value="${mk.default_markup_pct ?? 20}" ${_canManageMarkup ? '' : 'disabled'} class="w-40 px-3 py-2 border rounded-lg ${_canManageMarkup ? '' : 'bg-slate-100'}">
+          </div>
+          ${_canManageMarkup
+            ? `<button onclick="saveMarkup()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm">Save Markup</button>`
+            : `<span class="text-xs text-amber-600 pb-2"><i class="fas fa-lock mr-1"></i>You lack the "Manage Markup Percentage" permission.</span>`}
         </div>
-        ${canMarkup ? '<button onclick="saveMarkup()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm mt-4">Save Markup</button>' : ''}
       </div>
 
       <!-- Processing Fee -->
       <div class="card p-6">
-        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-receipt text-teal-600 mr-2"></i>Processing Fee</h3>
-        <p class="text-xs text-slate-500 mb-4">Configure a processing fee applied to the amount borrowed on financed purchases. ${canFee ? '' : '<span class="text-amber-600">You do not have permission to edit these.</span>'}</p>
-        <label class="flex items-center gap-2 text-sm mb-4">
-          <input type="checkbox" id="pf_enabled" ${_feeState.enabled ? 'checked' : ''} ${canFee ? '' : 'disabled'} onchange="_feeState.enabled=this.checked">
-          <span class="font-medium">Enable processing fee</span>
-        </label>
-        <div class="mb-4">
-          <div class="field-label mb-1">Fee structure</div>
-          <div class="flex gap-2">
-            <label class="flex-1 border rounded-lg p-3 text-sm cursor-pointer ${_feeState.mode === 'percentage' ? 'ring-2 ring-teal-500 border-teal-400' : 'border-slate-200'}">
-              <input type="radio" name="pf_mode" value="percentage" class="mr-2" ${_feeState.mode === 'percentage' ? 'checked' : ''} ${canFee ? '' : 'disabled'} onchange="setFeeMode('percentage')">
-              <b>Option 1 — Percentage-Based</b><div class="text-xs text-slate-400 ml-5">A flat % of the total amount borrowed.</div>
-            </label>
-            <label class="flex-1 border rounded-lg p-3 text-sm cursor-pointer ${_feeState.mode === 'tiered' ? 'ring-2 ring-teal-500 border-teal-400' : 'border-slate-200'}">
-              <input type="radio" name="pf_mode" value="tiered" class="mr-2" ${_feeState.mode === 'tiered' ? 'checked' : ''} ${canFee ? '' : 'disabled'} onchange="setFeeMode('tiered')">
-              <b>Option 2 — Tiered Range Fee</b><div class="text-xs text-slate-400 ml-5">A flat fee per amount-borrowed bracket.</div>
-            </label>
-          </div>
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-file-invoice-dollar text-teal-600 mr-2"></i>Processing Fee</h3>
+        <p class="text-xs text-slate-500 mb-4">A fee charged on the amount financed (borrowed). Choose a single structure below.</p>
+        <div class="flex flex-wrap gap-3 mb-5">
+          ${feeModeCard('none', 'No Fee', 'fa-ban', 'No processing fee is charged.')}
+          ${feeModeCard('percentage', 'Percentage', 'fa-percent', 'A flat % of the amount borrowed.')}
+          ${feeModeCard('tiered', 'Tiered Range', 'fa-table-list', 'A flat fee based on the amount bracket.')}
         </div>
-        <div id="pf_body"></div>
-        ${canFee ? '<button onclick="saveProcessingFee()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm mt-4">Save Processing Fee</button>' : ''}
+        <div id="feeConfig"></div>
+        ${_canManageFees
+          ? `<div class="flex gap-2 mt-5"><button onclick="saveProcessingFee()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm">Save Processing Fee</button></div>`
+          : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>You lack the "Manage Processing Fees" permission — settings are read-only.</p>`}
       </div>
     </div>`
-  renderFeeBody(canFee)
+  renderFeeConfig()
 }
-window.setFeeMode = (mode) => { _feeState.mode = mode; viewSettings() }
-function renderFeeBody(canFee) {
-  const box = $('pf_body'); if (!box) return
-  if (_feeState.mode === 'percentage') {
-    box.innerHTML = `<div class="text-sm max-w-xs"><label class="field-label">Percentage rate (%)</label>
-      <input id="pf_rate" type="number" step="0.1" value="${Number(_feeState.percentage_rate || 0)}" placeholder="e.g. 2.5" class="px-3 py-2 border rounded-lg w-full" ${canFee ? '' : 'disabled'} oninput="_feeState.percentage_rate=Number(this.value||0)">
-      <div class="help-text">Fee = borrowed amount × this percentage.</div></div>`
+function feeModeCard(mode, label, icon, desc) {
+  const active = _feeCfg.mode === mode
+  const clickable = _canManageFees ? `onclick="setFeeMode('${mode}')"` : ''
+  return `<button type="button" data-feemode="${mode}" ${clickable}
+    class="btn text-left border rounded-lg p-3 flex-1 min-w-[160px] transition ${active ? 'ring-2 ring-teal-500 border-teal-500 bg-teal-50' : 'border-slate-300'} ${_canManageFees ? '' : 'cursor-not-allowed opacity-80'}">
+    <div class="font-semibold text-sm text-slate-800"><i class="fas ${icon} text-teal-600 mr-1"></i>${esc(label)}</div>
+    <div class="text-[11px] text-slate-500 mt-1">${esc(desc)}</div>
+  </button>`
+}
+window.setFeeMode = (mode) => {
+  if (!_canManageFees) return
+  _feeCfg.mode = mode
+  document.querySelectorAll('[data-feemode]').forEach(el => {
+    const on = el.getAttribute('data-feemode') === mode
+    el.classList.toggle('ring-2', on); el.classList.toggle('ring-teal-500', on)
+    el.classList.toggle('border-teal-500', on); el.classList.toggle('bg-teal-50', on)
+  })
+  renderFeeConfig()
+}
+function renderFeeConfig() {
+  const el = $('feeConfig'); if (!el) return
+  const ro = _canManageFees ? '' : 'disabled'
+  if (_feeCfg.mode === 'percentage') {
+    el.innerHTML = `<div class="field-group">
+      <label class="field-label">Processing Fee Rate (%)</label>
+      <input id="fee_pct" type="number" step="0.1" min="0" value="${_feeCfg.percentage_rate ?? 0}" ${ro} class="w-48 px-3 py-2 border rounded-lg ${ro ? 'bg-slate-100' : ''}" placeholder="e.g. 2.5">
+      <p class="text-[11px] text-slate-500 mt-1">Charged as this percentage of the amount borrowed.</p>
+    </div>`
+  } else if (_feeCfg.mode === 'tiered') {
+    el.innerHTML = `
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm border border-slate-200 rounded-lg">
+          <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+            <th class="text-left px-3 py-2">From (KES)</th><th class="text-left px-3 py-2">To (KES)</th>
+            <th class="text-left px-3 py-2">Flat Fee (KES)</th><th class="px-3 py-2"></th></tr></thead>
+          <tbody id="tierRows"></tbody>
+        </table>
+      </div>
+      ${_canManageFees ? `<button onclick="addTier()" class="btn mt-3 bg-slate-800 text-white px-4 py-2 rounded-lg text-xs"><i class="fas fa-plus mr-1"></i>Add Tier</button>` : ''}
+      <p class="text-[11px] text-slate-500 mt-2">Example: <b>100,000</b> to <b>200,000</b> → Flat Fee <b>8,000</b>. Leave "To" blank for an open-ended top tier.</p>`
+    renderTierRows()
   } else {
-    const rows = _feeState.tiers.map((t, i) => `<tr class="border-t border-slate-100">
-      <td class="px-2 py-2"><input type="number" value="${Number(t.min)}" class="px-2 py-1 border rounded w-full text-sm" ${canFee ? '' : 'disabled'} onchange="updateTier(${i},'min',this.value)"></td>
-      <td class="px-2 py-2"><input type="number" value="${Number(t.max)}" class="px-2 py-1 border rounded w-full text-sm" ${canFee ? '' : 'disabled'} onchange="updateTier(${i},'max',this.value)"></td>
-      <td class="px-2 py-2"><input type="number" value="${Number(t.fee)}" class="px-2 py-1 border rounded w-full text-sm" ${canFee ? '' : 'disabled'} onchange="updateTier(${i},'fee',this.value)"></td>
-      <td class="px-2 py-2 text-right">${canFee ? `<button onclick="removeTier(${i})" class="text-red-600 hover:underline text-xs">Delete</button>` : ''}</td>
-    </tr>`).join('')
-    box.innerHTML = `<div class="border rounded-xl overflow-hidden">
-      <table class="w-full text-sm">
-        <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-2 py-2">From (KES)</th><th class="text-left px-2 py-2">To (KES)</th><th class="text-left px-2 py-2">Flat Fee (KES)</th><th></th></tr></thead>
-        <tbody>${rows || '<tr><td colspan="4" class="text-center py-6 text-slate-400 text-xs">No tiers yet. Add one below.</td></tr>'}</tbody>
-      </table></div>
-      ${canFee ? '<button onclick="addTier()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm mt-3"><i class="fas fa-plus mr-1"></i>Add Tier</button>' : ''}
-      <div class="help-text mt-2">Example: 100,000 to 200,000 → Flat Fee 8,000.</div>`
+    el.innerHTML = `<p class="text-sm text-slate-500 italic">No processing fee will be charged.</p>`
   }
 }
-window.addTier = () => { _feeState.tiers.push({ min: 0, max: 0, fee: 0 }); renderFeeBody(true) }
-window.removeTier = (i) => { _feeState.tiers.splice(i, 1); renderFeeBody(true) }
-window.updateTier = (i, key, val) => { if (_feeState.tiers[i]) _feeState.tiers[i][key] = Number(val || 0) }
+function renderTierRows() {
+  const tb = $('tierRows'); if (!tb) return
+  const ro = _canManageFees ? '' : 'disabled'
+  if (!_feeCfg.tiers.length) { tb.innerHTML = `<tr><td colspan="4" class="text-center text-slate-400 py-4 text-xs">No tiers yet. Click "Add Tier".</td></tr>`; return }
+  tb.innerHTML = _feeCfg.tiers.map((t, i) => `<tr class="border-t border-slate-100">
+    <td class="px-3 py-2"><input type="number" min="0" value="${t.min ?? ''}" ${ro} onchange="updateTier(${i},'min',this.value)" class="w-28 px-2 py-1 border rounded ${ro ? 'bg-slate-100' : ''}"></td>
+    <td class="px-3 py-2"><input type="number" min="0" value="${t.max ?? ''}" ${ro} onchange="updateTier(${i},'max',this.value)" placeholder="∞" class="w-28 px-2 py-1 border rounded ${ro ? 'bg-slate-100' : ''}"></td>
+    <td class="px-3 py-2"><input type="number" min="0" value="${t.fee ?? ''}" ${ro} onchange="updateTier(${i},'fee',this.value)" class="w-28 px-2 py-1 border rounded ${ro ? 'bg-slate-100' : ''}"></td>
+    <td class="px-3 py-2 text-right">${_canManageFees ? `<button onclick="removeTier(${i})" class="text-red-600 hover:underline text-xs"><i class="fas fa-trash"></i></button>` : ''}</td>
+  </tr>`).join('')
+}
+window.addTier = () => { _feeCfg.tiers.push({ min: 0, max: null, fee: 0 }); renderTierRows() }
+window.removeTier = (i) => { _feeCfg.tiers.splice(i, 1); renderTierRows() }
+window.updateTier = (i, field, val) => { _feeCfg.tiers[i][field] = (field === 'max' && val === '') ? null : Number(val) }
 window.saveMarkup = async () => {
-  try {
-    await api.put('/settings/financing-markup', { default_cash_markup_pct: Number($('mk_cash').value || 0), default_credit_markup_pct: Number($('mk_credit').value || 0) })
-    toast('Markup settings saved')
-  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+  try { await api.put('/settings/markup', { default_markup_pct: Number($('set_markup').value || 0) }); toast('Markup saved') }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 window.saveProcessingFee = async () => {
-  const body = { enabled: _feeState.enabled, mode: _feeState.mode, percentage_rate: Number(_feeState.percentage_rate || 0), tiers: _feeState.tiers }
-  if (_feeState.mode === 'tiered') {
-    const bad = body.tiers.find(t => Number(t.max) < Number(t.min))
-    if (bad) return toast('Each tier "To" value must be greater than or equal to "From".', false)
-  }
+  const body = { mode: _feeCfg.mode, percentage_rate: 0, tiers: [] }
+  if (_feeCfg.mode === 'percentage') body.percentage_rate = Number(($('fee_pct') || {}).value || 0)
+  if (_feeCfg.mode === 'tiered') body.tiers = _feeCfg.tiers
   try { await api.put('/settings/processing-fee', body); toast('Processing fee saved') }
   catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
