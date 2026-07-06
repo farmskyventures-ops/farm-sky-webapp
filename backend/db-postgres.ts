@@ -9,6 +9,7 @@ pgTypes.setTypeParser(1700, (value) => Number(value))
 
 export interface D1Like {
   prepare(sql: string): D1StatementLike
+  setSessionConfig?(name: string, value: string): Promise<void>
 }
 
 export interface D1StatementLike {
@@ -117,6 +118,16 @@ export class PostgresD1 implements D1Like {
 
   prepare(sql: string): D1StatementLike {
     return new PostgresStatement(this.pool, sql)
+  }
+
+  /**
+   * Sets a session-scoped configuration parameter (GUC) used by Row-Level
+   * Security policies, e.g. app.current_marketplace_id / app.is_admin.
+   * Uses set_config(name, value, is_local=false) so it applies to the whole
+   * session. Tolerates non-Postgres/edge failures silently at the caller.
+   */
+  async setSessionConfig(name: string, value: string): Promise<void> {
+    await this.pool.query('SELECT set_config($1, $2, false)', [name, value == null ? '' : String(value)])
   }
 }
 

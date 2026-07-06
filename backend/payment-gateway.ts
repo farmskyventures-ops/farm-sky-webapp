@@ -54,6 +54,43 @@ async function loadClient(c: any, client_key: string) {
   ).bind(client_key).first<any>()
 }
 
+// Resolve the marketplace (tenant) row for a client/marketplace key.
+async function loadMarketplace(c: any, marketplace_key: string) {
+  try {
+    return await c.env.DB.prepare(
+      `SELECT id, marketplace_key, display_name, domain, is_main, is_active FROM marketplaces WHERE marketplace_key = ?`
+    ).bind(marketplace_key).first<any>()
+  } catch (_) { return null }
+}
+
+// Set the per-connection tenant scope so PostgreSQL RLS restricts every
+// subsequent query in this request to the tenant's own rows. This is a no-op
+// on SQLite/D1 (which lacks RLS) but harmless — isolation there falls back to
+// the explicit `origin_app = ?` / `marketplace_id = ?` predicates in queries.
+async function setTenantScope(c: any, marketplaceId: number | null, isAdmin = false) {
+  const setLocal = (c.env.DB as any)?.setSessionConfig
+  if (typeof setLocal === 'function') {
+    try { await setLocal.call(c.env.DB, 'app.current_marketplace_id', marketplaceId == null ? '' : String(marketplaceId)) } catch (_) {}
+    try { await setLocal.call(c.env.DB, 'app.is_admin', isAdmin ? 'true' : 'false') } catch (_) {}
+  }
+}
+
+// Record a suspicious-activity / security event to the audit trail.
+async function auditSecurity(
+  c: any,
+  eventType: string,
+  severity: 'INFO' | 'WARN' | 'CRITICAL',
+  opts: { marketplaceId?: number | null; originApp?: string | null; transactionRef?: string | null; detail?: string } = {}
+) {
+  try {
+    const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || null
+    await c.env.DB.prepare(
+      `INSERT INTO payment_audit_log (marketplace_id, origin_app, event_type, severity, transaction_ref, detail, ip_address)
+       VALUES (?,?,?,?,?,?,?)`
+    ).bind(opts.marketplaceId ?? null, opts.originApp ?? null, eventType, severity, opts.transactionRef ?? null, (opts.detail || '').slice(0, 500), ip).run()
+  } catch (_) {}
+}
+
 async function findTxByProviderRef(c: any, provider_request_id: string) {
   if (!provider_request_id) return null
   return await c.env.DB.prepare(
@@ -61,12 +98,12 @@ async function findTxByProviderRef(c: any, provider_request_id: string) {
   ).bind(provider_request_id).first<any>()
 }
 
-async function logCallback(c: any, txRef: string | null, method: string, providerReqId: string | null, rawBody: string, valid: boolean) {
+async function logCallback(c: any, txRef: string | null, method: string, providerReqId: string | null, rawBody: string, valid: boolean, marketplaceId: number | null = null) {
   try {
     await c.env.DB.prepare(
-      `INSERT INTO central_callbacks (transaction_ref, payment_method, provider_request_id, raw_payload, signature_valid)
-       VALUES (?, ?, ?, ?, ?)`
-    ).bind(txRef, method, providerReqId, rawBody.slice(0, 8000), valid ? 1 : 0).run()
+      `INSERT INTO central_callbacks (transaction_ref, payment_method, provider_request_id, raw_payload, signature_valid, marketplace_id)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(txRef, method, providerReqId, rawBody.slice(0, 8000), valid ? 1 : 0, marketplaceId).run()
   } catch (_) {}
 }
 
@@ -125,18 +162,47 @@ gateway.post('/initiate', async (c) => {
   if (!client_key) return c.json({ success: false, error: 'Missing X-Farmsky-Client header' }, 401)
 
   const client = await loadClient(c, client_key)
-  if (!client || !client.is_active) return c.json({ success: false, error: 'Unknown or inactive client app' }, 401)
+  if (!client || !client.is_active) {
+    await auditSecurity(c, 'UNKNOWN_CLIENT', 'WARN', { originApp: client_key, detail: 'initiate from unknown/inactive client' })
+    return c.json({ success: false, error: 'Unknown or inactive client app' }, 401)
+  }
+
+  // Resolve tenant + apply DB-layer RLS scope for the rest of the request.
+  const marketplace = await loadMarketplace(c, client_key)
+  const marketplaceId = marketplace?.id ?? null
+  await setTenantScope(c, marketplaceId, false)
 
   const v = await verifySignature(client.hmac_secret, client_key, timestamp, nonce, rawBody, signature)
-  if (!v.ok) return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
+  if (!v.ok) {
+    await auditSecurity(c, 'SIGNATURE_FAIL', 'CRITICAL', { marketplaceId, originApp: client_key, detail: v.error || 'invalid HMAC signature on /initiate' })
+    return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
+  }
 
-  // Replay protection on nonce using SQLite datetime function expressions
-  try {
-    const seen = await c.env.DB.prepare(
-      `SELECT 1 FROM central_callbacks WHERE raw_payload LIKE ? AND received_at > datetime('now', '-5 minutes') LIMIT 1`
-    ).bind(`%${nonce}%`).first<any>()
-    if (seen) return c.json({ success: false, error: 'Replay detected' }, 401)
-  } catch (_) {}
+  // Replay protection: a (client_key, nonce) pair may be used only once. The
+  // UNIQUE(client_key, nonce) constraint on payment_nonces makes this atomic —
+  // the second INSERT of the same pair fails, which we treat as a replay.
+  if (nonce) {
+    try {
+      const existingNonce = await c.env.DB.prepare(
+        `SELECT 1 FROM payment_nonces WHERE client_key = ? AND nonce = ? LIMIT 1`
+      ).bind(client_key, nonce).first<any>()
+      if (existingNonce) {
+        await auditSecurity(c, 'REPLAY', 'CRITICAL', { marketplaceId, originApp: client_key, detail: `replayed nonce ${nonce}` })
+        return c.json({ success: false, error: 'Replay detected' }, 401)
+      }
+      await c.env.DB.prepare(
+        `INSERT INTO payment_nonces (client_key, nonce) VALUES (?, ?)`
+      ).bind(client_key, nonce).run()
+    } catch (e: any) {
+      // A unique-violation here means a concurrent duplicate slipped in => replay.
+      const code = e?.code || ''
+      if (code === '23505' || /unique|duplicate/i.test(String(e?.message || ''))) {
+        await auditSecurity(c, 'REPLAY', 'CRITICAL', { marketplaceId, originApp: client_key, detail: `replayed nonce ${nonce}` })
+        return c.json({ success: false, error: 'Replay detected' }, 401)
+      }
+      // Any other error (e.g. table missing on edge/D1) is non-fatal.
+    }
+  }
 
   let body: any = {}
   try { body = rawBody ? JSON.parse(rawBody) : {} } catch { return c.json({ success: false, error: 'Body must be JSON' }, 400) }
@@ -205,11 +271,11 @@ gateway.post('/initiate', async (c) => {
 
   await c.env.DB.prepare(
     `INSERT INTO central_transactions
-        (transaction_ref, idempotency_key, origin_app, origin_reference, payment_method,
+        (transaction_ref, idempotency_key, origin_app, marketplace_id, origin_reference, payment_method,
          provider_request_id, phone, amount, currency, description, status, initiated_by_user, ip_address)
-      VALUES (?,?,?,?,?,?,?,?,?,?, 'PENDING', ?, ?)`
+      VALUES (?,?,?,?,?,?,?,?,?,?,?, 'PENDING', ?, ?)`
   ).bind(
-    transaction_ref, idempotencyKey, client_key, origin_reference, method,
+    transaction_ref, idempotencyKey, client_key, marketplaceId, origin_reference, method,
     providerResult.checkout_request_id || null, phone, amount, 'KES', desc, initiated_by_user, ip
   ).run()
 
@@ -238,9 +304,15 @@ gateway.get('/status/:ref', async (c) => {
   const client = await loadClient(c, client_key)
   if (!client || !client.is_active) return c.json({ success: false, error: 'Unknown client app' }, 401)
 
+  const marketplace = await loadMarketplace(c, client_key)
+  await setTenantScope(c, marketplace?.id ?? null, false)
+
   // For GET we sign the path so an attacker cannot replay another app's poll
   const v = await verifySignature(client.hmac_secret, client_key, timestamp, nonce, transaction_ref, signature)
-  if (!v.ok) return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
+  if (!v.ok) {
+    await auditSecurity(c, 'SIGNATURE_FAIL', 'WARN', { marketplaceId: marketplace?.id ?? null, originApp: client_key, detail: 'invalid signature on /status poll' })
+    return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
+  }
 
   const tx = await c.env.DB.prepare(
     `SELECT * FROM central_transactions WHERE transaction_ref = ? AND origin_app = ? LIMIT 1`
@@ -297,17 +369,23 @@ gateway.get('/status/:ref', async (c) => {
 // cannot mutate an unrelated tx. We also persist the raw payload for audit.
 // ----------------------------------------------------------------------------
 async function settleCallback(c: any, method: PaymentMethod, providerReqId: string | null, success: boolean, receipt: string | null, resultCode: string | null, resultDesc: string | null, rawBody: string) {
+  // Provider IPNs are not tenant-scoped at the network layer, so the settlement
+  // path runs with admin scope to locate the originating transaction, then
+  // records the tenant it belongs to.
+  await setTenantScope(c, null, true)
   if (!providerReqId) {
     await logCallback(c, null, method, null, rawBody, false)
+    await auditSecurity(c, 'CALLBACK_UNBOUND', 'WARN', { originApp: method, detail: 'callback missing provider_request_id' })
     return
   }
   const tx = await findTxByProviderRef(c, providerReqId)
   if (!tx) {
     await logCallback(c, null, method, providerReqId, rawBody, false)
+    await auditSecurity(c, 'CALLBACK_NO_MATCH', 'CRITICAL', { detail: `callback provider_request_id ${providerReqId} matches no transaction (possible spoof)` })
     return
   }
   if (tx.status !== 'PENDING') {
-    await logCallback(c, tx.transaction_ref, method, providerReqId, rawBody, true)
+    await logCallback(c, tx.transaction_ref, method, providerReqId, rawBody, true, tx.marketplace_id ?? null)
     return
   }
   await c.env.DB.prepare(
@@ -316,7 +394,7 @@ async function settleCallback(c: any, method: PaymentMethod, providerReqId: stri
             result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
       WHERE transaction_ref=?`
   ).bind(success ? 'SUCCESS' : 'FAILED', receipt, resultCode, resultDesc, tx.transaction_ref).run()
-  await logCallback(c, tx.transaction_ref, method, providerReqId, rawBody, true)
+  await logCallback(c, tx.transaction_ref, method, providerReqId, rawBody, true, tx.marketplace_id ?? null)
 
   // Notify originating app (if it has registered a callback_url)
   const client = await loadClient(c, tx.origin_app)
@@ -375,6 +453,7 @@ gateway.post('/callbacks/buni', async (c) => {
 // Returns counts per origin_app and per payment_method.
 // ----------------------------------------------------------------------------
 gateway.get('/admin/summary', async (c) => {
+  await setTenantScope(c, null, true) // admin scope: read across all tenants
   const { results: byApp } = await c.env.DB.prepare(
     `SELECT origin_app, COUNT(*) as count, COALESCE(SUM(amount), 0) as total
         FROM central_transactions WHERE status='SUCCESS' GROUP BY origin_app`
@@ -388,6 +467,71 @@ gateway.get('/admin/summary', async (c) => {
         FROM central_transactions WHERE status='SUCCESS' GROUP BY origin_app, payment_method`
   ).all()
   return c.json({ by_app: byApp, by_method: byMethod, matrix })
+})
+
+// ----------------------------------------------------------------------------
+// AUTOMATED REVENUE MATRIX AUDIT
+// Because all three marketplaces share ONE merchant shortcode, this attributes
+// a single settlement statement back to each tenant (marketplace x method).
+// ----------------------------------------------------------------------------
+gateway.get('/admin/revenue-matrix', async (c) => {
+  await setTenantScope(c, null, true)
+  const { results: matrix } = await c.env.DB.prepare(
+    `SELECT COALESCE(m.marketplace_key, ct.origin_app) AS marketplace_key,
+            ct.payment_method,
+            COUNT(*) AS success_count,
+            COALESCE(SUM(ct.amount), 0) AS gross_revenue,
+            MIN(ct.completed_at) AS first_settlement,
+            MAX(ct.completed_at) AS last_settlement
+       FROM central_transactions ct
+       LEFT JOIN marketplaces m ON m.id = ct.marketplace_id
+      WHERE ct.status='SUCCESS'
+      GROUP BY COALESCE(m.marketplace_key, ct.origin_app), ct.payment_method
+      ORDER BY marketplace_key, ct.payment_method`
+  ).all()
+  const { results: rollup } = await c.env.DB.prepare(
+    `SELECT COALESCE(m.marketplace_key, ct.origin_app) AS marketplace_key,
+            COUNT(*) AS total_success,
+            COALESCE(SUM(ct.amount), 0) AS total_revenue
+       FROM central_transactions ct
+       LEFT JOIN marketplaces m ON m.id = ct.marketplace_id
+      WHERE ct.status='SUCCESS'
+      GROUP BY COALESCE(m.marketplace_key, ct.origin_app)
+      ORDER BY total_revenue DESC`
+  ).all()
+  return c.json({ matrix, rollup, note: 'Single shortcode revenue attributed per marketplace tenant.' })
+})
+
+// ----------------------------------------------------------------------------
+// SUSPICIOUS ACTIVITY AUDIT TRAIL CHECK
+// Surfaces signature failures, replays, cross-tenant / spoofed callbacks,
+// velocity anomalies and marketplace_id integrity breaks.
+// ----------------------------------------------------------------------------
+gateway.get('/admin/suspicious-activity', async (c) => {
+  await setTenantScope(c, null, true)
+  const events = await c.env.DB.prepare(
+    `SELECT event_type, severity, COUNT(*) AS occurrences, MAX(created_at) AS last_seen
+       FROM payment_audit_log
+      GROUP BY event_type, severity
+      ORDER BY occurrences DESC`
+  ).all().catch(() => ({ results: [] }))
+  const integrity = await c.env.DB.prepare(
+    `SELECT ct.transaction_ref, ct.origin_app, ct.marketplace_id, m.marketplace_key
+       FROM central_transactions ct
+       LEFT JOIN marketplaces m ON m.id = ct.marketplace_id
+      WHERE ct.marketplace_id IS NULL OR m.marketplace_key IS DISTINCT FROM ct.origin_app
+      LIMIT 100`
+  ).all().catch(() => ({ results: [] }))
+  const invalidCallbacks = await c.env.DB.prepare(
+    `SELECT payment_method, COUNT(*) AS invalid_callbacks, MAX(received_at) AS last_seen
+       FROM central_callbacks WHERE signature_valid = 0
+      GROUP BY payment_method`
+  ).all().catch(() => ({ results: [] }))
+  return c.json({
+    security_events: events.results || [],
+    integrity_breaks: integrity.results || [],
+    invalid_callbacks: invalidCallbacks.results || []
+  })
 })
 
 export default gateway

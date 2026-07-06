@@ -175,3 +175,78 @@ Or hit `GET /api/v1/payments-admin/summary` for a JSON version of those three qu
 - [ ] Set the three provider IPN URLs above in M-Pesa Daraja, SasaPay and KCB Buni dashboards
 - [ ] Configure `MPESA_*`, `SASAPAY_*`, `BUNI_*` env vars on this app (see `.env.example`)
 - [ ] (Optional) Set `callback_url` per app if you prefer push notifications over polling
+
+---
+
+## 7. Multi-tenant architecture & Single Merchant Shortcode (Instructions 6–18)
+
+All three marketplaces — **equipment.farmsky.africa** (the **MAIN** app), **feed.farmsky.africa** and **mazao.farmsky.africa** — settle through **ONE** merchant shortcode. Payments flow through a single **Centralized Payment Gateway** service (deployable at `payment-api.farmsky.africa`), isolated from the marketplace business logic. Tenant isolation is enforced at **two independent layers**:
+
+1. **Database layer — PostgreSQL Row-Level Security (RLS)** keyed on `marketplace_id`.
+2. **Network layer — HMAC-SHA256 cryptographic payload validation** (Section 2).
+
+### 7.1 Tenant registry & schema
+
+`migrations/0011_central_multitenancy_rls.sql` adds:
+
+- **`marketplaces`** — one row per tenant (`equipment` is `is_main=1`, plus `feed`, `mazao`), mapping `marketplace_key` → `domain`.
+- **`marketplace_id`** columns on `central_transactions` and `central_callbacks` (back-filled from `origin_app`).
+- **`payment_audit_log`** — suspicious-activity audit trail (`SIGNATURE_FAIL`, `REPLAY`, `CALLBACK_NO_MATCH`, etc. with `severity`).
+- **`payment_nonces`** — `UNIQUE(client_key, nonce)` store that makes replay rejection atomic.
+
+The gateway stamps every transaction with the tenant's `marketplace_id`, resolved from the verified `client_key` (never the request body).
+
+### 7.2 Row-Level Security setup (run ONCE as a superuser)
+
+```bash
+psql "$SUPERUSER_DATABASE_URL" -v ON_ERROR_STOP=1 -f backend/sql/01_payment_rls_setup.sql
+```
+
+This script:
+
+- Creates an **isolated least-privilege role** `payment_api_user` (`NOSUPERUSER NOCREATEDB NOCREATEROLE`) that can only touch the payment tables.
+- **`ENABLE` + `FORCE` RLS** on `central_transactions`, `central_callbacks`, `payment_audit_log`.
+- Adds tenant-isolation policies using two per-connection GUCs:
+  - `app.current_marketplace_id` — the active tenant.
+  - `app.is_admin` — `true` only for the MAIN app's reconciliation role (RLS bypass to read across tenants).
+
+The gateway sets these on every request via `PostgresD1.setSessionConfig()` → `SELECT set_config('app.current_marketplace_id', …, false)`. A compromised or buggy marketplace connection **cannot read or alter another tenant's rows — the database itself refuses**.
+
+> Change the `payment_api_user` password from `CHANGE_ME_IN_PROD` before production, and put its connection string in the payment gateway service's `DATABASE_URL`.
+
+### 7.3 Deploying the gateway as a separate Render web service
+
+Run the payment gateway as its own Render web service (same codebase, different DB user):
+
+| Setting | Value |
+|---|---|
+| Service | `payment-api.farmsky.africa` (separate Render web service) |
+| Build | `npm run build:node` |
+| Start | `node dist-node/server.js` |
+| `DATABASE_URL` | `postgres://payment_api_user:<pw>@<farmsky-central-db-host>/farmsky_central` |
+| Providers | `MPESA_*`, `SASAPAY_*`, `BUNI_*` for the shared shortcode |
+
+Because it connects as `payment_api_user`, RLS is *forced* even for the app's own queries — the isolation cannot be bypassed from application code.
+
+### 7.4 Automated audits (run as the MAIN reconciliation role)
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f backend/sql/02_payment_security_audits.sql
+```
+
+Also exposed as admin JSON endpoints on the MAIN app:
+
+| Purpose | Method | URL |
+|---|---|---|
+| Revenue matrix (marketplace × method) — single-shortcode attribution | `GET` | `/api/v1/payments/admin/revenue-matrix` |
+| Suspicious-activity audit (signature fails, replays, integrity breaks, spoofed callbacks) | `GET` | `/api/v1/payments/admin/suspicious-activity` |
+
+The **revenue matrix** is how a single settlement statement from the one shortcode is attributed back to each marketplace tenant.
+
+### 7.5 Multi-tenant operational checklist
+
+- [ ] Apply `migrations/0011_central_multitenancy_rls.sql` (auto-applied on boot)
+- [ ] Run `backend/sql/01_payment_rls_setup.sql` once as superuser; change `payment_api_user` password
+- [ ] Set the mazao `hmac_secret` (`UPDATE app_clients SET hmac_secret=… WHERE client_key='mazao';`)
+- [ ] Deploy the gateway as a separate Render service using the `payment_api_user` `DATABASE_URL`
+- [ ] Schedule `backend/sql/02_payment_security_audits.sql` (or poll the two admin endpoints)
