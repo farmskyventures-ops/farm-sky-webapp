@@ -115,7 +115,12 @@ async function setSetting(c: any, key: string, value: any): Promise<void> {
     await c.env.DB.prepare(`INSERT INTO app_settings (setting_key, setting_value) VALUES (?,?)`).bind(key, json).run()
   }
 }
-const DEFAULT_PROCESSING_FEE = { enabled: false, mode: 'percentage', percentage_rate: 0, tiers: [] as Array<{ min: number; max: number; fee: number }> }
+const DEFAULT_PROCESSING_FEE = { enabled: false, mode: 'percentage', percentage_rate: 0, tiers: [] as Array<{ min: number; max: number; fee: number }>, product_ids: [] as number[] }
+function normalizeProductIds(raw: any): number[] {
+  if (!Array.isArray(raw)) return []
+  const ids = raw.map((v: any) => Number(v)).filter((n: number) => Number.isFinite(n) && n > 0)
+  return Array.from(new Set(ids))
+}
 function normalizeProcessingFee(raw: any) {
   const cfg: any = { ...DEFAULT_PROCESSING_FEE, ...(raw && typeof raw === 'object' ? raw : {}) }
   cfg.enabled = Boolean(cfg.enabled)
@@ -126,12 +131,49 @@ function normalizeProcessingFee(raw: any) {
         .map((t: any) => ({ min: numberVal(t.min, 0), max: numberVal(t.max, 0), fee: numberVal(t.fee, 0) }))
         .filter((t: any) => t.max >= t.min)
     : []
+  // Products this fee structure applies to. Empty array = applies to ALL products.
+  cfg.product_ids = normalizeProductIds(cfg.product_ids)
+  return cfg
+}
+const DEFAULT_FINANCING_MARKUP = {
+  financing_applicable: true,
+  mode: 'percentage',            // 'percentage' | 'tiered'
+  percentage_rate: 20,
+  tiers: [] as Array<{ min: number; max: number; markup: number }>,
+  default_cash_markup_pct: 10,
+  default_credit_markup_pct: 20,
+  cash_markup_pct: 10,
+  cash_terms_text: '',
+  product_ids: [] as number[]
+}
+function normalizeFinancingMarkup(raw: any) {
+  const cfg: any = { ...DEFAULT_FINANCING_MARKUP, ...(raw && typeof raw === 'object' ? raw : {}) }
+  cfg.financing_applicable = raw && Object.prototype.hasOwnProperty.call(raw, 'financing_applicable')
+    ? Boolean(cfg.financing_applicable) : true
+  cfg.mode = cfg.mode === 'tiered' ? 'tiered' : 'percentage'
+  cfg.percentage_rate = numberVal(cfg.percentage_rate, 20)
+  cfg.tiers = Array.isArray(cfg.tiers)
+    ? cfg.tiers
+        .map((t: any) => ({ min: numberVal(t.min, 0), max: numberVal(t.max, 0), markup: numberVal(t.markup, 0) }))
+        .filter((t: any) => t.max >= t.min)
+    : []
+  cfg.cash_markup_pct = numberVal(cfg.cash_markup_pct, 10)
+  cfg.cash_terms_text = String(cfg.cash_terms_text || '')
+  // Keep legacy fields in sync for backward compatibility with existing quotes.
+  cfg.default_credit_markup_pct = cfg.mode === 'percentage' ? cfg.percentage_rate : numberVal(cfg.default_credit_markup_pct, 20)
+  cfg.default_cash_markup_pct = cfg.cash_markup_pct
+  cfg.product_ids = normalizeProductIds(cfg.product_ids)
   return cfg
 }
 // Compute the processing fee applied to a borrowed (financed) amount.
-function computeProcessingFee(cfg: any, borrowedAmount: number): number {
+// When cfg.product_ids is non-empty, the fee only applies to those products.
+function computeProcessingFee(cfg: any, borrowedAmount: number, productId?: any): number {
   const c = normalizeProcessingFee(cfg)
   if (!c.enabled) return 0
+  if (Array.isArray(c.product_ids) && c.product_ids.length > 0) {
+    const pid = Number(productId)
+    if (!Number.isFinite(pid) || !c.product_ids.includes(pid)) return 0
+  }
   const amount = Number(borrowedAmount) || 0
   if (c.mode === 'percentage') return roundMoney(amount * (c.percentage_rate / 100))
   const tier = c.tiers.find((t: any) => amount >= t.min && amount <= t.max)
@@ -256,8 +298,9 @@ function financingQuote(p: any, quantity: any, paymentType: string, termMonths: 
   const financing_charge = model === 'loan_interest'
     ? roundMoney(finance_principal * (interestRate / 100) * (term / 12))
     : roundMoney(finance_principal * (interestRate / 100) * (term / 12))
-  // Processing fee is calculated on the amount borrowed (finance principal).
-  const processing_fee = computeProcessingFee(processingFeeCfg, finance_principal)
+  // Processing fee is calculated on the amount borrowed (finance principal),
+  // scoped to the product when the fee structure targets specific products.
+  const processing_fee = computeProcessingFee(processingFeeCfg, finance_principal, p.id)
   const financed_total = roundMoney(finance_principal + financing_charge + processing_fee)
   const installment_amount = installment_count > 0 ? roundMoney(financed_total / installment_count) : financed_total
   const total_payable = roundMoney(deposit_amount + financed_total)
@@ -1366,10 +1409,15 @@ app.delete('/api/role-templates/:key', requireAuth, requireRole('super_admin'), 
 app.get('/api/settings/financing', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
   const processing_fee = normalizeProcessingFee(await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE))
-  const financing_markup = await getSetting(c, 'financing_markup', { default_cash_markup_pct: 10, default_credit_markup_pct: 20 })
+  const financing_markup = normalizeFinancingMarkup(await getSetting(c, 'financing_markup', DEFAULT_FINANCING_MARKUP))
+  // Lightweight inventory list so the UI can offer product selection.
+  const { results } = await c.env.DB.prepare(`SELECT id, sku, name, category, quantity FROM products ORDER BY name`).all()
   return c.json({
     processing_fee,
     financing_markup,
+    // legacy alias kept so older frontends do not break
+    finance_markup: financing_markup,
+    products: results,
     can_manage_processing_fees: hasPermission(user, 'manage_processing_fees'),
     can_manage_markup: hasPermission(user, 'manage_markup_pct')
   })
@@ -1378,18 +1426,46 @@ app.put('/api/settings/processing-fee', requireAuth, requirePermission('manage_p
   const b = await c.req.json()
   const cfg = normalizeProcessingFee(b)
   await setSetting(c, 'processing_fee', cfg)
-  await audit(c, c.get('user').id, 'update', 'settings', `processing_fee:${cfg.mode}`)
+  await audit(c, c.get('user').id, 'update', 'settings', `processing_fee:${cfg.enabled ? cfg.mode : 'disabled'} products:${cfg.product_ids.length || 'all'}`)
   return c.json({ ok: true, processing_fee: cfg })
 })
-app.put('/api/settings/financing-markup', requireAuth, requirePermission('manage_markup_pct'), async (c) => {
+async function saveFinancingMarkup(c: any) {
   const b = await c.req.json()
-  const cfg = {
-    default_cash_markup_pct: numberVal(b.default_cash_markup_pct, 10),
-    default_credit_markup_pct: numberVal(b.default_credit_markup_pct, 20)
-  }
+  const cfg = normalizeFinancingMarkup(b)
   await setSetting(c, 'financing_markup', cfg)
-  await audit(c, c.get('user').id, 'update', 'settings', 'financing_markup')
-  return c.json({ ok: true, financing_markup: cfg })
+  await audit(c, c.get('user').id, 'update', 'settings', `financing_markup:${cfg.financing_applicable ? cfg.mode : 'cash_only'} products:${cfg.product_ids.length || 'all'}`)
+  return c.json({ ok: true, financing_markup: cfg, finance_markup: cfg })
+}
+app.put('/api/settings/financing-markup', requireAuth, requirePermission('manage_markup_pct'), saveFinancingMarkup)
+// Backward-compatible alias (the earlier frontend saved to /settings/markup, which 404'd).
+app.put('/api/settings/markup', requireAuth, requirePermission('manage_markup_pct'), saveFinancingMarkup)
+
+// Inline "add product to inventory" used by the Processing Fee / Markup builders.
+// Authorized either by the classic admin roles OR the fee/markup management perms.
+app.post('/api/settings/quick-product', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const allowed = user.role === 'admin' || user.role === 'super_admin' ||
+    hasPermission(user, 'manage_processing_fees') || hasPermission(user, 'manage_markup_pct')
+  if (!allowed) return c.json({ error: 'Forbidden' }, 403)
+  const p = normalizeProductPayload(await c.req.json())
+  if (!p.sku || !p.name) return c.json({ error: 'SKU and name are required' }, 400)
+  try {
+    const r = await c.env.DB.prepare(
+      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
+      p.cash_price, p.credit_price, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
+      p.payment_option_mode, p.financing_model, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
+      p.financing_term_max_months, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
+      p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code
+    ).run()
+    await audit(c, user.id, 'create', 'product', `${p.name} (via settings builder)`)
+    return c.json({ id: r.meta.last_row_id, product: { id: r.meta.last_row_id, sku: p.sku, name: p.name, category: p.category, quantity: p.quantity } })
+  } catch (err: any) {
+    if (/unique|duplicate/i.test(String(err?.message || ''))) return c.json({ error: 'A product with this SKU already exists' }, 400)
+    return c.json({ error: 'Failed to create product' }, 500)
+  }
 })
 
 app.post('/api/change-requests', requireAuth, async (c) => {
