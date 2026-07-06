@@ -3,15 +3,25 @@
 -- granular permissions (feature config + data visibility).
 -- =====================================================================
 
--- Fix for "column does not exist" error: Clean out the old/conflicting structure if it exists
+-- Fix for "column does not exist" error: Clean out any old/conflicting object
+-- (table, view, or materialized view) named app_settings so the canonical
+-- schema below always applies, regardless of pre-existing remote DB state.
+DROP VIEW IF EXISTS app_settings CASCADE;
+DROP MATERIALIZED VIEW IF EXISTS app_settings CASCADE;
 DROP TABLE IF EXISTS app_settings CASCADE;
 
 -- 1. Global application settings (using JSONB for native PostgreSQL JSON optimization)
-CREATE TABLE app_settings (
+CREATE TABLE IF NOT EXISTS app_settings (
     setting_key TEXT PRIMARY KEY,
     setting_value JSONB,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Belt-and-braces: guarantee the canonical columns exist even if an older
+-- table survived (CREATE IF NOT EXISTS is a no-op when the table pre-exists).
+ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS setting_key TEXT;
+ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS setting_value JSONB;
+ALTER TABLE app_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
 
 -- Seed the default processing-fee configuration
 INSERT INTO app_settings (setting_key, setting_value) VALUES

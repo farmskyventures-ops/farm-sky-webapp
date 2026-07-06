@@ -43,9 +43,12 @@ async function execStatement(pool: Pool, statement: string, allowConflict: boole
   } catch (error: any) {
     const code = error?.code || ''
     const message = String(error?.message || '')
-    // 42701 duplicate column, 42P07 duplicate table/index, 23505 unique violation (handled by ON CONFLICT)
-    if (['42701', '42P07', '23505'].includes(code)) return
-    if (/already exists|duplicate column/i.test(message)) return
+    // Idempotency guards so re-running migrations on an existing DB is safe:
+    // 42701 duplicate column, 42P07 duplicate table/index, 23505 unique violation
+    // (handled by ON CONFLICT), 42809 wrong object type for DROP VIEW/TABLE on
+    // an object of a different kind, 42P06 duplicate schema.
+    if (['42701', '42P07', '23505', '42809', '42P06'].includes(code)) return
+    if (/already exists|duplicate column|is not a|wrong (object )?type/i.test(message)) return
     throw error
   }
 }
