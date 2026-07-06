@@ -16,6 +16,8 @@ export type SessionUser = {
   id: number
   full_name: string
   phone: string
+  email?: string | null
+  avatar_url?: string | null
   role: string
   region?: string
   label?: string

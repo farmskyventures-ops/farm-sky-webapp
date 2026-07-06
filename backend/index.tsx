@@ -336,7 +336,7 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
   const token = getCookie(c, 'session') || c.req.header('Authorization')?.replace('Bearer ', '')
   if (!token) return null
   const row = await c.env.DB.prepare(
-    `SELECT u.id, u.full_name, u.phone, u.role, u.region, u.label, u.permissions, u.status,
+    `SELECT u.id, u.full_name, u.phone, u.email, u.avatar_url, u.role, u.region, u.label, u.permissions, u.status,
             u.schedule_enabled, u.access_days, u.access_start, u.access_end, s.expires_at
      FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`
   ).bind(token).first<any>()
@@ -352,6 +352,8 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
     id: row.id,
     full_name: row.full_name,
     phone: row.phone,
+    email: row.email || null,
+    avatar_url: row.avatar_url || null,
     role: row.role,
     region: row.region,
     label: row.label || null,
@@ -449,6 +451,111 @@ app.post('/api/logout', async (c) => {
   return c.json({ ok: true })
 })
 app.get('/api/me', requireAuth, (c) => c.json({ user: c.get('user') }))
+
+// ----------------------------------------------------------------------------
+// SELF-SERVICE PROFILE (Instruction 3)
+//   * Farmers (role=customer): may update their own profile data EXCEPT
+//     national_id and phone/mobile. Also avatar + password.
+//   * All other users: may ONLY update their profile picture and password.
+//   * Editing OTHER users is done by super_admin / authorized users via the
+//     existing PUT /api/users/:id (Edit button in the users list).
+// ----------------------------------------------------------------------------
+
+// Fetch own profile (user fields + farmer/customer record when role=customer).
+app.get('/api/me/profile', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  let customer: any = null
+  if (user.role === 'customer') {
+    customer = await c.env.DB.prepare(`SELECT * FROM customers WHERE user_id=?`).bind(user.id).first<any>()
+  }
+  return c.json({ user, customer })
+})
+
+// Update own profile picture (any authenticated user).
+app.put('/api/me/avatar', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const { avatar_url } = await c.req.json()
+  await c.env.DB.prepare(`UPDATE users SET avatar_url=? WHERE id=?`).bind(avatar_url || null, user.id).run()
+  await audit(c, user.id, 'update', 'profile', 'avatar')
+  return c.json({ ok: true, avatar_url: avatar_url || null })
+})
+
+// Change own password (verify current password first).
+app.put('/api/me/password', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const { current_password, new_password } = await c.req.json()
+  if (!new_password || String(new_password).length < 4) return c.json({ error: 'New password must be at least 4 characters' }, 400)
+  const row = await c.env.DB.prepare(`SELECT password FROM users WHERE id=?`).bind(user.id).first<any>()
+  if (!row || row.password !== String(current_password)) return c.json({ error: 'Current password is incorrect' }, 400)
+  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(String(new_password), user.id).run()
+  await audit(c, user.id, 'update', 'profile', 'password change')
+  return c.json({ ok: true })
+})
+
+// Update own profile data.
+//   Farmers  -> full customer profile (EXCEPT national_id & phone/mobile) + avatar.
+//   Others   -> avatar only (name/region managed by admins).
+app.put('/api/me/profile', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json()
+
+  // Everyone may update their avatar via this endpoint.
+  if (b.avatar_url !== undefined) {
+    await c.env.DB.prepare(`UPDATE users SET avatar_url=? WHERE id=?`).bind(b.avatar_url || null, user.id).run()
+  }
+
+  if (user.role !== 'customer') {
+    // Non-farmers: profile picture only (already handled above). Everything else ignored.
+    await audit(c, user.id, 'update', 'profile', 'avatar (non-farmer self-update)')
+    const updated = await getSessionUser(c)
+    return c.json({ ok: true, user: updated, note: 'Only your profile picture and password can be changed here.' })
+  }
+
+  // Farmer: locate their customer record.
+  const cust = await c.env.DB.prepare(`SELECT * FROM customers WHERE user_id=?`).bind(user.id).first<any>()
+  if (!cust) return c.json({ error: 'Farmer profile not found' }, 404)
+
+  // Explicitly IGNORE immutable fields: national_id, phone, mobile.
+  const saccoProvided = b.sacco_membership !== undefined
+  const saccoMember = ['yes', 'true', '1', 'on'].includes(String(b.sacco_membership || '').toLowerCase())
+  await c.env.DB.prepare(
+    `UPDATE customers SET
+      full_name=COALESCE(?, full_name),
+      date_of_birth=COALESCE(?, date_of_birth),
+      gender=COALESCE(?, gender),
+      alt_mobile=COALESCE(?, alt_mobile),
+      county=COALESCE(?, county),
+      sub_county=COALESCE(?, sub_county),
+      ward=COALESCE(?, ward),
+      village=COALESCE(?, village),
+      latitude=COALESCE(?, latitude),
+      longitude=COALESCE(?, longitude),
+      value_chain_type=COALESCE(?, value_chain_type),
+      value_chain=COALESCE(?, value_chain),
+      acreage=COALESCE(?, acreage),
+      herd_size=COALESCE(?, herd_size),
+      farm_experience=COALESCE(?, farm_experience),
+      annual_production=COALESCE(?, annual_production),
+      existing_loans=COALESCE(?, existing_loans),
+      sacco_membership=COALESCE(?, sacco_membership)
+     WHERE id=?`
+  ).bind(
+    b.full_name ?? null, b.date_of_birth ?? null, b.gender ?? null,
+    b.alt_mobile ?? null, b.county ?? null, b.sub_county ?? null,
+    b.ward ?? null, b.village ?? null, b.latitude ?? null, b.longitude ?? null,
+    b.value_chain_type ?? null, b.value_chain ?? null, b.acreage ?? null, b.herd_size ?? null,
+    b.farm_experience ?? null, b.annual_production ?? null, b.existing_loans ?? null,
+    saccoProvided ? (saccoMember ? 'yes' : 'no') : null,
+    cust.id
+  ).run()
+  // Keep the users.full_name in sync when the farmer renames themselves.
+  if (b.full_name) {
+    await c.env.DB.prepare(`UPDATE users SET full_name=? WHERE id=?`).bind(String(b.full_name).trim(), user.id).run()
+  }
+  await audit(c, user.id, 'update', 'profile', 'farmer self-update (ID & phone locked)')
+  const updated = await getSessionUser(c)
+  return c.json({ ok: true, user: updated })
+})
 
 // ---- Auth provider status (so the UI can show live vs demo) ----
 app.get('/api/auth/status', (c) => c.json({ sms_live: smsConfigured(c.env) }))

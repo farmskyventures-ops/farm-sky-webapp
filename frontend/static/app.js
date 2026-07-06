@@ -57,6 +57,26 @@ function refreshPermissionChecklist(prefix, roleSelectId, readOnly = false) {
   if (!box || !$(roleSelectId)) return
   box.innerHTML = permissionChecklist(prefix, templatePermissions($(roleSelectId).value), readOnly)
 }
+// Password input with a show/hide eye toggle (Instruction 4).
+// Renders an <input type=password> wrapped so an eye button can flip its type.
+function passwordField(id, opts = {}) {
+  const { placeholder = '', required = false, cls = 'w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg', value = '' } = opts
+  return `<div class="relative">
+    <input id="${id}" type="password" placeholder="${esc(placeholder)}" value="${esc(value)}" ${required ? 'required' : ''} class="${cls} pr-10">
+    <button type="button" onclick="togglePw('${id}',this)" tabindex="-1"
+      class="absolute inset-y-0 right-0 flex items-center pr-3 text-slate-400 hover:text-slate-600" aria-label="Show password">
+      <i class="fas fa-eye"></i>
+    </button>
+  </div>`
+}
+window.togglePw = (id, btn) => {
+  const el = document.getElementById(id); if (!el) return
+  const show = el.type === 'password'
+  el.type = show ? 'text' : 'password'
+  const icon = btn.querySelector('i')
+  if (icon) { icon.classList.toggle('fa-eye', !show); icon.classList.toggle('fa-eye-slash', show) }
+  btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password')
+}
 const _WEEK_DAYS = [['mon', 'Mon'], ['tue', 'Tue'], ['wed', 'Wed'], ['thu', 'Thu'], ['fri', 'Fri'], ['sat', 'Sat'], ['sun', 'Sun']]
 // Renders a Time-Based Access Control (login window) editor block.
 function scheduleEditor(prefix, sched = {}, readOnly = false) {
@@ -233,7 +253,7 @@ function authSignIn() {
       </div>
       <div>
         <label class="text-sm font-medium text-slate-600">Password</label>
-        <input id="password" type="password" placeholder="••••" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required>
+        ${passwordField('password', { placeholder: '••••', required: true })}
       </div>
       <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Sign In</button>
     </form>`
@@ -335,7 +355,7 @@ function authSignUpVerify(phone, name, demoOtp) {
       <div><label class="text-sm font-medium text-slate-600">National ID Number</label>
         <input id="su_nid" type="text" placeholder="National ID" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
       <div><label class="text-sm font-medium text-slate-600">Create Password</label>
-        <input id="su_pass" type="password" placeholder="Choose a password" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
+        ${passwordField('su_pass', { placeholder: 'Choose a password', required: true })}</div>
       <div class="border-t pt-4">
         <h4 class="font-semibold text-slate-800 mb-1">Identity capture</h4>
         <p class="text-xs text-slate-500 mb-4">Step 1: ID front. Step 2: ID back. Step 3: passport photo for liveness.</p>
@@ -387,7 +407,7 @@ function authResetVerify(phone, demoOtp) {
       <div><label class="text-sm font-medium text-slate-600">Reset Code</label>
         <input id="rs_code" type="text" inputmode="numeric" placeholder="6-digit code" value="${esc(demoOtp || '')}" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg tracking-widest" required></div>
       <div><label class="text-sm font-medium text-slate-600">New Password</label>
-        <input id="rs_pass" type="password" placeholder="New password" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
+        ${passwordField('rs_pass', { placeholder: 'New password', required: true })}</div>
       <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Update Password</button>
     </form>
     <button onclick="renderLogin('reset')" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Back</button>`
@@ -408,8 +428,10 @@ async function logout() { await api.post('/logout'); state.user = null; renderLo
 // ---------------------------------------------------------------------------
 function navItems() {
   const r = state.user.role
+  const account = { k: 'profile', i: 'fa-id-card', t: 'My Account' }
+  const withAccount = (arr) => [...arr, account]
   const common = [{ k: 'dashboard', i: 'fa-gauge-high', t: 'Dashboard' }]
-  if (r === 'super_admin' || r === 'admin') return [...common,
+  if (r === 'super_admin' || r === 'admin') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     { k: 'inventory', i: 'fa-boxes-stacked', t: 'Inventory' },
     { k: 'customers', i: 'fa-users', t: 'Customers' },
@@ -418,23 +440,23 @@ function navItems() {
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
     { k: 'settings', i: 'fa-sliders', t: 'Financing Settings' },
-    { k: 'exports', i: 'fa-database', t: 'Data Export' }]
-  if (r === 'operations_finance') return [...common,
+    { k: 'exports', i: 'fa-database', t: 'Data Export' }])
+  if (r === 'operations_finance') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     { k: 'customers', i: 'fa-users', t: 'Customers' },
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
-    { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' }]
-  if (r === 'agent') return [...common,
+    { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' }])
+  if (r === 'agent') return withAccount([...common,
     { k: 'onboard', i: 'fa-user-plus', t: 'Add Farmer' },
     { k: 'customers', i: 'fa-users', t: 'My Farmers' },
-    { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' }]
-  if (r === 'customer') return [...common,
+    { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' }])
+  if (r === 'customer') return withAccount([...common,
     { k: 'shop', i: 'fa-store', t: 'Equipment Shop' },
-    { k: 'contracts', i: 'fa-file-signature', t: 'My Purchases' }]
-  if (r === 'support') return [...common,
+    { k: 'contracts', i: 'fa-file-signature', t: 'My Purchases' }])
+  if (r === 'support') return withAccount([...common,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
-    { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' }]
-  return common
+    { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' }])
+  return withAccount(common)
 }
 function renderApp() {
   const items = navItems()
@@ -473,9 +495,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -1594,6 +1616,120 @@ async function viewRepayments() {
     <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Contract</th><th class="text-left px-4 py-3">Customer</th><th class="text-left px-4 py-3">Inst.</th><th class="text-left px-4 py-3">Due Date</th><th class="text-right px-4 py-3">Amount</th><th class="text-right px-4 py-3">Paid</th><th class="text-left px-4 py-3">Status</th></tr></thead>
     <tbody>${data.repayments.map(r => `<tr class="border-t border-slate-100"><td class="px-4 py-3 font-mono text-xs">${esc(r.contract_ref)}</td><td class="px-4 py-3">${esc(r.customer)}</td><td class="px-4 py-3">#${r.installment_no}</td><td class="px-4 py-3">${r.due_date}</td><td class="px-4 py-3 text-right">${fmt(r.amount_due)}</td><td class="px-4 py-3 text-right">${fmt(r.amount_paid)}</td><td class="px-4 py-3">${badge(r.status)}</td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No repayments</td></tr>'}</tbody>
   </table></div>`
+}
+
+// ---------------------------------------------------------------------------
+// MY ACCOUNT / PROFILE (Instruction 3 + 4)
+//   Farmers  : edit their data EXCEPT National ID & Phone (both locked).
+//   Others   : profile picture only. Everyone can change their password.
+// ---------------------------------------------------------------------------
+let _profile = null
+async function viewProfile() {
+  let data
+  try { data = (await api.get('/me/profile')).data }
+  catch (err) { $('content').innerHTML = `<div class="card p-6 text-red-600 text-sm">${esc(err.response?.data?.error || 'Failed to load profile')}</div>`; return }
+  _profile = data
+  const u = data.user, c = data.customer, isFarmer = u.role === 'customer'
+  const avatar = u.avatar_url
+    ? `<img src="${esc(u.avatar_url)}" class="h-24 w-24 rounded-full object-cover border-2 border-teal-200">`
+    : `<div class="h-24 w-24 rounded-full bg-teal-100 flex items-center justify-center text-2xl font-bold text-teal-700">${esc((u.full_name || '?').charAt(0).toUpperCase())}</div>`
+  $('content').innerHTML = `
+    <div class="space-y-6 max-w-3xl">
+      <!-- Identity + avatar -->
+      <div class="card p-6">
+        <div class="flex items-center gap-5">
+          <div id="avatarPreview">${avatar}</div>
+          <div class="flex-1">
+            <div class="font-bold text-lg text-slate-800">${esc(u.full_name)}</div>
+            <div class="text-sm text-slate-500">${esc(roleLabel(u.role))}${u.label ? ' · ' + esc(u.label) : ''}</div>
+            <div class="text-xs text-slate-400 mt-1"><i class="fas fa-phone mr-1"></i>${esc(u.phone)} <span class="ml-1 text-slate-300">(locked)</span></div>
+          </div>
+        </div>
+        <div class="mt-4 field-group">
+          <label class="field-label">Profile picture URL</label>
+          <div class="flex gap-2">
+            <input id="pf_avatar" value="${esc(u.avatar_url || '')}" class="flex-1 px-3 py-2 border rounded-lg text-sm" placeholder="https://... image URL">
+            <button onclick="saveAvatar()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-image mr-1"></i>Update</button>
+          </div>
+          <p class="text-[11px] text-slate-500 mt-1">Everyone can update their profile picture.</p>
+        </div>
+      </div>
+
+      ${isFarmer ? `
+      <!-- Farmer data (National ID & Phone locked) -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-leaf text-teal-600 mr-2"></i>My Farmer Profile</h3>
+        <p class="text-xs text-slate-500 mb-4">You can update your details below. Your <b>National ID</b> and <b>Phone number</b> cannot be changed — contact an administrator if these need updating.</p>
+        <div class="responsive-grid cols-2 text-sm">
+          <div><label class="field-label">Full name</label><input id="pf_name" value="${esc(c?.full_name || u.full_name || '')}" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">National ID <span class="text-slate-400">(locked)</span></label><input value="${esc(c?.national_id || '')}" disabled class="px-3 py-2 border rounded-lg bg-slate-100 text-slate-500"></div>
+          <div><label class="field-label">Phone number <span class="text-slate-400">(locked)</span></label><input value="${esc(c?.mobile || u.phone || '')}" disabled class="px-3 py-2 border rounded-lg bg-slate-100 text-slate-500"></div>
+          <div><label class="field-label">Alternative number</label><input id="pf_alt_mobile" value="${esc(c?.alt_mobile || '')}" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">County</label><input id="pf_county" value="${esc(c?.county || '')}" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Sub-county</label><input id="pf_sub_county" value="${esc(c?.sub_county || '')}" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Ward</label><input id="pf_ward" value="${esc(c?.ward || '')}" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Village</label><input id="pf_village" value="${esc(c?.village || '')}" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Value chain</label><input id="pf_value_chain" value="${esc(c?.value_chain || '')}" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Acreage</label><input id="pf_acreage" value="${esc(c?.acreage || '')}" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Current loan amount</label><input id="pf_loans" value="${esc(c?.existing_loans || '')}" class="px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">SACCO membership</label><select id="pf_sacco" class="px-3 py-2 border rounded-lg"><option value="yes" ${(c?.sacco_membership || '').toLowerCase() === 'yes' ? 'selected' : ''}>Yes</option><option value="no" ${(c?.sacco_membership || '').toLowerCase() !== 'yes' ? 'selected' : ''}>No</option></select></div>
+        </div>
+        <div class="flex gap-2 mt-4"><button onclick="saveFarmerProfile()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save My Details</button></div>
+      </div>` : `
+      <div class="card p-6">
+        <p class="text-sm text-slate-500"><i class="fas fa-circle-info text-teal-600 mr-2"></i>As a <b>${esc(roleLabel(u.role))}</b>, you can update your profile picture and password here. Your account details are managed by an administrator.</p>
+      </div>`}
+
+      <!-- Change password (everyone) -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-key text-teal-600 mr-2"></i>Change Password</h3>
+        <p class="text-xs text-slate-500 mb-4">Choose a new password. You'll need your current password to confirm.</p>
+        <div class="responsive-grid cols-2 text-sm">
+          <div><label class="field-label">Current password</label>${passwordField('pf_cur_pw', { placeholder: 'Current password', cls: 'px-3 py-2 border rounded-lg w-full' })}</div>
+          <div><label class="field-label">New password</label>${passwordField('pf_new_pw', { placeholder: 'New password', cls: 'px-3 py-2 border rounded-lg w-full' })}</div>
+        </div>
+        <div class="flex gap-2 mt-4"><button onclick="changeMyPassword()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-lock mr-1"></i>Update Password</button></div>
+      </div>
+    </div>`
+}
+window.saveAvatar = async () => {
+  try {
+    const url = ($('pf_avatar') || {}).value || ''
+    await api.put('/me/avatar', { avatar_url: url })
+    if (state.user) state.user.avatar_url = url
+    const box = $('avatarPreview')
+    if (box) box.innerHTML = url ? `<img src="${esc(url)}" class="h-24 w-24 rounded-full object-cover border-2 border-teal-200">` : box.innerHTML
+    toast('Profile picture updated')
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.saveFarmerProfile = async () => {
+  const body = {
+    full_name: ($('pf_name') || {}).value,
+    alt_mobile: ($('pf_alt_mobile') || {}).value,
+    county: ($('pf_county') || {}).value,
+    sub_county: ($('pf_sub_county') || {}).value,
+    ward: ($('pf_ward') || {}).value,
+    village: ($('pf_village') || {}).value,
+    value_chain: ($('pf_value_chain') || {}).value,
+    acreage: ($('pf_acreage') || {}).value,
+    existing_loans: ($('pf_loans') || {}).value,
+    sacco_membership: ($('pf_sacco') || {}).value
+  }
+  try {
+    const res = await api.put('/me/profile', body)
+    if (res.data.user && state.user) { state.user.full_name = res.data.user.full_name; renderApp() }
+    toast('Your details were updated')
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.changeMyPassword = async () => {
+  const cur = ($('pf_cur_pw') || {}).value, nw = ($('pf_new_pw') || {}).value
+  if (!nw || nw.length < 4) return toast('New password must be at least 4 characters', false)
+  try {
+    await api.put('/me/password', { current_password: cur, new_password: nw })
+    if ($('pf_cur_pw')) $('pf_cur_pw').value = ''
+    if ($('pf_new_pw')) $('pf_new_pw').value = ''
+    toast('Password updated')
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 
 // ---------------------------------------------------------------------------
