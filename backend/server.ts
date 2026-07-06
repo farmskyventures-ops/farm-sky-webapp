@@ -63,7 +63,7 @@ const ENV = {
 }
 
 const root = new Hono()
-root.use('/static/*', serveStatic({ root: './public' }))
+root.use('/static/*', serveStatic({ root: './frontend' }))
 root.all('*', (c) => app.fetch(c.req.raw, ENV as any))
 
 const PORT = Number(process.env.PORT || 8080)

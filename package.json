@@ -4,11 +4,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "db:seed": "node --import tsx src/server.ts --migrate-only",
-    "build:node": "esbuild src/server.ts --bundle --platform=node --format=esm --outfile=dist-node/server.js --packages=external --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
+    "db:seed": "node --import tsx backend/server.ts --migrate-only",
+    "build:node": "esbuild backend/server.ts --bundle --platform=node --format=esm --outfile=dist-node/server.js --packages=external --banner:js=\"import{createRequire}from'module';const require=createRequire(import.meta.url);\"",
     "start": "node dist-node/server.js",
-    "start:dev": "node --import tsx src/server.ts",
-    "db:migrate": "node --import tsx src/server.ts --migrate-only"
+    "start:dev": "node --import tsx backend/server.ts",
+    "db:migrate": "node --import tsx backend/server.ts --migrate-only"
   },
   "dependencies": {
     "hono": "^4.12.23",
