@@ -9,24 +9,24 @@
 //   Supported rails: M-Pesa Daraja, SasaPay, KCB Buni
 //
 //   Routes (mounted under /api/v1/payments/*):
-//     POST /initiate                    <- the calling app sends a signed request
-//     GET  /status/:transaction_ref    <- polled by the calling app
-//     POST /callbacks/mpesa            <- provider IPN
-//     POST /callbacks/sasapay          <- provider IPN
-//     POST /callbacks/buni             <- provider IPN
+//      POST /initiate                    <- the calling app sends a signed request
+//      GET  /status/:transaction_ref    <- polled by the calling app
+//      POST /callbacks/mpesa            <- provider IPN
+//      POST /callbacks/sasapay          <- provider IPN
+//      POST /callbacks/buni             <- provider IPN
 //
 //   Security:
-//     - Every /initiate call is HMAC-SHA256 signed using the calling app's
-//       shared secret stored in app_clients.hmac_secret.
-//     - Replay protection: nonce + timestamp; requests older than 5 min
-//       are rejected.
-//     - Idempotency: optional Idempotency-Key header. Re-sending the same
-//       key for the same client returns the original transaction_ref.
-//     - Provider callbacks are bound by provider_request_id (which only
-//       the provider knows after our outbound STK push), so spoofed IPNs
-//       cannot mark an unrelated transaction as paid.
-//     - origin_app is taken from the verified client identity in the DB,
-//       NOT from the request body, so it cannot be spoofed.
+//      - Every /initiate call is HMAC-SHA256 signed using the calling app's
+//        shared secret stored in app_clients.hmac_secret.
+//      - Replay protection: nonce + timestamp; requests older than 5 min
+//        are rejected.
+//      - Idempotency: optional Idempotency-Key header. Re-sending the same
+//        key for the same client returns the original transaction_ref.
+//      - Provider callbacks are bound by provider_request_id (which only
+//        the provider knows after our outbound STK push), so spoofed IPNs
+//        cannot mark an unrelated transaction as paid.
+//      - origin_app is taken from the verified client identity in the DB,
+//        NOT from the request body, so it cannot be spoofed.
 // =====================================================================
 
 import { Hono } from 'hono'
@@ -64,9 +64,7 @@ async function loadMarketplace(c: any, marketplace_key: string) {
 }
 
 // Set the per-connection tenant scope so PostgreSQL RLS restricts every
-// subsequent query in this request to the tenant's own rows. This is a no-op
-// on SQLite/D1 (which lacks RLS) but harmless — isolation there falls back to
-// the explicit `origin_app = ?` / `marketplace_id = ?` predicates in queries.
+// subsequent query in this request to the tenant's own rows.
 async function setTenantScope(c: any, marketplaceId: number | null, isAdmin = false) {
   const setLocal = (c.env.DB as any)?.setSessionConfig
   if (typeof setLocal === 'function') {
@@ -109,7 +107,6 @@ async function logCallback(c: any, txRef: string | null, method: string, provide
 
 async function notifyOriginApp(c: any, client: any, tx: any) {
   if (!client?.callback_url) return
-  // Fire-and-forget; failures are not fatal
   try {
     const body = JSON.stringify({
       transaction_ref: tx.transaction_ref,
@@ -123,7 +120,6 @@ async function notifyOriginApp(c: any, client: any, tx: any) {
       result_desc: tx.result_desc,
       completed_at: tx.completed_at
     })
-    // Sign so the receiving app can verify it came from us
     const { signRequest } = await import('./payments-shared')
     const { timestamp, nonce, signature } = await signRequest(client.hmac_secret, client.client_key, body)
     await fetch(client.callback_url, {
@@ -142,13 +138,6 @@ async function notifyOriginApp(c: any, client: any, tx: any) {
 
 // ----------------------------------------------------------------------------
 // POST /initiate
-// Body (JSON): { amount, phone, payment_method, origin_reference?, description?, initiated_by_user?, channel?, channelCode?, accountNumber? }
-// Headers (required):
-//   X-Farmsky-Client     : 'equipment' | 'feed' | 'input'
-//   X-Farmsky-Timestamp  : milliseconds since epoch
-//   X-Farmsky-Nonce      : random UUID per request
-//   X-Farmsky-Signature  : HMAC-SHA256 hex of (client \n ts \n nonce \n raw-body) using hmac_secret
-//   Idempotency-Key      : optional; safe to retry with same key
 // ----------------------------------------------------------------------------
 gateway.post('/initiate', async (c) => {
   const rawBody = await c.req.text()
@@ -167,7 +156,6 @@ gateway.post('/initiate', async (c) => {
     return c.json({ success: false, error: 'Unknown or inactive client app' }, 401)
   }
 
-  // Resolve tenant + apply DB-layer RLS scope for the rest of the request.
   const marketplace = await loadMarketplace(c, client_key)
   const marketplaceId = marketplace?.id ?? null
   await setTenantScope(c, marketplaceId, false)
@@ -178,9 +166,6 @@ gateway.post('/initiate', async (c) => {
     return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
   }
 
-  // Replay protection: a (client_key, nonce) pair may be used only once. The
-  // UNIQUE(client_key, nonce) constraint on payment_nonces makes this atomic —
-  // the second INSERT of the same pair fails, which we treat as a replay.
   if (nonce) {
     try {
       const existingNonce = await c.env.DB.prepare(
@@ -194,13 +179,11 @@ gateway.post('/initiate', async (c) => {
         `INSERT INTO payment_nonces (client_key, nonce) VALUES (?, ?)`
       ).bind(client_key, nonce).run()
     } catch (e: any) {
-      // A unique-violation here means a concurrent duplicate slipped in => replay.
       const code = e?.code || ''
       if (code === '23505' || /unique|duplicate/i.test(String(e?.message || ''))) {
         await auditSecurity(c, 'REPLAY', 'CRITICAL', { marketplaceId, originApp: client_key, detail: `replayed nonce ${nonce}` })
         return c.json({ success: false, error: 'Replay detected' }, 401)
       }
-      // Any other error (e.g. table missing on edge/D1) is non-fatal.
     }
   }
 
@@ -214,7 +197,6 @@ gateway.post('/initiate', async (c) => {
   const description = body.description ? String(body.description).slice(0, 200) : `${client.display_name} payment`
   const initiated_by_user = body.initiated_by_user ?? null
 
-  // Capture optional dynamic-channel options coming from the marketplaces
   const channel = body.channel || 'MOBILE_MONEY'
   const channelCode = body.channelCode || body.networkCode || undefined
   const accountNumber = body.accountNumber || undefined
@@ -223,7 +205,6 @@ gateway.post('/initiate', async (c) => {
   if (!Number.isFinite(amount) || amount <= 0) return c.json({ success: false, error: 'amount must be > 0' }, 400)
   if (!phone || phone.length < 11) return c.json({ success: false, error: 'phone is invalid' }, 400)
 
-  // Idempotency check matching schema configuration fields
   if (idempotencyKey) {
     const existing = await c.env.DB.prepare(
       `SELECT transaction_ref, payment_method, status FROM central_transactions WHERE origin_app = ? AND idempotency_key = ? LIMIT 1`
@@ -239,7 +220,6 @@ gateway.post('/initiate', async (c) => {
     }
   }
 
-  // Push to the chosen provider FIRST so we can record provider_request_id
   const transaction_ref = genRef()
   const desc = description.slice(0, 40)
   let providerResult: any
@@ -292,7 +272,6 @@ gateway.post('/initiate', async (c) => {
 
 // ----------------------------------------------------------------------------
 // GET /status/:transaction_ref
-// Same HMAC headers required so only the originating app can poll its own tx.
 // ----------------------------------------------------------------------------
 gateway.get('/status/:ref', async (c) => {
   const transaction_ref = c.req.param('ref')
@@ -307,7 +286,6 @@ gateway.get('/status/:ref', async (c) => {
   const marketplace = await loadMarketplace(c, client_key)
   await setTenantScope(c, marketplace?.id ?? null, false)
 
-  // For GET we sign the path so an attacker cannot replay another app's poll
   const v = await verifySignature(client.hmac_secret, client_key, timestamp, nonce, transaction_ref, signature)
   if (!v.ok) {
     await auditSecurity(c, 'SIGNATURE_FAIL', 'WARN', { marketplaceId: marketplace?.id ?? null, originApp: client_key, detail: 'invalid signature on /status poll' })
@@ -319,7 +297,6 @@ gateway.get('/status/:ref', async (c) => {
   ).bind(transaction_ref, client_key).first<any>()
   if (!tx) return c.json({ success: false, error: 'Transaction not found' }, 404)
 
-  // If still PENDING, ask the provider for the latest status
   if (tx.status === 'PENDING' && tx.provider_request_id) {
     try {
       let pr: any
@@ -363,15 +340,9 @@ gateway.get('/status/:ref', async (c) => {
 })
 
 // ----------------------------------------------------------------------------
-// CALLBACKS (provider IPNs). These are reached by Daraja/SasaPay/Buni only,
-// so they don't need our HMAC. Spoof protection: the provider_request_id is
-// only known after we successfully pushed a transaction, so a random attacker
-// cannot mutate an unrelated tx. We also persist the raw payload for audit.
+// CALLBACKS (provider IPNs)
 // ----------------------------------------------------------------------------
 async function settleCallback(c: any, method: PaymentMethod, providerReqId: string | null, success: boolean, receipt: string | null, resultCode: string | null, resultDesc: string | null, rawBody: string) {
-  // Provider IPNs are not tenant-scoped at the network layer, so the settlement
-  // path runs with admin scope to locate the originating transaction, then
-  // records the tenant it belongs to.
   await setTenantScope(c, null, true)
   if (!providerReqId) {
     await logCallback(c, null, method, null, rawBody, false)
@@ -396,7 +367,6 @@ async function settleCallback(c: any, method: PaymentMethod, providerReqId: stri
   ).bind(success ? 'SUCCESS' : 'FAILED', receipt, resultCode, resultDesc, tx.transaction_ref).run()
   await logCallback(c, tx.transaction_ref, method, providerReqId, rawBody, true, tx.marketplace_id ?? null)
 
-  // Notify originating app (if it has registered a callback_url)
   const client = await loadClient(c, tx.origin_app)
   const refreshed = await c.env.DB.prepare(`SELECT * FROM central_transactions WHERE transaction_ref=?`).bind(tx.transaction_ref).first<any>()
   if (client && refreshed) await notifyOriginApp(c, client, refreshed)
@@ -449,11 +419,10 @@ gateway.post('/callbacks/buni', async (c) => {
 })
 
 // ----------------------------------------------------------------------------
-// Admin reporting (this app's own admin only)
-// Returns counts per origin_app and per payment_method.
+// Admin Metrics & Reports
 // ----------------------------------------------------------------------------
 gateway.get('/admin/summary', async (c) => {
-  await setTenantScope(c, null, true) // admin scope: read across all tenants
+  await setTenantScope(c, null, true)
   const { results: byApp } = await c.env.DB.prepare(
     `SELECT origin_app, COUNT(*) as count, COALESCE(SUM(amount), 0) as total
         FROM central_transactions WHERE status='SUCCESS' GROUP BY origin_app`
@@ -469,11 +438,6 @@ gateway.get('/admin/summary', async (c) => {
   return c.json({ by_app: byApp, by_method: byMethod, matrix })
 })
 
-// ----------------------------------------------------------------------------
-// AUTOMATED REVENUE MATRIX AUDIT
-// Because all three marketplaces share ONE merchant shortcode, this attributes
-// a single settlement statement back to each tenant (marketplace x method).
-// ----------------------------------------------------------------------------
 gateway.get('/admin/revenue-matrix', async (c) => {
   await setTenantScope(c, null, true)
   const { results: matrix } = await c.env.DB.prepare(
@@ -502,11 +466,6 @@ gateway.get('/admin/revenue-matrix', async (c) => {
   return c.json({ matrix, rollup, note: 'Single shortcode revenue attributed per marketplace tenant.' })
 })
 
-// ----------------------------------------------------------------------------
-// SUSPICIOUS ACTIVITY AUDIT TRAIL CHECK
-// Surfaces signature failures, replays, cross-tenant / spoofed callbacks,
-// velocity anomalies and marketplace_id integrity breaks.
-// ----------------------------------------------------------------------------
 gateway.get('/admin/suspicious-activity', async (c) => {
   await setTenantScope(c, null, true)
   const events = await c.env.DB.prepare(
