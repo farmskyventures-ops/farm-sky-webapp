@@ -29,16 +29,25 @@ function safeJson<T = any>(value: any, fallback: T): T {
 // Fallback permissions when role catalog has not loaded yet.
 function builtinDefaults(role: string): Record<string, boolean> {
   if (['super_admin', 'admin'].includes(role)) {
-    return { view: true, edit: true, delete: true, deactivate: true, approve: true, dispatch: true, add_farmer: true, view_farmers: true, view_credit_purchases: true, manage_users: true, request_admin_action: true }
+    return { view: true, edit: true, delete: true, deactivate: true, approve: true, dispatch: true, add_farmer: true, view_farmers: true, view_credit_purchases: true, manage_users: true, request_admin_action: true, can_manage_inventory: true, can_manage_finance_settings: true, view_wallet: true, manage_wallets: true }
   }
   if (role === 'operations_finance') {
-    return { view: true, approve: true, dispatch: true, view_farmers: true, view_credit_purchases: true, request_admin_action: true }
+    return { view: true, approve: true, dispatch: true, view_farmers: true, view_credit_purchases: true, request_admin_action: true, can_manage_finance_settings: true }
   }
   if (role === 'agent') {
-    return { view: true, add_farmer: true, view_farmers: true, view_credit_purchases: true }
+    return { view: true, add_farmer: true, view_farmers: true, view_credit_purchases: true, can_manage_inventory: true, view_wallet: true }
   }
   if (role === 'support') {
     return { view: true, view_farmers: true, view_credit_purchases: true }
+  }
+  if (role === 'lender') {
+    return { view: true, view_credit_purchases: true }
+  }
+  if (role === 'mne') {
+    return { view: true, view_farmers: true, view_credit_purchases: true }
+  }
+  if (['investor', 'partner'].includes(role)) {
+    return { view: true }
   }
   return { view: true }
 }
@@ -360,10 +369,41 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
     permissions: parsePermissions(row.permissions, row.role, fallback)
   }
 }
+// Declare the executing user's identity + capabilities inside the DB session so
+// PostgreSQL Row-Level Security (backend/sql/03_ownership_rls_setup.sql) can
+// strip away records the user has no relationship with. No-op on SQLite/D1.
+// Running any RLS-protected query WITHOUT this context returns ZERO rows for
+// general users — preventing systemic data-leak vectors.
+async function setUserContext(c: any, user: SessionUser | null) {
+  const setLocal = (c.env.DB as any)?.setSessionConfig
+  if (typeof setLocal !== 'function') return
+  try {
+    await setLocal.call(c.env.DB, 'app.current_user_id', user ? String(user.id) : '')
+    await setLocal.call(c.env.DB, 'app.current_role', user ? String(user.role) : '')
+    const canFinance = user
+      ? (['admin', 'super_admin'].includes(user.role) || Boolean(user.permissions?.can_manage_finance_settings))
+      : false
+    await setLocal.call(c.env.DB, 'app.user_can_finance', canFinance ? 'true' : 'false')
+  } catch (_) {}
+}
+// Run a block with a temporary admin context so background / storefront reads
+// (public catalog, provider callbacks) can see the global dataset, then restore.
+async function withAdminContext(c: any, fn: () => Promise<any>) {
+  const setLocal = (c.env.DB as any)?.setSessionConfig
+  if (typeof setLocal === 'function') {
+    try {
+      await setLocal.call(c.env.DB, 'app.current_role', 'admin')
+      await setLocal.call(c.env.DB, 'app.user_can_finance', 'true')
+    } catch (_) {}
+  }
+  try { return await fn() }
+  finally { await setUserContext(c, c.get('user') || null) }
+}
 async function requireAuth(c: any, next: any) {
   const user = await getSessionUser(c)
   if (!user) return c.json({ error: 'Unauthorized' }, 401)
   c.set('user', user)
+  await setUserContext(c, user)
   await next()
 }
 function requireRole(...roles: string[]) {
@@ -629,43 +669,113 @@ app.post('/api/reset-password/verify', async (c) => {
 // ----------------------------------------------------------------------------
 // PRODUCTS / INVENTORY
 // ----------------------------------------------------------------------------
+// Storefront + management catalog. Products are read under admin context so the
+// public shop and managers see the global catalog; ownership filtering for the
+// "My Inventory" grid is applied explicitly below via ?mine=1.
 app.get('/api/products', requireAuth, async (c) => {
-  const { results } = await c.env.DB.prepare(`SELECT * FROM products ORDER BY name`).all()
-  const withStatus = results.map((p: any) => ({
+  const user = c.get('user') as SessionUser
+  const mine = c.req.query('mine') === '1'
+  const shop = c.req.query('shop') === '1'
+  const rows = await withAdminContext(c, async () => {
+    let query = `SELECT * FROM products`
+    const binds: any[] = []
+    const where: string[] = []
+    // Storefront: only fully-authorized products are visible to buyers.
+    if (shop) where.push(`finance_status = 'published'`)
+    if (mine && !['admin', 'super_admin'].includes(user.role)) { where.push(`created_by = ?`); binds.push(user.id) }
+    if (where.length) query += ` WHERE ` + where.join(' AND ')
+    query += ` ORDER BY name`
+    const { results } = await c.env.DB.prepare(query).bind(...binds).all()
+    return results
+  })
+  const withStatus = (rows as any[]).map((p: any) => ({
     ...p,
     stock_status: p.quantity <= 0 ? 'out_of_stock' : p.quantity <= p.reorder_threshold ? 'low_stock' : 'in_stock'
   }))
-  return c.json({ products: withStatus })
+  return c.json({ products: withStatus, can_manage_inventory: hasPermission(user, 'can_manage_inventory'), can_manage_finance_settings: hasPermission(user, 'can_manage_finance_settings') })
 })
-app.post('/api/products', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+// Drafting a product needs can_manage_inventory. If the author is NOT authorized
+// for finance, the product is saved as 'pending_finance' with finance fields
+// neutralized, and lands in the finance-approval queue.
+app.post('/api/products', requireAuth, requirePermission('can_manage_inventory'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const canFinance = hasPermission(user, 'can_manage_finance_settings')
   const p = normalizeProductPayload(await c.req.json())
   if (!p.sku || !p.name) return c.json({ error: 'SKU and name are required' }, 400)
+  // Enforce the split at the app layer too (defence-in-depth alongside the RLS trigger).
+  let financeStatus = 'published'
+  if (!canFinance) {
+    p.credit_markup_pct = 0
+    p.credit_price = p.cash_price
+    p.financing_enabled = false
+    p.financing_interest_pct = 0
+    p.financing_terms_text = null
+    p.financing_terms_doc_url = null
+    p.payment_option_mode = 'cash'
+    financeStatus = 'pending_finance'
+  }
+  const financeSetBy = canFinance ? user.id : null
   const r = await c.env.DB.prepare(
-    `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code,created_by,finance_status,finance_set_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(
     p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
     p.cash_price, p.credit_price, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
     p.payment_option_mode, p.financing_model, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
     p.financing_term_max_months, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-    p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code
+    p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code, user.id, financeStatus, financeSetBy
   ).run()
-  await audit(c, c.get('user').id, 'create', 'product', `${p.name} (${p.payment_option_mode})`)
-  return c.json({ id: r.meta.last_row_id })
+  await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus})`)
+  return c.json({ id: r.meta.last_row_id, finance_status: financeStatus })
 })
-app.put('/api/products/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+// Editing core/cash details needs can_manage_inventory. Editing finance columns
+// needs can_manage_finance_settings — if the editor lacks it, the existing
+// finance values are preserved (COALESCE-style) and cannot be changed.
+app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventory', 'can_manage_finance_settings'), async (c) => {
+  const user = c.get('user') as SessionUser
   const id = c.req.param('id')
+  const canInv = hasPermission(user, 'can_manage_inventory')
+  const canFinance = hasPermission(user, 'can_manage_finance_settings')
+  const existing = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(id).first<any>())
+  if (!existing) return c.json({ error: 'Not found' }, 404)
   const p = normalizeProductPayload(await c.req.json())
+  // Choose which columns the editor is allowed to change.
+  const coreCols = canInv ? {
+    sku: p.sku, name: p.name, category: p.category, description: p.description, product_type: p.product_type,
+    buying_price: p.buying_price, cash_markup_pct: p.cash_markup_pct, cash_price: p.cash_price,
+    quantity: p.quantity, unit: p.unit, reorder_threshold: p.reorder_threshold, image: p.image || existing.image,
+    cash_enabled: p.cash_enabled, cash_deposit_pct: p.cash_deposit_pct, cash_terms_text: p.cash_terms_text, cash_terms_doc_url: p.cash_terms_doc_url
+  } : {
+    sku: existing.sku, name: existing.name, category: existing.category, description: existing.description, product_type: existing.product_type,
+    buying_price: existing.buying_price, cash_markup_pct: existing.cash_markup_pct, cash_price: existing.cash_price,
+    quantity: existing.quantity, unit: existing.unit, reorder_threshold: existing.reorder_threshold, image: existing.image,
+    cash_enabled: existing.cash_enabled, cash_deposit_pct: existing.cash_deposit_pct, cash_terms_text: existing.cash_terms_text, cash_terms_doc_url: existing.cash_terms_doc_url
+  }
+  const finCols = canFinance ? {
+    credit_markup_pct: p.credit_markup_pct, credit_price: p.credit_price, financing_enabled: p.financing_enabled,
+    financing_model: p.financing_model, financing_interest_pct: p.financing_interest_pct, financing_frequency: p.financing_frequency,
+    financing_term_min_months: p.financing_term_min_months, financing_term_max_months: p.financing_term_max_months,
+    financing_deposit_pct: p.financing_deposit_pct, financing_terms_text: p.financing_terms_text, financing_terms_doc_url: p.financing_terms_doc_url,
+    transunion_product_code: p.transunion_product_code,
+    payment_option_mode: p.payment_option_mode, finance_status: 'published', finance_set_by: user.id
+  } : {
+    credit_markup_pct: existing.credit_markup_pct, credit_price: existing.credit_price, financing_enabled: existing.financing_enabled,
+    financing_model: existing.financing_model, financing_interest_pct: existing.financing_interest_pct, financing_frequency: existing.financing_frequency,
+    financing_term_min_months: existing.financing_term_min_months, financing_term_max_months: existing.financing_term_max_months,
+    financing_deposit_pct: existing.financing_deposit_pct, financing_terms_text: existing.financing_terms_text, financing_terms_doc_url: existing.financing_terms_doc_url,
+    transunion_product_code: existing.transunion_product_code,
+    payment_option_mode: existing.payment_option_mode, finance_status: existing.finance_status, finance_set_by: existing.finance_set_by
+  }
   await c.env.DB.prepare(
-    `UPDATE products SET sku=?, name=?, category=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, transunion_product_code=? WHERE id=?`
+    `UPDATE products SET sku=?, name=?, category=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, transunion_product_code=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
   ).bind(
-    p.sku, p.name, p.category, p.description, p.product_type, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
-    p.cash_price, p.credit_price, p.quantity, p.unit, p.reorder_threshold, p.image || null, p.cash_enabled, p.financing_enabled,
-    p.payment_option_mode, p.financing_model, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
-    p.financing_term_max_months, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-    p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code, id
+    coreCols.sku, coreCols.name, coreCols.category, coreCols.description, coreCols.product_type, coreCols.buying_price, coreCols.cash_markup_pct, finCols.credit_markup_pct,
+    coreCols.cash_price, finCols.credit_price, coreCols.quantity, coreCols.unit, coreCols.reorder_threshold, coreCols.image || null, coreCols.cash_enabled, finCols.financing_enabled,
+    finCols.payment_option_mode, finCols.financing_model, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
+    finCols.financing_term_max_months, coreCols.cash_deposit_pct, finCols.financing_deposit_pct, coreCols.cash_terms_text, finCols.financing_terms_text,
+    coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, finCols.transunion_product_code, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
   ).run()
-  await audit(c, c.get('user').id, 'update', 'product', p.name)
+  await audit(c, user.id, 'update', 'product', `${coreCols.name}${canFinance ? '' : ' (core only)'}`)
   return c.json({ ok: true })
 })
 app.delete('/api/products/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
@@ -676,13 +786,85 @@ app.delete('/api/products/:id', requireAuth, requireRole('admin', 'super_admin')
   await audit(c, c.get('user').id, 'delete', 'product', String(id))
   return c.json({ ok: true })
 })
-app.put('/api/products/:id/stock', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+app.put('/api/products/:id/stock', requireAuth, requirePermission('can_manage_inventory'), async (c) => {
   const id = c.req.param('id')
   const { quantity, movement_type } = await c.req.json()
   await c.env.DB.prepare(`UPDATE products SET quantity = quantity + ? WHERE id = ?`).bind(Number(quantity), id).run()
   await c.env.DB.prepare(`INSERT INTO stock_movements (product_id, movement_type, quantity, reference) VALUES (?,?,?,?)`)
     .bind(id, movement_type || 'purchase', quantity, 'manual adjustment').run()
   return c.json({ ok: true })
+})
+
+// ---- Split-data workflow: finance-approval queue -------------------------
+// Products drafted by a base user awaiting an authorized finance user to supply
+// markups / rates / agreements before they can be published to the storefront.
+app.get('/api/products/finance-queue', requireAuth, requirePermission('can_manage_finance_settings'), async (c) => {
+  const rows = await withAdminContext(c, async () => {
+    const { results } = await c.env.DB.prepare(
+      `SELECT p.*, u.full_name AS created_by_name
+         FROM products p LEFT JOIN users u ON u.id = p.created_by
+        WHERE p.finance_status = 'pending_finance'
+        ORDER BY p.created_at DESC`
+    ).all()
+    return results
+  })
+  return c.json({ products: rows })
+})
+// Authorized finance user supplies the finance components and publishes.
+app.put('/api/products/:id/finance', requireAuth, requirePermission('can_manage_finance_settings'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const id = c.req.param('id')
+  const b = await c.req.json()
+  const publish = b.finance_status !== 'pending_finance'
+  await c.env.DB.prepare(
+    `UPDATE products SET
+        credit_markup_pct = COALESCE(?, credit_markup_pct),
+        credit_price = COALESCE(?, credit_price),
+        financing_enabled = COALESCE(?, financing_enabled),
+        financing_model = COALESCE(?, financing_model),
+        financing_interest_pct = COALESCE(?, financing_interest_pct),
+        financing_frequency = COALESCE(?, financing_frequency),
+        financing_term_min_months = COALESCE(?, financing_term_min_months),
+        financing_term_max_months = COALESCE(?, financing_term_max_months),
+        financing_deposit_pct = COALESCE(?, financing_deposit_pct),
+        financing_terms_text = COALESCE(?, financing_terms_text),
+        financing_terms_doc_url = COALESCE(?, financing_terms_doc_url),
+        payment_option_mode = COALESCE(?, payment_option_mode),
+        finance_notes = COALESCE(?, finance_notes),
+        finance_status = ?, finance_set_by = ?, finance_set_at = CURRENT_TIMESTAMP
+      WHERE id = ?`
+  ).bind(
+    b.credit_markup_pct ?? null, b.credit_price ?? null,
+    b.financing_enabled === undefined ? null : (boolInt(b.financing_enabled, true) ? 1 : 0),
+    b.financing_model ?? null, b.financing_interest_pct ?? null, b.financing_frequency ?? null,
+    b.financing_term_min_months ?? null, b.financing_term_max_months ?? null, b.financing_deposit_pct ?? null,
+    b.financing_terms_text ?? null, b.financing_terms_doc_url ?? null,
+    b.payment_option_mode ?? (publish ? 'both' : null), b.finance_notes ?? null,
+    publish ? 'published' : 'pending_finance', user.id, id
+  ).run()
+  await audit(c, user.id, 'finance_authorize', 'product', `product ${id} ${publish ? 'published' : 'saved'}`)
+  return c.json({ ok: true, finance_status: publish ? 'published' : 'pending_finance' })
+})
+// ---- Admin audit: products hidden from storefront for lack of finance -----
+// Diagnostic + reminder feed for authorized finance personnel.
+app.get('/api/products/finance-audit', requireAuth, requirePermission('can_manage_finance_settings'), async (c) => {
+  const rows = await withAdminContext(c, async () => {
+    const { results } = await c.env.DB.prepare(
+      `SELECT p.id, p.sku, p.name, p.finance_status, p.created_at, p.created_by,
+              u.full_name AS created_by_name,
+              (CASE WHEN p.credit_markup_pct IS NULL OR p.credit_markup_pct = 0 THEN 1 ELSE 0 END) AS missing_markup,
+              (CASE WHEN p.financing_terms_text IS NULL OR p.financing_terms_text = '' THEN 1 ELSE 0 END) AS missing_agreement
+         FROM products p LEFT JOIN users u ON u.id = p.created_by
+        WHERE p.finance_status <> 'published'
+        ORDER BY p.created_at ASC`
+    ).all()
+    return results
+  })
+  const list = rows as any[]
+  const reminder = list.length
+    ? `${list.length} product(s) are hidden from the storefront pending financial parameters. Authorized finance personnel should review the queue.`
+    : 'All products have complete financial parameters and are visible on the storefront.'
+  return c.json({ hidden_products: list, count: list.length, reminder, notify_roles: ['admin', 'super_admin', 'operations_finance'] })
 })
 
 // ----------------------------------------------------------------------------
@@ -710,11 +892,12 @@ app.post('/api/customers', requireAuth, requireRole('agent', 'admin', 'super_adm
   const b = await c.req.json()
   const user = c.get('user')
   const saccoMember = ['yes', 'true', '1', 'on'].includes(String(b.sacco_membership || '').toLowerCase())
+  const assignedAgent = user.role === 'agent' ? user.id : (b.agent_id || user.id)
   const r = await c.env.DB.prepare(
-    `INSERT INTO customers (agent_id,full_name,national_id,date_of_birth,gender,mobile,alt_mobile,county,sub_county,ward,village,latitude,longitude,value_chain_type,value_chain,acreage,herd_size,farm_experience,annual_production,existing_loans,sacco_membership,id_front_url,id_back_url,kyc_status,status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', 'active')`
+    `INSERT INTO customers (agent_id,onboarded_by,full_name,national_id,date_of_birth,gender,mobile,alt_mobile,county,sub_county,ward,village,latitude,longitude,value_chain_type,value_chain,acreage,herd_size,farm_experience,annual_production,existing_loans,sacco_membership,id_front_url,id_back_url,kyc_status,status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending', 'active')`
   ).bind(
-    user.role === 'agent' ? user.id : (b.agent_id || user.id),
+    assignedAgent, assignedAgent,
     b.full_name, b.national_id, b.date_of_birth, b.gender, b.mobile, b.alt_mobile, b.county, b.sub_county,
     b.ward, b.village, b.latitude || null, b.longitude || null, b.value_chain_type, b.value_chain,
     b.acreage || null, b.herd_size || null, b.farm_experience || null, b.annual_production || null,
@@ -846,17 +1029,20 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
   const user = c.get('user')
   const { customer_id, product_id, quantity, payment_type, term_months, delivery_location, consent } = await c.req.json()
   if (!consent) return c.json({ error: 'Customer consent to the configured terms is required' }, 400)
-  const p = await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(product_id).first<any>()
+  // The catalog + the buyer's own customer row are read under admin context so
+  // ownership RLS (which scopes products to their lister) doesn't block checkout.
+  const p = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(product_id).first<any>())
   if (!p) return c.json({ error: 'Product not found' }, 404)
+  if (p.finance_status && p.finance_status !== 'published') return c.json({ error: 'This product is not yet available for purchase' }, 400)
   const qty = Math.max(1, Number(quantity) || 1)
   if (p.quantity < qty) return c.json({ error: 'Insufficient stock' }, 400)
   let custId = customer_id
   if (user.role === 'customer') {
-    const myCust = await c.env.DB.prepare(`SELECT id, agent_id FROM customers WHERE user_id=?`).bind(user.id).first<any>()
+    const myCust = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id, agent_id FROM customers WHERE user_id=?`).bind(user.id).first<any>())
     if (!myCust) return c.json({ error: 'Customer profile not found' }, 404)
     custId = myCust.id
   }
-  const custRow = await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(custId).first<any>()
+  const custRow = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(custId).first<any>())
   const normalizedPaymentType = payment_type === 'cash' ? 'cash' : 'financing'
   if (normalizedPaymentType === 'financing' && custRow?.kyc_status !== 'verified') {
     return c.json({
@@ -872,10 +1058,10 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
     ? (q.amount_due_now > 0 ? 'pending_payment' : 'awaiting_cash_balance')
     : 'pending'
   const r = await c.env.DB.prepare(
-    `INSERT INTO murabaha_contracts (contract_ref,customer_id,agent_id,product_id,quantity,payment_type,supplier_cost,markup_pct,murabaha_price,term_months,monthly_payment,delivery_location,status,ownership_recorded,consent_given,amount_paid,outstanding,financing_model,interest_rate_pct,deposit_pct,deposit_amount,finance_principal,payment_frequency,installment_amount,dispatch_status,terms_document_url,terms_text)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO murabaha_contracts (contract_ref,customer_id,agent_id,created_by,product_id,quantity,payment_type,supplier_cost,markup_pct,murabaha_price,term_months,monthly_payment,delivery_location,status,ownership_recorded,consent_given,amount_paid,outstanding,financing_model,interest_rate_pct,deposit_pct,deposit_amount,finance_principal,payment_frequency,installment_amount,dispatch_status,terms_document_url,terms_text)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(
-    contractRef, custId, custRow?.agent_id || null, product_id, qty, normalizedPaymentType, q.supplier_cost, q.markup_pct,
+    contractRef, custId, custRow?.agent_id || null, custRow?.onboarded_by || custRow?.agent_id || user.id, product_id, qty, normalizedPaymentType, q.supplier_cost, q.markup_pct,
     q.total_payable, q.term_months, q.monthly_payment || q.installment_amount || 0, delivery_location || '', status,
     0, 1, 0, q.total_payable, q.financing_model, q.interest_rate_pct || 0, q.deposit_pct, q.deposit_amount,
     q.finance_principal, q.payment_frequency, q.installment_amount || 0, 'pending', q.terms_document_url || null, q.terms_text || null
@@ -1006,6 +1192,11 @@ async function applyPayment(c: any, contract: any, amt: number, receipt: string,
     remaining = roundMoney(remaining - pay)
   }
   await c.env.DB.prepare(`UPDATE invoices SET status=? WHERE contract_id=?`).bind(newOutstanding <= 0 ? 'paid' : 'partial', contract.id).run()
+  // When an order/contract is fully settled, dynamically credit the agent's
+  // wallet per their active commission rules (idempotent per contract).
+  if (status === 'completed' && contract.status !== 'completed') {
+    try { await distributeCommission(c, { ...contract, status }) } catch (_) {}
+  }
   return { amount_paid: newPaid, outstanding: newOutstanding, status }
 }
 app.post('/api/mpesa/stkpush', requireAuth, async (c) => {
@@ -1741,6 +1932,214 @@ app.post('/api/export/email', requireAuth, requireRole('admin', 'super_admin'), 
   } catch (e: any) {
     return c.json({ error: e.message || 'Export failed' }, 400)
   }
+})
+
+// ============================================================================
+// WALLET SYSTEM — double-entry ledger, earning rules, commissions, payouts
+// ============================================================================
+
+// Ensure a user has a wallet row; returns the wallet id. Created under admin
+// context so it works regardless of the caller's ownership scope.
+async function ensureWallet(c: any, userId: number, assignedBy: number | null = null): Promise<number> {
+  return await withAdminContext(c, async () => {
+    const existing = await c.env.DB.prepare(`SELECT id FROM wallets WHERE user_id=?`).bind(userId).first<any>()
+    if (existing) return Number(existing.id)
+    const r = await c.env.DB.prepare(`INSERT INTO wallets (user_id, assigned_by) VALUES (?,?)`).bind(userId, assignedBy).run()
+    return Number(r.meta.last_row_id)
+  })
+}
+// Post a ledger entry (the ONLY sanctioned way a balance changes). The DB
+// trigger stamps balance_after and syncs wallets.balance atomically.
+async function postLedger(c: any, opts: { userId: number; walletId: number; type: 'credit' | 'debit'; amount: number; category: string; reference?: string | null; description?: string | null; createdBy?: number | null }) {
+  return await c.env.DB.prepare(
+    `INSERT INTO wallet_ledger (wallet_id, user_id, entry_type, amount, balance_after, category, reference, description, created_by)
+     VALUES (?,?,?,?, 0, ?,?,?,?)`
+  ).bind(opts.walletId, opts.userId, opts.type, roundMoney(opts.amount), opts.category, opts.reference ?? null, opts.description ?? null, opts.createdBy ?? null).run()
+}
+
+// GET my wallet + ledger statement (RLS scopes agents to their own).
+app.get('/api/wallet', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const walletId = await ensureWallet(c, user.id)
+  const wallet = await c.env.DB.prepare(`SELECT * FROM wallets WHERE id=?`).bind(walletId).first<any>()
+  const { results: ledger } = await c.env.DB.prepare(`SELECT * FROM wallet_ledger WHERE wallet_id=? ORDER BY id DESC LIMIT 200`).bind(walletId).all()
+  const { results: rules } = await c.env.DB.prepare(`SELECT * FROM earning_rules WHERE user_id=? AND is_active=1 ORDER BY id`).bind(user.id).all()
+  return c.json({ wallet, ledger, earning_rules: rules })
+})
+
+// ---- Admin wallet management ----
+// List all wallets with holder details (admin global view).
+app.get('/api/wallets', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const rows = await withAdminContext(c, async () => {
+    const { results } = await c.env.DB.prepare(
+      `SELECT w.*, u.full_name, u.phone, u.role,
+              (SELECT COUNT(*) FROM earning_rules er WHERE er.user_id=w.user_id AND er.is_active=1) AS rule_count
+         FROM wallets w JOIN users u ON u.id = w.user_id ORDER BY u.full_name`
+    ).all()
+    return results
+  })
+  return c.json({ wallets: rows })
+})
+// Assign / create a wallet for a user (admin authorizes it).
+app.post('/api/wallets', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const admin = c.get('user') as SessionUser
+  const b = await c.req.json()
+  const userId = Number(b.user_id)
+  if (!userId) return c.json({ error: 'user_id is required' }, 400)
+  const walletId = await ensureWallet(c, userId, admin.id)
+  await audit(c, admin.id, 'assign', 'wallet', `wallet for user ${userId}`)
+  return c.json({ ok: true, wallet_id: walletId })
+})
+
+// ---- Earning rules (admin sets criteria: 2% commission, KES 5,000 retainer…) ----
+app.get('/api/earning-rules/:userId', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const userId = c.req.param('userId')
+  const rows = await withAdminContext(c, async () => {
+    const { results } = await c.env.DB.prepare(`SELECT * FROM earning_rules WHERE user_id=? ORDER BY id`).bind(userId).all()
+    return results
+  })
+  return c.json({ earning_rules: rows })
+})
+app.post('/api/earning-rules', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const admin = c.get('user') as SessionUser
+  const b = await c.req.json()
+  const userId = Number(b.user_id)
+  const ruleType = String(b.rule_type || '').trim()
+  if (!userId || !ruleType) return c.json({ error: 'user_id and rule_type are required' }, 400)
+  const calcMethod = b.calc_method === 'percentage' ? 'percentage' : 'fixed'
+  await ensureWallet(c, userId, admin.id)
+  const r = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `INSERT INTO earning_rules (user_id, rule_type, calc_method, rate, fixed_amount, applies_to, description, is_active, created_by)
+     VALUES (?,?,?,?,?,?,?,1,?)`
+  ).bind(userId, ruleType, calcMethod, calcMethod === 'percentage' ? numberVal(b.rate, 0) : null, calcMethod === 'fixed' ? numberVal(b.fixed_amount, 0) : null, b.applies_to || (ruleType === 'commission' ? 'completed_order' : 'manual'), b.description || null, admin.id).run())
+  await audit(c, admin.id, 'create', 'earning_rule', `${ruleType} for user ${userId}`)
+  return c.json({ ok: true, id: r.meta.last_row_id })
+})
+app.put('/api/earning-rules/:id', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const admin = c.get('user') as SessionUser
+  const id = c.req.param('id')
+  const b = await c.req.json()
+  await withAdminContext(c, async () => await c.env.DB.prepare(
+    `UPDATE earning_rules SET rule_type=COALESCE(?,rule_type), calc_method=COALESCE(?,calc_method), rate=?, fixed_amount=?, applies_to=COALESCE(?,applies_to), description=COALESCE(?,description), is_active=COALESCE(?,is_active), updated_at=CURRENT_TIMESTAMP WHERE id=?`
+  ).bind(b.rule_type ?? null, b.calc_method ?? null, b.rate ?? null, b.fixed_amount ?? null, b.applies_to ?? null, b.description ?? null, b.is_active === undefined ? null : (boolInt(b.is_active, true) ? 1 : 0), id).run())
+  await audit(c, admin.id, 'update', 'earning_rule', String(id))
+  return c.json({ ok: true })
+})
+
+// ---- Dynamic commission distribution on order completion ----
+// Called when a contract/order status becomes 'completed'. Evaluates the target
+// agent's active commission rules and credits their wallet dynamically.
+async function distributeCommission(c: any, contract: any) {
+  if (!contract) return
+  const agentId = contract.created_by || contract.agent_id
+  if (!agentId) return
+  const orderValue = numberVal(contract.murabaha_price ?? contract.total_payable, 0)
+  await withAdminContext(c, async () => {
+    const { results: rules } = await c.env.DB.prepare(
+      `SELECT * FROM earning_rules WHERE user_id=? AND is_active=1 AND applies_to='completed_order'`
+    ).bind(agentId).all()
+    if (!rules?.length) return
+    const walletId = await ensureWallet(c, agentId)
+    for (const rule of rules as any[]) {
+      // Idempotency: don't double-credit the same contract for the same rule.
+      const dup = await c.env.DB.prepare(
+        `SELECT 1 FROM wallet_ledger WHERE wallet_id=? AND category=? AND reference=? LIMIT 1`
+      ).bind(walletId, rule.rule_type, contract.contract_ref).first<any>()
+      if (dup) continue
+      const amount = rule.calc_method === 'percentage'
+        ? roundMoney(orderValue * numberVal(rule.rate, 0) / 100)
+        : roundMoney(numberVal(rule.fixed_amount, 0))
+      if (amount <= 0) continue
+      await postLedger(c, { userId: agentId, walletId, type: 'credit', amount, category: rule.rule_type, reference: contract.contract_ref, description: `${rule.rule_type} on ${contract.contract_ref}`, createdBy: null })
+    }
+  })
+}
+
+// ---- Admin payout disbursals (retainers, transport, per-diems) ----
+// Batch-process fixed funds to one user or all agents.
+app.post('/api/wallet/payouts', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const admin = c.get('user') as SessionUser
+  const b = await c.req.json()
+  const category = String(b.category || 'retainer')
+  const amount = roundMoney(numberVal(b.amount, 0))
+  if (amount <= 0) return c.json({ error: 'amount must be > 0' }, 400)
+  const batchRef = ref('PAY')
+  const result = await withAdminContext(c, async () => {
+    let recipients: number[] = []
+    if (Array.isArray(b.user_ids) && b.user_ids.length) {
+      recipients = b.user_ids.map((x: any) => Number(x)).filter(Boolean)
+    } else if (b.user_id) {
+      recipients = [Number(b.user_id)]
+    } else if (b.target === 'all_agents') {
+      const { results } = await c.env.DB.prepare(`SELECT id FROM users WHERE role='agent' AND status='active'`).all()
+      recipients = (results as any[]).map((r) => Number(r.id))
+    }
+    if (!recipients.length) return { error: 'No recipients resolved' }
+    let total = 0, count = 0
+    for (const uid of recipients) {
+      const walletId = await ensureWallet(c, uid, admin.id)
+      await postLedger(c, { userId: uid, walletId, type: 'credit', amount, category, reference: batchRef, description: b.description || `${category} disbursal`, createdBy: admin.id })
+      total += amount; count++
+    }
+    await c.env.DB.prepare(
+      `INSERT INTO payout_batches (batch_ref, category, description, total_amount, recipient_count, issued_by) VALUES (?,?,?,?,?,?)`
+    ).bind(batchRef, category, b.description || null, roundMoney(total), count, admin.id).run()
+    return { total: roundMoney(total), count }
+  })
+  if ((result as any).error) return c.json(result, 400)
+  await audit(c, admin.id, 'payout', 'wallet', `${batchRef} ${category} x${(result as any).count}`)
+  return c.json({ ok: true, batch_ref: batchRef, ...(result as any) })
+})
+
+// ---- Real-time earning analytics (RLS: agent sees self, admin sees global) ----
+app.get('/api/wallet/analytics', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const isAdmin = hasPermission(user, 'manage_wallets') && ['admin', 'super_admin'].includes(user.role)
+  // With ownership RLS active, the SAME query returns per-agent data for agents
+  // and platform-wide data for admins — no branching in the query itself.
+  const byCategory = await c.env.DB.prepare(
+    `SELECT category, entry_type, COUNT(*) AS entries, COALESCE(SUM(amount),0) AS total
+       FROM wallet_ledger GROUP BY category, entry_type ORDER BY category`
+  ).all()
+  const totals = await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(CASE WHEN entry_type='credit' THEN amount ELSE 0 END),0) AS total_earned,
+            COALESCE(SUM(CASE WHEN entry_type='debit'  THEN amount ELSE 0 END),0) AS total_debited
+       FROM wallet_ledger`
+  ).first<any>()
+  return c.json({ scope: isAdmin ? 'global' : 'self', totals, by_category: byCategory.results })
+})
+
+// ----------------------------------------------------------------------------
+// SECURITY VALIDATION — confirm RLS isolation is active
+// Running the ownership-scoped tables WITHOUT a user context must yield 0 rows.
+// ----------------------------------------------------------------------------
+app.get('/api/security/rls-check', requireAuth, requireRole('super_admin'), async (c) => {
+  const setLocal = (c.env.DB as any)?.setSessionConfig
+  if (typeof setLocal !== 'function') return c.json({ supported: false, note: 'RLS is a PostgreSQL feature; not active on this runtime.' })
+  // Deliberately clear the context, then read each protected table.
+  await setLocal.call(c.env.DB, 'app.current_user_id', '')
+  await setLocal.call(c.env.DB, 'app.current_role', '')
+  const probe = async (t: string) => {
+    try { const r = await c.env.DB.prepare(`SELECT COUNT(*)::int n FROM ${t}`).first<any>(); return Number(r?.n ?? -1) }
+    catch { return -1 }
+  }
+  const result = {
+    customers: await probe('customers'),
+    products: await probe('products'),
+    murabaha_contracts: await probe('murabaha_contracts'),
+    wallet_ledger: await probe('wallet_ledger')
+  }
+  // Restore this admin's context.
+  await setUserContext(c, c.get('user'))
+  const leaking = Object.entries(result).filter(([, n]) => n > 0).map(([t]) => t)
+  return c.json({
+    supported: true,
+    without_context_counts: result,
+    isolation_ok: leaking.length === 0,
+    message: leaking.length === 0
+      ? 'RLS active: no rows are visible without a user context — data-leak vectors are closed.'
+      : `WARNING: tables leaking without context: ${leaking.join(', ')}. Ensure backend/sql/03_ownership_rls_setup.sql has been applied.`
+  })
 })
 
 // ----------------------------------------------------------------------------

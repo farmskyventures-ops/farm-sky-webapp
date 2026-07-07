@@ -18,12 +18,12 @@ const payLabel = (t, model) => {
     : (String(t || '').charAt(0).toUpperCase() + String(t || '').slice(1))
 }
 
-let _products = [], _agents = [], _users = [], _customers = []
+let _products = [], _agents = [], _users = [], _customers = [], _walletUsers = []
 let _permMeta = { permissions: [], roles: [] }
 function getRoleTemplate(role) {
   return (_permMeta.roles || []).find((r) => r.role_key === role)
 }
-const roleLabel = (r) => getRoleTemplate(r)?.label || ({ super_admin: 'Super Admin', admin: 'Admin', operations_finance: 'Operations & Finance', agent: 'Agent', customer: 'Farmer', support: 'Support' }[r] || r)
+const roleLabel = (r) => getRoleTemplate(r)?.label || ({ super_admin: 'Super Admin', admin: 'Admin', operations_finance: 'Operations & Finance', agent: 'Agent', customer: 'Farmer', support: 'Support', lender: 'Lender', investor: 'Investor', mne: 'M & E', partner: 'Partner' }[r] || r)
 const permsText = (perms) => Object.entries(perms || {}).filter(([, v]) => v).map(([k]) => k.replace(/_/g, ' ')).join(', ')
 async function ensurePermissionMeta() {
   if (!_permMeta.permissions.length && state.user) {
@@ -431,31 +431,43 @@ function navItems() {
   const account = { k: 'profile', i: 'fa-id-card', t: 'My Account' }
   const withAccount = (arr) => [...arr, account]
   const common = [{ k: 'dashboard', i: 'fa-gauge-high', t: 'Dashboard' }]
+  const financeQueue = { k: 'finance_queue', i: 'fa-hand-holding-dollar', t: 'Finance Queue' }
+  const wallets = { k: 'wallets', i: 'fa-wallet', t: 'Wallets & Payouts' }
+  const myWallet = { k: 'wallet', i: 'fa-wallet', t: 'My Wallet' }
   if (r === 'super_admin' || r === 'admin') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     { k: 'inventory', i: 'fa-boxes-stacked', t: 'Inventory' },
+    financeQueue,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
+    wallets,
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
     { k: 'settings', i: 'fa-sliders', t: 'Financing Settings' },
     { k: 'exports', i: 'fa-database', t: 'Data Export' }])
   if (r === 'operations_finance') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
+    financeQueue,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' }])
   if (r === 'agent') return withAccount([...common,
     { k: 'onboard', i: 'fa-user-plus', t: 'Add Farmer' },
     { k: 'customers', i: 'fa-users', t: 'My Farmers' },
-    { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' }])
+    ...(canDo('can_manage_inventory') ? [{ k: 'inventory', i: 'fa-boxes-stacked', t: 'My Inventory' }] : []),
+    { k: 'contracts', i: 'fa-file-signature', t: 'Credit Purchases' },
+    myWallet])
   if (r === 'customer') return withAccount([...common,
     { k: 'shop', i: 'fa-store', t: 'Equipment Shop' },
     { k: 'contracts', i: 'fa-file-signature', t: 'My Purchases' }])
   if (r === 'support') return withAccount([...common,
     { k: 'customers', i: 'fa-users', t: 'Customers' },
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' }])
+  // Lender / Investor / M&E / Partner: read-only dashboard + relevant views.
+  if (['lender', 'investor', 'mne', 'partner'].includes(r)) return withAccount([...common,
+    ...(canDo('view_credit_purchases') ? [{ k: 'contracts', i: 'fa-file-signature', t: 'Financed Portfolio' }] : []),
+    ...(canDo('view_farmers') ? [{ k: 'customers', i: 'fa-users', t: 'Farmers' }] : [])])
   return withAccount(common)
 }
 function renderApp() {
@@ -495,9 +507,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -564,7 +576,7 @@ function prodImg(p, cls) {
     : `<div class="${cls} flex items-center justify-center bg-gradient-to-br from-teal-50 to-emerald-100 text-teal-400"><i class="fas fa-box-open text-3xl"></i></div>`
 }
 async function viewShop() {
-  const { data } = await api.get('/products')
+  const { data } = await api.get('/products?shop=1')
   _products = data.products
   $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-3 gap-5">
     ${data.products.map(p => `
@@ -958,6 +970,16 @@ window.decide = async (id, action) => {
 // ---------------------------------------------------------------------------
 function productForm(prefix, p = {}) {
   const paymentMode = p.payment_option_mode || (p.cash_enabled && p.financing_enabled ? 'both' : p.cash_enabled ? 'cash' : 'financing') || 'both'
+  // Split-data listing (Instruction 3): only finance-authorized users may set
+  // markups / rates / financing terms / agreements. Base inventory users see them
+  // disabled and the record is routed to the finance-approval queue.
+  const canFin = canDo('can_manage_finance_settings')
+  const finDis = canFin ? '' : 'disabled'
+  const finNote = canFin ? '' : `
+    <div style="grid-column:1 / -1" class="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-xs text-amber-800 mb-1">
+      <i class="fas fa-lock mr-1"></i>Commercial markups, financing rates, PAYGO &amp; legal agreements are set by an authorized finance user.
+      Complete the basic inventory details below — an admin or finance officer supplies the financial components before the product goes live.
+    </div>`
   return `
     <div class="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-600 mb-4"><i class="fas fa-circle-info text-teal-600 mr-1"></i>Use the labeled fields below to collect or update inventory clearly: identify the equipment, capture stock levels, then define cash and financing terms.</div>
     <div class="flex items-center gap-3 mb-4">
@@ -977,44 +999,46 @@ function productForm(prefix, p = {}) {
       <div><label class="field-label">Buying cost</label><input id="${prefix}_buy" type="number" value="${Number(p.buying_price || 0)}" placeholder="Buying price" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Quantity in stock</label><input id="${prefix}_qty" type="number" value="${Number(p.quantity || 0)}" placeholder="Quantity" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Cash markup %</label><input id="${prefix}_cm" type="number" value="${Number(p.cash_markup_pct || 10)}" placeholder="Cash markup %" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Financing markup %</label><input id="${prefix}_crm" type="number" value="${Number(p.credit_markup_pct || 20)}" placeholder="Financing markup %" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Reorder threshold</label><input id="${prefix}_rt" type="number" value="${Number(p.reorder_threshold || 10)}" placeholder="Reorder threshold" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">TransUnion product code</label><input id="${prefix}_tu" value="${esc(p.transunion_product_code || '')}" placeholder="TransUnion product code" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Payment availability</label><select id="${prefix}_mode" class="px-3 py-2 border rounded-lg">
         <option value="both" ${paymentMode === 'both' ? 'selected' : ''}>Cash + Financing</option>
         <option value="cash" ${paymentMode === 'cash' ? 'selected' : ''}>Cash only</option>
         <option value="financing" ${paymentMode === 'financing' ? 'selected' : ''}>Financing only</option>
       </select></div>
-      <div><label class="field-label">Financing model</label><select id="${prefix}_fin_model" class="px-3 py-2 border rounded-lg">
+      <div><label class="field-label">Cash deposit %</label><input id="${prefix}_cash_dep" type="number" value="${Number(p.cash_deposit_pct ?? 100)}" placeholder="Cash deposit % (0/10/100)" class="px-3 py-2 border rounded-lg"></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Cash terms summary</label><textarea id="${prefix}_cash_terms" placeholder="Cash terms summary" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.cash_terms_text || '')}</textarea></div>
+      <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-slate-50">
+        <div class="font-medium text-slate-700 mb-2">Cash agreement</div>
+        <input id="${prefix}_cash_doc" value="${esc(p.cash_terms_doc_url || '')}" placeholder="Cash agreement URL / uploaded file data" class="w-full px-3 py-2 border rounded-lg text-xs">
+        <div class="flex items-center justify-between gap-2 mt-2">
+          <label class="btn bg-white px-3 py-2 rounded-lg text-xs cursor-pointer border"><i class="fas fa-file-upload mr-1"></i>Upload<input type="file" accept="image/*,application/pdf" class="hidden" onchange="pickFileDataUrl(this,'${prefix}_cash_doc','${prefix}_cash_doc_name')"></label>
+          <span id="${prefix}_cash_doc_name" class="text-[11px] text-slate-400 truncate">${p.cash_terms_doc_url ? 'existing document attached' : 'no file selected'}</span>
+        </div>
+      </div>
+      <div style="grid-column:1 / -1" class="mt-2 mb-1 flex items-center gap-2 text-sm font-semibold text-slate-700 border-t pt-3">
+        <i class="fas fa-hand-holding-dollar text-teal-600"></i>Financial components ${canFin ? '' : '<span class="badge bg-amber-100 text-amber-700 ml-1">finance-authorized only</span>'}
+      </div>
+      ${finNote}
+      <div><label class="field-label">Financing markup %</label><input id="${prefix}_crm" ${finDis} type="number" value="${Number(p.credit_markup_pct || 20)}" placeholder="Financing markup %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div><label class="field-label">TransUnion product code</label><input id="${prefix}_tu" ${finDis} value="${esc(p.transunion_product_code || '')}" placeholder="TransUnion product code" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div><label class="field-label">Financing model</label><select id="${prefix}_fin_model" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
         <option value="loan_interest" ${(p.financing_model || 'loan_interest') === 'loan_interest' ? 'selected' : ''}>Normal financing with interest</option>
         <option value="paygo" ${(p.financing_model || '') === 'paygo' ? 'selected' : ''}>PAYGO (M-KOPA style)</option>
       </select></div>
-      <div><label class="field-label">Interest / finance rate %</label><input id="${prefix}_int" type="number" value="${Number(p.financing_interest_pct || 0)}" placeholder="Interest rate %" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Repayment frequency</label><select id="${prefix}_freq" class="px-3 py-2 border rounded-lg">
+      <div><label class="field-label">Interest / finance rate %</label><input id="${prefix}_int" ${finDis} type="number" value="${Number(p.financing_interest_pct || 0)}" placeholder="Interest rate %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div><label class="field-label">Repayment frequency</label><select id="${prefix}_freq" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
         ${['daily','weekly','monthly'].map(v => `<option value="${v}" ${(p.financing_frequency || 'monthly') === v ? 'selected' : ''}>${v}</option>`).join('')}
       </select></div>
-      <div><label class="field-label">Minimum term (months)</label><input id="${prefix}_tmin" type="number" value="${Number(p.financing_term_min_months || 3)}" placeholder="Minimum term (months)" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Maximum term (months)</label><input id="${prefix}_tmax" type="number" value="${Number(p.financing_term_max_months || 12)}" placeholder="Maximum term (months)" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Cash deposit %</label><input id="${prefix}_cash_dep" type="number" value="${Number(p.cash_deposit_pct ?? 100)}" placeholder="Cash deposit % (0/10/100)" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" type="number" value="${Number(p.financing_deposit_pct ?? 10)}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Cash terms summary</label><textarea id="${prefix}_cash_terms" placeholder="Cash terms summary" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.cash_terms_text || '')}</textarea></div>
-      <div><label class="field-label">Financing / PAYGO terms summary</label><textarea id="${prefix}_fin_terms" placeholder="Financing / PAYGO terms summary" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.financing_terms_text || '')}</textarea></div>
-      <div style="grid-column:1 / -1" class="responsive-grid cols-2">
-        <div class="border rounded-xl p-3 bg-slate-50">
-          <div class="font-medium text-slate-700 mb-2">Cash agreement</div>
-          <input id="${prefix}_cash_doc" value="${esc(p.cash_terms_doc_url || '')}" placeholder="Cash agreement URL / uploaded file data" class="w-full px-3 py-2 border rounded-lg text-xs">
-          <div class="flex items-center justify-between gap-2 mt-2">
-            <label class="btn bg-white px-3 py-2 rounded-lg text-xs cursor-pointer border"><i class="fas fa-file-upload mr-1"></i>Upload<input type="file" accept="image/*,application/pdf" class="hidden" onchange="pickFileDataUrl(this,'${prefix}_cash_doc','${prefix}_cash_doc_name')"></label>
-            <span id="${prefix}_cash_doc_name" class="text-[11px] text-slate-400 truncate">${p.cash_terms_doc_url ? 'existing document attached' : 'no file selected'}</span>
-          </div>
-        </div>
-        <div class="border rounded-xl p-3 bg-slate-50">
-          <div class="font-medium text-slate-700 mb-2">Financing / PAYGO agreement</div>
-          <input id="${prefix}_fin_doc" value="${esc(p.financing_terms_doc_url || '')}" placeholder="Financing agreement URL / uploaded file data" class="w-full px-3 py-2 border rounded-lg text-xs">
-          <div class="flex items-center justify-between gap-2 mt-2">
-            <label class="btn bg-white px-3 py-2 rounded-lg text-xs cursor-pointer border"><i class="fas fa-file-upload mr-1"></i>Upload<input type="file" accept="image/*,application/pdf" class="hidden" onchange="pickFileDataUrl(this,'${prefix}_fin_doc','${prefix}_fin_doc_name')"></label>
-            <span id="${prefix}_fin_doc_name" class="text-[11px] text-slate-400 truncate">${p.financing_terms_doc_url ? 'existing document attached' : 'no file selected'}</span>
-          </div>
+      <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" ${finDis} type="number" value="${Number(p.financing_deposit_pct ?? 10)}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div><label class="field-label">Minimum term (months)</label><input id="${prefix}_tmin" ${finDis} type="number" value="${Number(p.financing_term_min_months || 3)}" placeholder="Minimum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div><label class="field-label">Maximum term (months)</label><input id="${prefix}_tmax" ${finDis} type="number" value="${Number(p.financing_term_max_months || 12)}" placeholder="Maximum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Financing / PAYGO terms summary</label><textarea id="${prefix}_fin_terms" ${finDis} placeholder="Financing / PAYGO terms summary" class="px-3 py-2 border rounded-lg min-h-24 ${finDis ? 'bg-slate-100 text-slate-400' : ''}">${esc(p.financing_terms_text || '')}</textarea></div>
+      <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-slate-50">
+        <div class="font-medium text-slate-700 mb-2">Financing / PAYGO agreement</div>
+        <input id="${prefix}_fin_doc" ${finDis} value="${esc(p.financing_terms_doc_url || '')}" placeholder="Financing agreement URL / uploaded file data" class="w-full px-3 py-2 border rounded-lg text-xs ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
+        <div class="flex items-center justify-between gap-2 mt-2">
+          <label class="btn ${finDis ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-white cursor-pointer'} px-3 py-2 rounded-lg text-xs border"><i class="fas fa-file-upload mr-1"></i>Upload<input type="file" ${finDis} accept="image/*,application/pdf" class="hidden" onchange="pickFileDataUrl(this,'${prefix}_fin_doc','${prefix}_fin_doc_name')"></label>
+          <span id="${prefix}_fin_doc_name" class="text-[11px] text-slate-400 truncate">${p.financing_terms_doc_url ? 'existing document attached' : 'no file selected'}</span>
         </div>
       </div>
     </div>`
@@ -1051,26 +1075,45 @@ function productPayload(prefix) {
     transunion_product_code: $(prefix + '_tu').value || null
   }
 }
+function financeStatusBadge(s) {
+  const map = { published: 'bg-emerald-100 text-emerald-700', pending_finance: 'bg-amber-100 text-amber-700', draft: 'bg-slate-100 text-slate-600' }
+  const label = { published: 'Live', pending_finance: 'Pending finance', draft: 'Draft' }[s] || s || 'Live'
+  return `<span class="badge ${map[s] || 'bg-slate-100 text-slate-600'}">${esc(label)}</span>`
+}
 async function viewInventory() {
-  const { data } = await api.get('/products')
+  // Instruction 5 Query 3 — "My Inventory Control Grid". Agents (base inventory
+  // users) see only records they created (?mine=1); admins see the full catalog.
+  const isAdmin = ['admin', 'super_admin'].includes(state.user.role)
+  const { data } = await api.get('/products' + (isAdmin ? '' : '?mine=1'))
   _products = data.products
+  const canInv = data.can_manage_inventory
+  const canFin = data.can_manage_finance_settings
+  const isDelete = isAdmin
+  const addBtn = canInv
+    ? `<button onclick="addProductModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Add inventory</button>`
+    : `<span class="text-xs text-slate-400">Read-only view · you are not authorized to add inventory</span>`
   $('content').innerHTML = `
-  <div class="flex justify-end mb-4"><button onclick="addProductModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Add Equipment</button></div>
+  <div class="flex items-center justify-between mb-4">
+    <div class="text-sm text-slate-500">${isAdmin ? 'Full equipment catalog' : 'Equipment you have listed'} · ${data.products.length} item(s)</div>
+    <div class="action-bar">${addBtn}</div>
+  </div>
   <div class="card table-card"><table class="w-full text-sm">
-    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Equipment</th><th class="text-left px-4 py-3">Payment Options</th><th class="text-left px-4 py-3">Financing</th><th class="text-right px-4 py-3">Cash Deposit</th><th class="text-right px-4 py-3">Finance Deposit</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Equipment</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Payment Options</th><th class="text-left px-4 py-3">Financing</th><th class="text-right px-4 py-3">Cash Dep.</th><th class="text-right px-4 py-3">Fin. Dep.</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
     <tbody>${data.products.map(p => `<tr class="border-t border-slate-100">
       <td class="px-4 py-2">${prodImg(p, 'w-10 h-10 rounded-lg')}</td>
       <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || 'Equipment')}</div></td>
+      <td class="px-4 py-3">${financeStatusBadge(p.finance_status)}</td>
       <td class="px-4 py-3">${esc((p.payment_option_mode || 'both').replace('_', ' '))}</td>
       <td class="px-4 py-3">${esc(p.financing_model === 'paygo' ? 'PAYGO' : 'Interest financing')}<div class="text-xs text-slate-400">${Number(p.financing_interest_pct || 0)}% · ${esc(p.financing_frequency || 'monthly')}</div></td>
       <td class="px-4 py-3 text-right">${Number(p.cash_deposit_pct ?? 100)}%</td>
       <td class="px-4 py-3 text-right">${Number(p.financing_deposit_pct ?? 10)}%</td>
       <td class="px-4 py-3 text-right">${p.quantity} ${esc(p.unit)}</td>
       <td class="px-4 py-3 whitespace-nowrap text-right">
-        <button onclick="editProductModal(${p.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>
-        <button onclick="restockModal(${p.id},'${esc(p.name)}')" class="text-slate-500 hover:underline text-xs mr-2">Restock</button>
-        <button onclick="deleteProduct(${p.id},'${esc(p.name)}')" class="text-red-600 hover:underline text-xs">Delete</button>
-      </td></tr>`).join('')}</tbody>
+        ${(canInv || canFin) ? `<button onclick="editProductModal(${p.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>` : ''}
+        ${canInv ? `<button onclick="restockModal(${p.id},'${esc(p.name)}')" class="text-slate-500 hover:underline text-xs mr-2">Restock</button>` : ''}
+        ${p.finance_status === 'pending_finance' && canFin ? `<button onclick="financeModal(${p.id})" class="text-amber-600 hover:underline text-xs mr-2"><i class="fas fa-hand-holding-dollar mr-1"></i>Set finance</button>` : ''}
+        ${isDelete ? `<button onclick="deleteProduct(${p.id},'${esc(p.name)}')" class="text-red-600 hover:underline text-xs">Delete</button>` : ''}
+      </td></tr>`).join('') || '<tr><td colspan="9" class="text-center py-8 text-slate-400">No inventory records</td></tr>'}</tbody>
   </table></div>`
 }
 window.pickImage = (input, targetId, previewId) => {
@@ -1125,6 +1168,299 @@ window.doRestock = async (id) => {
   if (!confirmEdit(`Confirm inventory update and add ${$('rq').value || 0} unit(s) to stock?`)) return
   await api.put(`/products/${id}/stock`, { quantity: Number($('rq').value), movement_type: 'purchase' })
   closeModal(); toast('Stock updated'); viewInventory()
+}
+
+// ---------------------------------------------------------------------------
+// FINANCE APPROVAL QUEUE (Instruction 3 & 4) — authorized finance users supply
+// the markup / rate / PAYGO / agreement components for drafted products, then
+// publish them to the storefront. Also surfaces the hidden-product audit feed.
+// ---------------------------------------------------------------------------
+async function viewFinanceQueue() {
+  let queue = [], audit = { hidden_products: [], count: 0, reminder: '' }
+  try {
+    const [q, a] = await Promise.all([
+      api.get('/products/finance-queue'),
+      api.get('/products/finance-audit')
+    ])
+    queue = q.data.products || []
+    audit = a.data
+  } catch (err) { toast(err.response?.data?.error || 'Failed to load queue', false) }
+  const reminder = audit.count
+    ? `<div class="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-800 mb-4"><i class="fas fa-bell mr-2"></i>${esc(audit.reminder)}</div>`
+    : `<div class="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 text-sm text-emerald-800 mb-4"><i class="fas fa-circle-check mr-2"></i>${esc(audit.reminder || 'All products have complete financial parameters.')}</div>`
+  const rows = queue.map(p => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-2">${prodImg(p, 'w-10 h-10 rounded-lg')}</td>
+      <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || 'Equipment')}</div></td>
+      <td class="px-4 py-3 text-xs text-slate-500">${esc(p.created_by_name || '—')}</td>
+      <td class="px-4 py-3 text-right">${fmt(p.buying_price)}</td>
+      <td class="px-4 py-3 text-right">${p.quantity} ${esc(p.unit || '')}</td>
+      <td class="px-4 py-3 text-right"><button onclick="financeModal(${p.id})" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-hand-holding-dollar mr-1"></i>Supply finance</button></td>
+    </tr>`).join('')
+  const auditRows = (audit.hidden_products || []).map(a => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3"><div class="font-medium">${esc(a.name)}</div><div class="text-xs text-slate-500">${esc(a.sku)}</div></td>
+      <td class="px-4 py-3">${financeStatusBadge(a.finance_status)}</td>
+      <td class="px-4 py-3">${a.missing_markup ? '<span class="text-red-600 text-xs"><i class="fas fa-triangle-exclamation mr-1"></i>markup</span>' : '<span class="text-emerald-600 text-xs">markup ok</span>'}</td>
+      <td class="px-4 py-3">${a.missing_agreement ? '<span class="text-red-600 text-xs"><i class="fas fa-triangle-exclamation mr-1"></i>agreement</span>' : '<span class="text-emerald-600 text-xs">agreement ok</span>'}</td>
+      <td class="px-4 py-3 text-xs text-slate-500">${esc(a.created_by_name || '—')}</td>
+    </tr>`).join('')
+  $('content').innerHTML = `
+  ${reminder}
+  <div class="card table-card mb-6">
+    <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-list-check text-teal-600 mr-2"></i>Products awaiting financial setup</div>
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Equipment</th><th class="text-left px-4 py-3">Listed by</th><th class="text-right px-4 py-3">Buying cost</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="6" class="text-center py-8 text-slate-400">Nothing awaiting finance approval</td></tr>'}</tbody>
+    </table>
+  </div>
+  <div class="card table-card">
+    <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-eye-slash text-amber-500 mr-2"></i>Hidden from storefront (audit)</div>
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Equipment</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Markup</th><th class="text-left px-4 py-3">Agreement</th><th class="text-left px-4 py-3">Listed by</th></tr></thead>
+      <tbody>${auditRows || '<tr><td colspan="5" class="text-center py-8 text-slate-400">No hidden products</td></tr>'}</tbody>
+    </table>
+  </div>`
+}
+window.financeModal = async (id) => {
+  // Load the current product (from cache if present) so we can prefill.
+  let p = (_products || []).find(x => x.id === id)
+  if (!p) {
+    try { const { data } = await api.get('/products/finance-queue'); p = (data.products || []).find(x => x.id === id) || {} } catch (_) { p = {} }
+  }
+  p = p || {}
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-hand-holding-dollar text-teal-600 mr-2"></i>Supply financial components</h3>
+    <p class="text-xs text-slate-500 mb-4">${esc(p.name || 'Product')} · ${esc(p.sku || '')}</p>
+    <div class="responsive-grid cols-2 text-sm">
+      <div><label class="field-label">Financing markup %</label><input id="fz_crm" type="number" value="${Number(p.credit_markup_pct || 20)}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Financing model</label><select id="fz_model" class="px-3 py-2 border rounded-lg">
+        <option value="loan_interest" ${(p.financing_model || 'loan_interest') === 'loan_interest' ? 'selected' : ''}>Interest financing</option>
+        <option value="paygo" ${(p.financing_model || '') === 'paygo' ? 'selected' : ''}>PAYGO</option>
+      </select></div>
+      <div><label class="field-label">Interest / finance rate %</label><input id="fz_int" type="number" value="${Number(p.financing_interest_pct || 0)}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Repayment frequency</label><select id="fz_freq" class="px-3 py-2 border rounded-lg">
+        ${['daily','weekly','monthly'].map(v => `<option value="${v}" ${(p.financing_frequency || 'monthly') === v ? 'selected' : ''}>${v}</option>`).join('')}
+      </select></div>
+      <div><label class="field-label">Minimum term (months)</label><input id="fz_tmin" type="number" value="${Number(p.financing_term_min_months || 3)}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Maximum term (months)</label><input id="fz_tmax" type="number" value="${Number(p.financing_term_max_months || 12)}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Financing deposit %</label><input id="fz_dep" type="number" value="${Number(p.financing_deposit_pct ?? 10)}" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Payment availability</label><select id="fz_mode" class="px-3 py-2 border rounded-lg">
+        <option value="both">Cash + Financing</option><option value="financing">Financing only</option><option value="cash">Cash only</option>
+      </select></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Financing / PAYGO terms summary</label><textarea id="fz_terms" class="px-3 py-2 border rounded-lg min-h-20">${esc(p.financing_terms_text || '')}</textarea></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Financing agreement URL / file</label><input id="fz_doc" value="${esc(p.financing_terms_doc_url || '')}" placeholder="Agreement URL or uploaded file data" class="px-3 py-2 border rounded-lg text-xs"></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Finance notes (optional)</label><input id="fz_notes" value="${esc(p.finance_notes || '')}" class="px-3 py-2 border rounded-lg text-xs"></div>
+    </div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="submitFinance(${id}, true)" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-check mr-1"></i>Publish to storefront</button>
+      <button onclick="submitFinance(${id}, false)" class="btn px-4 bg-slate-100 rounded-lg text-sm">Save draft</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+window.submitFinance = async (id, publish) => {
+  const payload = {
+    credit_markup_pct: Number($('fz_crm').value || 0),
+    financing_model: $('fz_model').value,
+    financing_interest_pct: Number($('fz_int').value || 0),
+    financing_frequency: $('fz_freq').value,
+    financing_term_min_months: Number($('fz_tmin').value || 3),
+    financing_term_max_months: Number($('fz_tmax').value || 12),
+    financing_deposit_pct: Number($('fz_dep').value || 10),
+    payment_option_mode: $('fz_mode').value,
+    financing_enabled: true,
+    financing_terms_text: $('fz_terms').value || null,
+    financing_terms_doc_url: $('fz_doc').value || null,
+    finance_notes: $('fz_notes').value || null,
+    finance_status: publish ? 'published' : 'pending_finance'
+  }
+  try {
+    await api.put(`/products/${id}/finance`, payload)
+    closeModal(); toast(publish ? 'Product published' : 'Finance draft saved'); viewFinanceQueue()
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// ---------------------------------------------------------------------------
+// WALLET SYSTEM (Instruction 7) — agent statement + admin management/payouts.
+// ---------------------------------------------------------------------------
+function ledgerRow(l) {
+  const sign = l.entry_type === 'credit' ? '+' : '−'
+  const color = l.entry_type === 'credit' ? 'text-emerald-600' : 'text-red-600'
+  return `<tr class="border-t border-slate-100">
+    <td class="px-4 py-3 text-xs text-slate-500">${esc((l.created_at || '').replace('T', ' ').slice(0, 16))}</td>
+    <td class="px-4 py-3"><span class="badge bg-slate-100 text-slate-600">${esc(l.category || '—')}</span></td>
+    <td class="px-4 py-3 text-xs text-slate-500">${esc(l.description || l.reference || '—')}</td>
+    <td class="px-4 py-3 text-right font-medium ${color}">${sign} ${fmt(l.amount)}</td>
+    <td class="px-4 py-3 text-right text-xs text-slate-500">${fmt(l.balance_after)}</td>
+  </tr>`
+}
+async function viewMyWallet() {
+  let wallet = null, ledger = [], rules = [], analytics = null
+  try {
+    const [w, a] = await Promise.all([api.get('/wallet'), api.get('/wallet/analytics')])
+    wallet = w.data.wallet; ledger = w.data.ledger || []; rules = w.data.earning_rules || []
+    analytics = a.data
+  } catch (err) { toast(err.response?.data?.error || 'Wallet unavailable', false) }
+  const rulesHtml = rules.length ? rules.map(r => `<div class="flex items-center justify-between border-b border-slate-100 py-2 text-sm">
+      <span><b>${esc(r.rule_type)}</b> · ${esc(r.calc_method)}</span>
+      <span class="text-slate-600">${r.calc_method === 'percentage' ? Number(r.rate || 0) + '%' : fmt(r.fixed_amount)}</span>
+    </div>`).join('') : '<div class="text-sm text-slate-400 py-2">No earning rules assigned yet.</div>'
+  $('content').innerHTML = `
+  <div class="responsive-grid cols-3 mb-6">
+    <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Wallet balance</div><div class="text-2xl font-bold text-teal-700">${fmt(wallet?.balance)}</div><div class="text-xs text-slate-400 mt-1">${esc(wallet?.currency || 'KES')} · ${esc(wallet?.status || 'active')}</div></div>
+    <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Total earned</div><div class="text-2xl font-bold text-emerald-600">${fmt(analytics?.totals?.total_earned)}</div></div>
+    <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Total debited</div><div class="text-2xl font-bold text-slate-600">${fmt(analytics?.totals?.total_debited)}</div></div>
+  </div>
+  <div class="card p-5 mb-6"><div class="font-semibold text-slate-700 mb-2"><i class="fas fa-sliders text-teal-600 mr-2"></i>My earning criteria</div>${rulesHtml}</div>
+  <div class="card table-card">
+    <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-receipt text-teal-600 mr-2"></i>Wallet statement (double-entry ledger)</div>
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Date</th><th class="text-left px-4 py-3">Category</th><th class="text-left px-4 py-3">Detail</th><th class="text-right px-4 py-3">Amount</th><th class="text-right px-4 py-3">Balance</th></tr></thead>
+      <tbody>${ledger.map(ledgerRow).join('') || '<tr><td colspan="5" class="text-center py-8 text-slate-400">No transactions yet</td></tr>'}</tbody>
+    </table>
+  </div>`
+}
+async function viewWallets() {
+  let wallets = [], analytics = null
+  try {
+    const [w, a] = await Promise.all([api.get('/wallets'), api.get('/wallet/analytics')])
+    wallets = w.data.wallets || []
+    analytics = a.data
+  } catch (err) { toast(err.response?.data?.error || 'Failed to load wallets', false) }
+  _walletUsers = wallets
+  const catRows = (analytics?.by_category || []).map(c => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3">${esc(c.category)}</td>
+      <td class="px-4 py-3">${esc(c.entry_type)}</td>
+      <td class="px-4 py-3 text-right">${c.entries}</td>
+      <td class="px-4 py-3 text-right">${fmt(c.total)}</td>
+    </tr>`).join('')
+  const rows = wallets.map(w => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3"><div class="font-medium">${esc(w.full_name)}</div><div class="text-xs text-slate-500">${esc(w.phone || '')} · ${esc(roleLabel(w.role))}</div></td>
+      <td class="px-4 py-3 text-right font-medium text-teal-700">${fmt(w.balance)}</td>
+      <td class="px-4 py-3 text-center">${w.rule_count || 0}</td>
+      <td class="px-4 py-3">${badge(w.status || 'active')}</td>
+      <td class="px-4 py-3 text-right whitespace-nowrap">
+        <button onclick="earningRulesModal(${w.user_id},'${esc(w.full_name)}')" class="text-teal-600 hover:underline text-xs mr-2">Earning rules</button>
+        <button onclick="payoutModal(${w.user_id},'${esc(w.full_name)}')" class="text-slate-600 hover:underline text-xs">Pay out</button>
+      </td>
+    </tr>`).join('')
+  $('content').innerHTML = `
+  <div class="responsive-grid cols-3 mb-6">
+    <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Total credited (global)</div><div class="text-2xl font-bold text-emerald-600">${fmt(analytics?.totals?.total_earned)}</div></div>
+    <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Total debited (global)</div><div class="text-2xl font-bold text-slate-600">${fmt(analytics?.totals?.total_debited)}</div></div>
+    <div class="card p-5 flex items-center justify-center"><button onclick="assignWalletModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Assign wallet</button></div>
+  </div>
+  <div class="flex flex-wrap gap-2 mb-4">
+    <button onclick="batchPayoutModal('all_agents')" class="btn bg-white border px-4 py-2 rounded-lg text-sm"><i class="fas fa-money-check-dollar mr-1 text-teal-600"></i>Batch payout to all agents</button>
+  </div>
+  <div class="card table-card mb-6">
+    <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-wallet text-teal-600 mr-2"></i>Wallets</div>
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Holder</th><th class="text-right px-4 py-3">Balance</th><th class="text-center px-4 py-3">Rules</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5" class="text-center py-8 text-slate-400">No wallets assigned</td></tr>'}</tbody>
+    </table>
+  </div>
+  <div class="card table-card">
+    <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-chart-pie text-teal-600 mr-2"></i>Earning analytics by category</div>
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Category</th><th class="text-left px-4 py-3">Type</th><th class="text-right px-4 py-3">Entries</th><th class="text-right px-4 py-3">Total</th></tr></thead>
+      <tbody>${catRows || '<tr><td colspan="4" class="text-center py-8 text-slate-400">No ledger activity yet</td></tr>'}</tbody>
+    </table>
+  </div>`
+}
+window.assignWalletModal = async () => {
+  let users = []
+  try { const { data } = await api.get('/users'); users = data.users || [] } catch (_) {}
+  const existing = new Set((_walletUsers || []).map(w => w.user_id))
+  const opts = users.filter(u => !existing.has(u.id)).map(u => `<option value="${u.id}">${esc(u.full_name)} · ${esc(roleLabel(u.role))}</option>`).join('')
+  showModal(`<h3 class="font-bold mb-3"><i class="fas fa-user-plus text-teal-600 mr-2"></i>Assign / authorize wallet</h3>
+    <label class="field-label">User</label>
+    <select id="aw_user" class="w-full px-3 py-2 border rounded-lg mb-4">${opts || '<option value="">All users already have wallets</option>'}</select>
+    <div class="flex gap-2"><button onclick="doAssignWallet()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Assign wallet</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doAssignWallet = async () => {
+  const userId = Number($('aw_user').value)
+  if (!userId) return toast('Select a user', false)
+  try { await api.post('/wallets', { user_id: userId }); closeModal(); toast('Wallet assigned'); viewWallets() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.earningRulesModal = async (userId, name) => {
+  let rules = []
+  try { const { data } = await api.get('/earning-rules/' + userId); rules = data.earning_rules || [] } catch (_) {}
+  const list = rules.map(r => `<div class="flex items-center justify-between border-b border-slate-100 py-2 text-sm">
+      <span><b>${esc(r.rule_type)}</b> · ${esc(r.calc_method)} · ${r.calc_method === 'percentage' ? Number(r.rate || 0) + '%' : fmt(r.fixed_amount)} <span class="text-xs text-slate-400">(${esc(r.applies_to || '')})</span></span>
+      <span class="${r.is_active ? 'text-emerald-600' : 'text-slate-400'} text-xs">${r.is_active ? 'active' : 'inactive'}</span>
+    </div>`).join('') || '<div class="text-sm text-slate-400 py-2">No rules yet.</div>'
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-sliders text-teal-600 mr-2"></i>Earning criteria — ${esc(name)}</h3>
+    <p class="text-xs text-slate-500 mb-3">Define how ${esc(name)} earns: e.g. 2% commission on completed orders, KES 5,000 retainer, transport, per-diem.</p>
+    <div class="mb-4">${list}</div>
+    <div class="border-t pt-3 responsive-grid cols-2 text-sm">
+      <div><label class="field-label">Rule type</label><input id="er_type" placeholder="commission / retainer / transport / per_diem" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Calculation</label><select id="er_calc" class="px-3 py-2 border rounded-lg" onchange="toggleErCalc()">
+        <option value="percentage">Percentage of order</option><option value="fixed">Fixed amount</option>
+      </select></div>
+      <div id="er_rate_wrap"><label class="field-label">Rate %</label><input id="er_rate" type="number" value="2" class="px-3 py-2 border rounded-lg"></div>
+      <div id="er_fixed_wrap" style="display:none"><label class="field-label">Fixed amount (KES)</label><input id="er_fixed" type="number" value="5000" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Applies to</label><select id="er_applies" class="px-3 py-2 border rounded-lg">
+        <option value="completed_order">Completed order (auto)</option><option value="manual">Manual / payout</option>
+      </select></div>
+      <div><label class="field-label">Description</label><input id="er_desc" placeholder="e.g. Sales commission" class="px-3 py-2 border rounded-lg"></div>
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="doAddEarningRule(${userId})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Add rule</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button></div>`)
+}
+window.toggleErCalc = () => {
+  const pct = $('er_calc').value === 'percentage'
+  $('er_rate_wrap').style.display = pct ? '' : 'none'
+  $('er_fixed_wrap').style.display = pct ? 'none' : ''
+}
+window.doAddEarningRule = async (userId) => {
+  const calc = $('er_calc').value
+  const payload = {
+    user_id: userId,
+    rule_type: $('er_type').value.trim(),
+    calc_method: calc,
+    rate: calc === 'percentage' ? Number($('er_rate').value || 0) : null,
+    fixed_amount: calc === 'fixed' ? Number($('er_fixed').value || 0) : null,
+    applies_to: $('er_applies').value,
+    description: $('er_desc').value || null
+  }
+  if (!payload.rule_type) return toast('Rule type is required', false)
+  try { await api.post('/earning-rules', payload); toast('Rule added'); earningRulesModal(userId, '') }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.payoutModal = (userId, name) => {
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-money-check-dollar text-teal-600 mr-2"></i>Pay out — ${esc(name)}</h3>
+    <p class="text-xs text-slate-500 mb-3">Disburse fixed funds (retainer, transport, per-diem) directly to this wallet.</p>
+    <div class="responsive-grid cols-2 text-sm">
+      <div><label class="field-label">Category</label><select id="po_cat" class="px-3 py-2 border rounded-lg">
+        <option value="retainer">Retainer</option><option value="transport">Transport</option><option value="per_diem">Per-diem</option><option value="bonus">Bonus</option>
+      </select></div>
+      <div><label class="field-label">Amount (KES)</label><input id="po_amt" type="number" value="5000" class="px-3 py-2 border rounded-lg"></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Description</label><input id="po_desc" placeholder="e.g. March retainer" class="px-3 py-2 border rounded-lg"></div>
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="doPayout(${userId})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Disburse</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doPayout = async (userId) => {
+  const payload = { user_id: userId, category: $('po_cat').value, amount: Number($('po_amt').value || 0), description: $('po_desc').value || null }
+  if (payload.amount <= 0) return toast('Amount must be greater than zero', false)
+  try { const { data } = await api.post('/wallet/payouts', payload); closeModal(); toast(`Paid out ${fmt(data.total)} (${data.batch_ref})`); viewWallets() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.batchPayoutModal = (target) => {
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-users text-teal-600 mr-2"></i>Batch payout — all active agents</h3>
+    <p class="text-xs text-slate-500 mb-3">Process a fixed disbursal to every active agent wallet at once.</p>
+    <div class="responsive-grid cols-2 text-sm">
+      <div><label class="field-label">Category</label><select id="bp_cat" class="px-3 py-2 border rounded-lg">
+        <option value="retainer">Retainer</option><option value="transport">Transport</option><option value="per_diem">Per-diem</option>
+      </select></div>
+      <div><label class="field-label">Amount per agent (KES)</label><input id="bp_amt" type="number" value="5000" class="px-3 py-2 border rounded-lg"></div>
+      <div style="grid-column:1 / -1"><label class="field-label">Description</label><input id="bp_desc" placeholder="e.g. Monthly retainer batch" class="px-3 py-2 border rounded-lg"></div>
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="doBatchPayout('${target}')" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Disburse to all agents</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doBatchPayout = async (target) => {
+  const payload = { target, category: $('bp_cat').value, amount: Number($('bp_amt').value || 0), description: $('bp_desc').value || null }
+  if (payload.amount <= 0) return toast('Amount must be greater than zero', false)
+  if (!confirmEdit('Disburse ' + fmt(payload.amount) + ' to every active agent?')) return
+  try { const { data } = await api.post('/wallet/payouts', payload); closeModal(); toast(`Paid ${data.count} agent(s), total ${fmt(data.total)}`); viewWallets() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,7 +1753,7 @@ window.doEditAgent = async (id) => {
 function userRoleOptions(selected) {
   const roles = (_permMeta.roles || []).length
     ? (_permMeta.roles || []).map((r) => ({ key: r.role_key, label: r.label }))
-    : ['super_admin', 'admin', 'operations_finance', 'agent', 'customer', 'support'].map((r) => ({ key: r, label: roleLabel(r) }))
+    : ['super_admin', 'admin', 'operations_finance', 'agent', 'lender', 'investor', 'mne', 'partner', 'customer', 'support'].map((r) => ({ key: r, label: roleLabel(r) }))
   return roles.map((r) => `<option value="${r.key}" ${selected === r.key ? 'selected' : ''}>${esc(r.label)}</option>`).join('')
 }
 async function viewUsers() {
