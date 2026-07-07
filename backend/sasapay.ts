@@ -140,14 +140,19 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
   }
 
   // Build the request body structural mapping
-  // If the user selected Mobile Money but no code was sent, force it to '0' for SasaPay Wallet
+  // FORCE matching network code logic based on SasaPay rules directly:
   let networkCodeToSend = finalNetworkCode
-  if (opts.channel === 'MOBILE_MONEY' && !opts.channelCode && !opts.networkCode) {
+  
+  // If the fallback default '63902' was applied but the incoming phone or 
+  // setup intends to use a native container push, safely check or switch it.
+  if (finalNetworkCode === '63902' && opts.description !== 'Feed Cash Sale') {
+    // If you want "Mobile Money Wallet Push" to default to the native SasaPay wallet ('0') 
+    // instead of an outright M-Pesa push wrapper, force it here:
     networkCodeToSend = '0'
   }
   const body: Record<string, any> = {
     MerchantCode: merchantCode(env),
-    NetworkCode: finalNetworkCode,
+    NetworkCode: networkCodeToSend, // Always uses the safe redirected code
     TransactionDesc: String(opts.description || 'Farmsky payment').slice(0, 20),
     AccountReference: String(opts.account || '').slice(0, 20),
     Currency: 'KES',
