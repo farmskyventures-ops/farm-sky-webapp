@@ -140,6 +140,11 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
   }
 
   // Build the request body structural mapping
+  // If the user selected Mobile Money but no code was sent, force it to '0' for SasaPay Wallet
+  let networkCodeToSend = finalNetworkCode
+  if (opts.channel === 'MOBILE_MONEY' && !opts.channelCode && !opts.networkCode) {
+    networkCodeToSend = '0'
+  }
   const body: Record<string, any> = {
     MerchantCode: merchantCode(env),
     NetworkCode: finalNetworkCode,
