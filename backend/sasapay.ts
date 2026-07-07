@@ -1,25 +1,16 @@
 // =====================================================================
 // SasaPay payment integration (Sandbox + Production)
 // Docs:
-//   Auth    : https://developer.sasapay.app/docs/apis/authentication
-//   C2B     : https://developer.sasapay.app/docs/apis/c2b
-//   Checkout: https://developer.sasapay.app/docs/apis/checkout-payments
-// =====================================================================
-//
-// Debugging note: if a call returns HTTP 4xx, the returned `error` field
-// contains the exact URL that was hit AND the raw response body so you can
-// see exactly what SasaPay is complaining about (invalid merchant code,
-// wrong network code, wrong callback URL, etc).
+//    Auth    : https://developer.sasapay.app/docs/apis/authentication
+//    C2B     : https://developer.sasapay.app/docs/apis/c2b
+//    Checkout: https://developer.sasapay.app/docs/apis/checkout-payments
 // =====================================================================
 
 export interface SasaPayEnv {
-  // Primary names used in the app UI / .env.example
   SASAPAY_CLIENT_ID?: string
   SASAPAY_CLIENT_SECRET?: string
-  // Backwards-compat aliases (some older configs used CONSUMER_KEY / CONSUMER_SECRET)
   SASAPAY_CONSUMER_KEY?: string
   SASAPAY_CONSUMER_SECRET?: string
-
   SASAPAY_MERCHANT_CODE?: string
   SASAPAY_CALLBACK_URL?: string
   SASAPAY_ENV?: string // 'sandbox' | 'production'
@@ -39,10 +30,10 @@ export type SasaPayStkOpts = {
   amount: number
   account: string
   description: string
-  networkCode?: string    // "63902" M-PESA (default), "0" SasaPay wallet, "63903" Airtel, "63907" T-Kash
-  channel?: 'MOBILE_MONEY' | 'BANK' // Dynamic channel type tracking
-  channelCode?: string    // Clean wrapper payload field for flexibility across channels
-  accountNumber?: string  // Destination account identifier for BANK flows
+  networkCode?: string    // "63902" M-PESA, "0" SasaPay wallet, "63903" Airtel
+  channel?: 'MOBILE_MONEY' | 'BANK'
+  channelCode?: string
+  accountNumber?: string
 }
 
 // ---------- URL helpers ------------------------------------------------------
@@ -52,10 +43,6 @@ function baseUrl(env: SasaPayEnv) {
     : 'https://sandbox.sasapay.app'
 }
 
-// SasaPay's C2B "request-payment" endpoint. Trailing slash matters — without
-// it SasaPay 301-redirects and some fetch runtimes convert POST → GET → 404.
-// If SasaPay 404s the v1 path (some legacy sandbox tenants still route to the
-// older waas path), we fall back to it automatically.
 const STK_PATHS = [
   '/api/v1/payments/request-payment/',
   '/waas/api/v1/payments/request-payment/'
@@ -75,7 +62,6 @@ export function sasapayConfigured(env: SasaPayEnv): boolean {
   return !!(merchantCode(env) && clientId(env) && clientSecret(env))
 }
 
-// Normalize to 2547XXXXXXXX
 function normalizePhone(phone: string): string {
   let p = String(phone || '').replace(/[^0-9]/g, '')
   if (p.startsWith('0')) p = '254' + p.slice(1)
@@ -92,8 +78,6 @@ async function readBody(res: Response): Promise<{ json: any; text: string }> {
 }
 
 // ---------- Auth ------------------------------------------------------------
-// GET /api/v1/auth/token/?grant_type=client_credentials
-// Header: Authorization: Basic base64(client_id:client_secret)
 async function getToken(env: SasaPayEnv): Promise<string> {
   const id = clientId(env)
   const secret = clientSecret(env)
@@ -123,7 +107,7 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
       success: true,
       checkout_request_id: 'SP_SIM_' + crypto.randomUUID().slice(0, 12),
       merchant_request_id: 'SPM_SIM_' + crypto.randomUUID().slice(0, 8),
-      customer_message: `Simulated SasaPay ${opts.channel || 'MOBILE_MONEY'} push sent. (Configure SasaPay keys for live payments.)`
+      customer_message: `Simulated SasaPay ${opts.channel || 'MOBILE_MONEY'} push sent.`
     }
   }
 
@@ -133,7 +117,7 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
 
   const phone = normalizePhone(opts.phone)
   
-  // Cleanly fall back to '0' (SasaPay Wallet) if it's an unmapped Mobile Money request, otherwise default to '63902'
+  // Safe default: use channelCode/networkCode if provided, otherwise route to '0' (SasaPay Wallet)
   let finalNetworkCode = opts.channelCode || opts.networkCode
   if (!finalNetworkCode) {
     finalNetworkCode = opts.channel === 'BANK' ? '' : '0'
@@ -141,10 +125,9 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
 
   const callbackUrl = env.SASAPAY_CALLBACK_URL || ''
   if (!callbackUrl) {
-    return { simulated: false, success: false, error: 'SasaPay: SASAPAY_CALLBACK_URL env var is required in live mode' }
+    return { simulated: false, success: false, error: 'SasaPay: SASAPAY_CALLBACK_URL env var is required' }
   }
 
-  // Build the request body structural mapping
   const body: Record<string, any> = {
     MerchantCode: merchantCode(env),
     NetworkCode: finalNetworkCode,
@@ -155,7 +138,6 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
     CallBackURL: callbackUrl
   }
 
-  // Handle differences between standard mobile network prompts and C2B Bank checkout
   if (opts.channel === 'BANK') {
     body.BillBankAccountNumber = opts.accountNumber || ''
     body.PhoneNumber = phone 
@@ -201,31 +183,7 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
     attempts.push({ url, status: res.status, body: text.slice(0, 300) })
     if (res.status !== 404) break 
   }
-  const last = attempts[attempts.length - 1]
-  return {
-    simulated: false,
-    success: false,
-    error: `SasaPay push failed. Tried ${attempts.length} path(s). Last: [${last.status}] ${last.url} -- ${last.body || 'no body'}`
-  }
-}
 
-    // Success shape: { status: true, ResponseCode: "0", CheckoutRequestID, ... }
-    if (res.ok && json?.status === true && (json.ResponseCode === '0' || json.ResponseCode === 0)) {
-      return {
-        simulated: false,
-        success: true,
-        checkout_request_id: String(json.CheckoutRequestID || json.MerchantRequestID || ''),
-        merchant_request_id: String(json.MerchantRequestID || json.CheckoutRequestID || ''),
-        customer_message: json.CustomerMessage || json.ResponseDescription || json.detail || 'Transaction processing initiated.'
-      }
-    }
-
-    // If it's a 404, keep the attempt and try the next fallback path
-    attempts.push({ url, status: res.status, body: text.slice(0, 300) })
-    if (res.status !== 404) break // any non-404 is a real answer — stop retrying
-  }
-
-  // All attempts failed — return the most informative error we have
   const last = attempts[attempts.length - 1]
   return {
     simulated: false,
@@ -235,11 +193,6 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
 }
 
 // ---------- Transaction status query ----------------------------------------
-// While SasaPay's async pipeline is still processing (typically the first few
-// seconds after we send the STK push), the transaction-status endpoint can
-// respond with 404 ("not found yet"). We MUST NOT surface that as a failure
-// or an HTML error string — the correct interpretation is "still pending",
-// so the front-end keeps polling and eventually the C2B callback resolves it.
 export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string): Promise<any> {
   if (!sasapayConfigured(env)) return { ResultCode: '0', ResultDesc: 'Simulated success' }
   try {
@@ -252,16 +205,12 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string): 
     })
     const { json } = await readBody(res)
 
-    // Happy path: SasaPay returned a real JSON status document.
     if (json && (json.ResultCode !== undefined || json.status_code !== undefined || json.status !== undefined)) {
       return json
     }
 
-    // 404 / HTML / any non-JSON → treat as PENDING so the poller keeps polling.
-    // Never leak provider HTML to the front-end.
     return { pending: true, status_code: null, ResultDesc: 'Transaction still processing' }
   } catch (e: any) {
-    // Network / auth errors also become pending, not failed.
     return { pending: true, status_code: null, ResultDesc: 'Transaction still processing' }
   }
 }
