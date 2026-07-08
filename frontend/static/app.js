@@ -804,33 +804,27 @@ window.payModal = async (id, amount, outstanding, kind) => {
       </label>
     </div>
 
-    <!-- Dynamic SasaPay Channel Customizer UI Block -->
+    <!-- Dynamic SasaPay Channel Customizer UI Block (ALL SasaPay channels) -->
     <div id="sasapayChannelBlock" class="hidden mb-3 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-3">
       <div>
-        <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1">SasaPay Option</label>
-        <select id="spChannel" onchange="toggleSasaBankFields()" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm">
-          <option value="MOBILE_MONEY">Mobile Money Wallet Push</option>
-          <option value="BANK_CHECKOUT">Direct Bank Account Checkout</option>
+        <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1">Pay from</label>
+        <select id="spChanType" onchange="onSasaChanTypeChange()" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm">
+          <option value="mobile">Mobile Money (M-PESA / Airtel / T-Kash / Telkom)</option>
+          <option value="bank">Bank Account</option>
+          <option value="wallet">SasaPay Wallet (OTP)</option>
         </select>
       </div>
-      
-      <div id="spBankFields" class="hidden space-y-2">
-        <div>
-          <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1">Select Bank</label>
-          <select id="spBankCode" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm">
-            <option value="">-- Choose Bank --</option>
-            <option value="063">Equity Bank</option>
-            <option value="001">KCB Bank</option>
-            <option value="011">Co-operative Bank</option>
-            <option value="003">Absa Bank</option>
-            <option value="044">Stanbic Bank</option>
-            <option value="012">NCBA Bank</option>
-          </select>
+      <div id="spChanPickWrap">
+        <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1" id="spChanPickLabel">Network</label>
+        <select id="spChannelCode" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm"></select>
+      </div>
+      <div id="spBankAcctWrap" class="hidden">
+        <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1">Bank Account Number</label>
+        <div class="flex gap-2">
+          <input id="spAccNum" type="text" placeholder="e.g. 0123456789" class="flex-1 px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm">
+          <button type="button" onclick="doValidateCheckoutAccount()" class="btn px-3 bg-slate-100 rounded-md text-xs whitespace-nowrap">Verify</button>
         </div>
-        <div>
-          <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1">Account Number</label>
-          <input id="spAccNum" type="text" placeholder="e.g. 0123456789" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm">
-        </div>
+        <div id="spAcctName" class="text-xs text-emerald-700 mt-1"></div>
       </div>
     </div>
 
@@ -841,29 +835,54 @@ window.payModal = async (id, amount, outstanding, kind) => {
     <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
 
+// Cache of the full SasaPay channel catalogue (wallet + mobile + ALL banks).
+let _sasaChannels = null
+async function loadSasaChannels() {
+  if (_sasaChannels) return _sasaChannels
+  try { const { data } = await api.get('/sasapay/channels'); _sasaChannels = data } catch { _sasaChannels = { channels: [], banks: [], mobile: [], wallet: [] } }
+  return _sasaChannels
+}
+
 // Global UI toggle helpers invoked by custom onchange bindings inside the modal
-window.toggleSasaChannels = () => {
+window.toggleSasaChannels = async () => {
   const method = document.querySelector('input[name="paymethod"]:checked')?.value;
   const block = document.getElementById('sasapayChannelBlock');
-  if (block) {
-    if (method === 'sasapay') {
-      block.classList.remove('hidden');
-    } else {
-      block.classList.add('hidden');
-    }
+  if (!block) return
+  if (method === 'sasapay') {
+    block.classList.remove('hidden')
+    await loadSasaChannels()
+    onSasaChanTypeChange()
+  } else {
+    block.classList.add('hidden')
   }
 }
 
-window.toggleSasaBankFields = () => {
-  const channel = document.getElementById('spChannel')?.value;
-  const fields = document.getElementById('spBankFields');
-  if (fields) {
-    if (channel === 'BANK_CHECKOUT') {
-      fields.classList.remove('hidden');
-    } else {
-      fields.classList.add('hidden');
-    }
-  }
+// Populate the channel picker based on the selected type (mobile/bank/wallet).
+window.onSasaChanTypeChange = () => {
+  const type = $('spChanType')?.value || 'mobile'
+  const sel = $('spChannelCode'); const lbl = $('spChanPickLabel')
+  const bankWrap = $('spBankAcctWrap')
+  if (!sel) return
+  const cat = _sasaChannels || { mobile: [], bank: [], wallet: [] }
+  let list = []
+  if (type === 'mobile') { list = cat.mobile || []; lbl.textContent = 'Network' }
+  else if (type === 'bank') { list = cat.banks || cat.bank || []; lbl.textContent = 'Select Bank' }
+  else { list = cat.wallet || []; lbl.textContent = 'Wallet' }
+  sel.innerHTML = list.map(ch => `<option value="${esc(ch.code)}">${esc(ch.name)}</option>`).join('') || '<option value="">— none —</option>'
+  if (bankWrap) bankWrap.classList.toggle('hidden', type !== 'bank')
+  const nm = $('spAcctName'); if (nm) nm.textContent = ''
+}
+
+// Verify a bank/mobile account holder name before paying it.
+window.doValidateCheckoutAccount = async () => {
+  const code = $('spChannelCode')?.value; const acc = $('spAccNum')?.value
+  const nm = $('spAcctName')
+  if (!code || !acc) { if (nm) { nm.className = 'text-xs text-red-600 mt-1'; nm.textContent = 'Enter an account number first.' } return }
+  if (nm) { nm.className = 'text-xs text-slate-500 mt-1'; nm.textContent = 'Verifying…' }
+  try {
+    const { data } = await api.post('/sasapay/validate-account', { channel_code: code, account_number: acc })
+    if (nm) { nm.className = 'text-xs text-emerald-700 mt-1'; nm.textContent = data.account_name ? ('✓ ' + data.account_name) : '✓ Account verified' }
+  } catch (err) { if (nm) { nm.className = 'text-xs text-red-600 mt-1'; nm.textContent = err.response?.data?.error || 'Could not verify account.' } }
 }
 
 window.doPay = async (id, kind) => {
@@ -880,29 +899,38 @@ window.doPay = async (id, kind) => {
     phone: $('mpphone').value 
   }
 
-  // Inject bank routing structures if setting up SasaPay specific options
+  // Inject SasaPay channel routing (mobile / bank / wallet) using the new API shape.
   if (method === 'sasapay') {
-    const channel = $('spChannel').value;
-    payload.channel = channel;
-    
-    if (channel === 'BANK_CHECKOUT') {
-      const bankCode = $('spBankCode').value;
-      const accNum = $('spAccNum').value;
-      
-      if (!bankCode || !accNum) {
+    const type = $('spChanType')?.value || 'mobile'
+    const code = $('spChannelCode')?.value || ''
+    payload.channel_code = code
+    if (type === 'bank') {
+      const accNum = $('spAccNum')?.value
+      if (!code || !accNum) {
         $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Please select a bank and enter your account number.</div>`;
         return;
       }
-      payload.channelCode = bankCode;
-      payload.accountNumber = accNum;
+      payload.account_number = accNum
     }
   }
 
   const btn = $('payBtn'); btn.disabled = true; btn.classList.add('opacity-50')
-  $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Sending ${methodLabel} STK push...</div>`
+  $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Sending ${methodLabel} payment request...</div>`
   
   try {
     const { data } = await api.post(endpoint, payload)
+
+    // SasaPay WALLET flow: prompt the user for the OTP before we can settle.
+    if (method === 'sasapay' && data.needs_otp) {
+      btn.disabled = false; btn.classList.remove('opacity-50')
+      $('payStatus').innerHTML = `<div class="bg-green-50 border border-green-200 rounded-lg p-2 text-xs text-green-700 mb-2">${esc(data.customer_message || 'Enter the OTP sent to your SasaPay wallet.')}</div>
+        <div class="flex gap-2 mb-3">
+          <input id="spOtp" type="text" inputmode="numeric" placeholder="OTP code" class="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm">
+          <button onclick="doSasaOtp('${esc(data.checkout_request_id)}', ${id}, '${kind}')" class="btn brand-bg text-white px-4 rounded-lg text-sm">Verify</button>
+        </div>`
+      return
+    }
+
     $('payStatus').innerHTML = `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'STK push sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Waiting for ${methodLabel} confirmation...</div>`
     let tries = 0
     const poll = async () => {
@@ -919,6 +947,32 @@ window.doPay = async (id, kind) => {
   } catch (err) {
     $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || 'Payment failed')}</div>`
     btn.disabled = false; btn.classList.remove('opacity-50')
+  }
+}
+
+// Submit the SasaPay wallet OTP, then poll /sasapay/confirm to settle the contract.
+window.doSasaOtp = async (checkoutId, id, kind) => {
+  const isCash = kind === 'cash'
+  const code = $('spOtp')?.value?.trim()
+  if (!code) return toast('Enter the OTP code', false)
+  $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Verifying OTP…</div>`
+  try {
+    await api.post('/sasapay/process', { checkout_request_id: checkoutId, verification_code: code })
+    $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>OTP accepted. Confirming payment…</div>`
+    let tries = 0
+    const poll = async () => {
+      tries++
+      try {
+        const { data: cd } = await api.post('/sasapay/confirm', { checkout_request_id: checkoutId })
+        if (cd.status === 'success') { closeModal(); toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt); state.route = 'contracts'; renderApp(); return }
+        else if (cd.status === 'failed') { $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(cd.result_desc || 'Payment failed')}</div>`; return }
+      } catch (e) {}
+      if (tries < 20) setTimeout(poll, 3000)
+      else $('payStatus').innerHTML = '<div class="text-xs text-amber-600 mb-3">Timed out waiting. Check Contracts later.</div>'
+    }
+    setTimeout(poll, 1500)
+  } catch (err) {
+    $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || 'OTP verification failed')}</div>`
   }
 }
 window.viewDoc = async (id) => {
@@ -1304,7 +1358,13 @@ async function viewMyWallet() {
     </div>`).join('') : '<div class="text-sm text-slate-400 py-2">No earning rules assigned yet.</div>'
   $('content').innerHTML = `
   <div class="responsive-grid cols-3 mb-6">
-    <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Wallet balance</div><div class="text-2xl font-bold text-teal-700">${fmt(wallet?.balance)}</div><div class="text-xs text-slate-400 mt-1">${esc(wallet?.currency || 'KES')} · ${esc(wallet?.status || 'active')}</div></div>
+    <div class="card p-5">
+      <div class="text-xs text-slate-500 mb-1">Wallet balance</div>
+      <div class="text-2xl font-bold text-teal-700">${fmt(wallet?.balance)}</div>
+      <div class="text-xs text-slate-400 mt-1">${esc(wallet?.currency || 'KES')} · ${esc(wallet?.status || 'active')}</div>
+      <button onclick="withdrawModal(${Number(wallet?.balance || 0)})" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs mt-3"><i class="fas fa-money-bill-transfer mr-1"></i>Withdraw</button>
+      <button onclick="payoutAccountsModal()" class="btn bg-white border px-3 py-1.5 rounded-lg text-xs mt-3 ml-1"><i class="fas fa-building-columns mr-1"></i>Payout accounts</button>
+    </div>
     <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Total earned</div><div class="text-2xl font-bold text-emerald-600">${fmt(analytics?.totals?.total_earned)}</div></div>
     <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Total debited</div><div class="text-2xl font-bold text-slate-600">${fmt(analytics?.totals?.total_debited)}</div></div>
   </div>
@@ -1349,7 +1409,10 @@ async function viewWallets() {
   </div>
   <div class="flex flex-wrap gap-2 mb-4">
     <button onclick="batchPayoutModal('all_agents')" class="btn bg-white border px-4 py-2 rounded-lg text-sm"><i class="fas fa-money-check-dollar mr-1 text-teal-600"></i>Batch payout to all agents</button>
+    <button onclick="directPayModal()" class="btn bg-white border px-4 py-2 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1 text-teal-600"></i>Direct payment</button>
+    <button onclick="checkSasaBalance()" class="btn bg-white border px-4 py-2 rounded-lg text-sm"><i class="fas fa-scale-balanced mr-1 text-teal-600"></i>Confirm SasaPay balance</button>
   </div>
+  <div id="sasaBalanceBox"></div>
   <div class="card table-card mb-6">
     <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-wallet text-teal-600 mr-2"></i>Wallets</div>
     <table class="w-full text-sm">
@@ -1425,6 +1488,124 @@ window.doAddEarningRule = async (userId) => {
   try { await api.post('/earning-rules', payload); toast('Rule added'); earningRulesModal(userId, '') }
   catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
+// ---------------------------------------------------------------------------
+// WALLET WITHDRAWAL — cash out to a registered mobile / bank / SasaPay account.
+// ---------------------------------------------------------------------------
+window.withdrawModal = async (balance) => {
+  await loadSasaChannels()
+  let accounts = []
+  try { const { data } = await api.get('/payout-accounts'); accounts = data.accounts || [] } catch (_) {}
+  const savedOpts = accounts.map(a => `<option value="${a.id}">${esc(a.label || a.channel_name)} · ${esc(a.account_number)}${a.is_verified ? ' ✓' : ''}</option>`).join('')
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-money-bill-transfer text-teal-600 mr-2"></i>Withdraw funds</h3>
+    <p class="text-xs text-slate-500 mb-3">Available balance: <b>${fmt(balance)}</b>. Funds are sent via SasaPay to your mobile, bank, or SasaPay wallet.</p>
+    ${savedOpts ? `<label class="field-label">Use a saved account</label>
+    <select id="wd_saved" onchange="onWithdrawSavedChange()" class="w-full px-3 py-2 border rounded-lg mb-3">
+      <option value="">— New / one-off destination —</option>${savedOpts}
+    </select>` : ''}
+    <div id="wd_manual" class="space-y-3">
+      <div><label class="field-label">Destination type</label>
+        <select id="wd_type" onchange="onWithdrawTypeChange()" class="w-full px-3 py-2 border rounded-lg">
+          <option value="mobile">Mobile Money</option><option value="bank">Bank Account</option><option value="wallet">SasaPay Wallet</option>
+        </select></div>
+      <div><label class="field-label" id="wd_chanlbl">Network</label>
+        <select id="wd_channel" class="w-full px-3 py-2 border rounded-lg"></select></div>
+      <div><label class="field-label">Account / phone number</label>
+        <div class="flex gap-2">
+          <input id="wd_account" type="text" placeholder="e.g. 0712345678" class="flex-1 px-3 py-2 border rounded-lg">
+          <button type="button" onclick="doValidateWithdrawAccount()" class="btn px-3 bg-slate-100 rounded-lg text-xs whitespace-nowrap">Verify</button>
+        </div>
+        <div id="wd_acctname" class="text-xs text-emerald-700 mt-1"></div></div>
+    </div>
+    <label class="field-label mt-3">Amount (KES)</label><input id="wd_amt" type="number" class="w-full px-3 py-2 border rounded-lg mb-3">
+    <label class="field-label">Reason (optional)</label><input id="wd_reason" placeholder="e.g. Cash out earnings" class="w-full px-3 py-2 border rounded-lg mb-3">
+    <div id="wd_status"></div>
+    <div class="flex gap-2 mt-2"><button id="wd_btn" onclick="doWithdraw()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Withdraw</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  onWithdrawTypeChange()
+}
+window.onWithdrawTypeChange = () => {
+  const type = $('wd_type')?.value || 'mobile'
+  const sel = $('wd_channel'); const lbl = $('wd_chanlbl')
+  const cat = _sasaChannels || { mobile: [], banks: [], wallet: [] }
+  let list = type === 'mobile' ? (cat.mobile || []) : type === 'bank' ? (cat.banks || cat.bank || []) : (cat.wallet || [])
+  if (lbl) lbl.textContent = type === 'bank' ? 'Select Bank' : (type === 'wallet' ? 'Wallet' : 'Network')
+  if (sel) sel.innerHTML = list.map(ch => `<option value="${esc(ch.code)}">${esc(ch.name)}</option>`).join('') || '<option value="">— none —</option>'
+}
+window.onWithdrawSavedChange = () => {
+  const saved = $('wd_saved')?.value
+  const manual = $('wd_manual')
+  if (manual) manual.style.display = saved ? 'none' : ''
+}
+window.doValidateWithdrawAccount = async () => {
+  const code = $('wd_channel')?.value; const acc = $('wd_account')?.value; const nm = $('wd_acctname')
+  if (!code || !acc) { if (nm) { nm.className = 'text-xs text-red-600 mt-1'; nm.textContent = 'Enter an account number first.' } return }
+  if (nm) { nm.className = 'text-xs text-slate-500 mt-1'; nm.textContent = 'Verifying…' }
+  try {
+    const { data } = await api.post('/sasapay/validate-account', { channel_code: code, account_number: acc })
+    if (nm) { nm.className = 'text-xs text-emerald-700 mt-1'; nm.textContent = data.account_name ? ('✓ ' + data.account_name) : '✓ Verified' }
+  } catch (err) { if (nm) { nm.className = 'text-xs text-red-600 mt-1'; nm.textContent = err.response?.data?.error || 'Could not verify.' } }
+}
+window.doWithdraw = async () => {
+  const amount = Number($('wd_amt')?.value || 0)
+  if (amount <= 0) return toast('Enter a valid amount', false)
+  const payload = { amount, reason: $('wd_reason')?.value || null }
+  const saved = $('wd_saved')?.value
+  if (saved) payload.payout_account_id = Number(saved)
+  else { payload.channel_code = $('wd_channel')?.value; payload.account_number = $('wd_account')?.value }
+  const btn = $('wd_btn'); btn.disabled = true; btn.classList.add('opacity-50')
+  $('wd_status').innerHTML = `<div class="text-xs text-slate-500 mb-2"><i class="fas fa-spinner fa-spin mr-1"></i>Processing withdrawal…</div>`
+  try {
+    const { data } = await api.post('/wallet/withdraw', payload)
+    closeModal(); toast(data.customer_message || `Withdrawal ${data.status} (${data.reference})`); viewMyWallet()
+  } catch (err) {
+    $('wd_status').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-2">${esc(err.response?.data?.error || 'Withdrawal failed')}</div>`
+    btn.disabled = false; btn.classList.remove('opacity-50')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PAYOUT ACCOUNTS — register/manage validated mobile & bank destinations.
+// ---------------------------------------------------------------------------
+window.payoutAccountsModal = async () => {
+  await loadSasaChannels()
+  let accounts = []
+  try { const { data } = await api.get('/payout-accounts'); accounts = data.accounts || [] } catch (_) {}
+  const list = accounts.map(a => `<div class="flex items-center justify-between border-b border-slate-100 py-2 text-sm">
+      <span><b>${esc(a.label || a.channel_name)}</b> · ${esc(a.account_number)} ${a.is_verified ? '<span class="text-emerald-600 text-xs">✓ verified</span>' : '<span class="text-amber-600 text-xs">unverified</span>'}${a.account_name ? ' · ' + esc(a.account_name) : ''}</span>
+      <button onclick="delPayoutAccount(${a.id})" class="text-red-500 hover:underline text-xs">Remove</button>
+    </div>`).join('') || '<div class="text-sm text-slate-400 py-2">No payout accounts yet.</div>'
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-building-columns text-teal-600 mr-2"></i>My payout accounts</h3>
+    <p class="text-xs text-slate-500 mb-3">Register the mobile / bank destinations you can withdraw to. Each is validated with SasaPay.</p>
+    <div class="mb-4">${list}</div>
+    <div class="border-t pt-3 space-y-2">
+      <div><label class="field-label">Type</label>
+        <select id="pa_type" onchange="onPayoutAcctType()" class="w-full px-3 py-2 border rounded-lg">
+          <option value="mobile">Mobile Money</option><option value="bank">Bank Account</option><option value="wallet">SasaPay Wallet</option>
+        </select></div>
+      <div><label class="field-label" id="pa_chanlbl">Network</label><select id="pa_channel" class="w-full px-3 py-2 border rounded-lg"></select></div>
+      <div><label class="field-label">Account / phone number</label><input id="pa_account" class="w-full px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Label (optional)</label><input id="pa_label" placeholder="e.g. My M-PESA" class="w-full px-3 py-2 border rounded-lg"></div>
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="doAddPayoutAccount()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Add & verify</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button></div>`)
+  onPayoutAcctType()
+}
+window.onPayoutAcctType = () => {
+  const type = $('pa_type')?.value || 'mobile'
+  const sel = $('pa_channel'); const lbl = $('pa_chanlbl')
+  const cat = _sasaChannels || { mobile: [], banks: [], wallet: [] }
+  let list = type === 'mobile' ? (cat.mobile || []) : type === 'bank' ? (cat.banks || cat.bank || []) : (cat.wallet || [])
+  if (lbl) lbl.textContent = type === 'bank' ? 'Select Bank' : (type === 'wallet' ? 'Wallet' : 'Network')
+  if (sel) sel.innerHTML = list.map(ch => `<option value="${esc(ch.code)}">${esc(ch.name)}</option>`).join('') || '<option value="">— none —</option>'
+}
+window.doAddPayoutAccount = async () => {
+  const payload = { channel_code: $('pa_channel')?.value, account_number: $('pa_account')?.value, label: $('pa_label')?.value || null }
+  if (!payload.channel_code || !payload.account_number) return toast('Channel and account number required', false)
+  try { const { data } = await api.post('/payout-accounts', payload); toast(data.is_verified ? ('Added: ' + (data.account_name || 'verified')) : 'Added (unverified)'); payoutAccountsModal() }
+  catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.delPayoutAccount = async (id) => {
+  try { await api.delete('/payout-accounts/' + id); payoutAccountsModal() } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
 window.payoutModal = (userId, name) => {
   showModal(`<h3 class="font-bold mb-1"><i class="fas fa-money-check-dollar text-teal-600 mr-2"></i>Pay out — ${esc(name)}</h3>
     <p class="text-xs text-slate-500 mb-3">Disburse fixed funds (retainer, transport, per-diem) directly to this wallet.</p>
@@ -1461,6 +1642,101 @@ window.doBatchPayout = async (target) => {
   if (!confirmEdit('Disburse ' + fmt(payload.amount) + ' to every active agent?')) return
   try { const { data } = await api.post('/wallet/payouts', payload); closeModal(); toast(`Paid ${data.count} agent(s), total ${fmt(data.total)}`); viewWallets() }
   catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+
+// ---------------------------------------------------------------------------
+// ADMIN DIRECT PAYMENT — pay an individual directly to their in-app wallet or
+// to a mobile/bank number via SasaPay B2C.
+// ---------------------------------------------------------------------------
+window.directPayModal = async () => {
+  await loadSasaChannels()
+  let users = []
+  try { const { data } = await api.get('/users'); users = data.users || [] } catch (_) {}
+  const userOpts = users.map(u => `<option value="${u.id}">${esc(u.full_name)} · ${esc(roleLabel(u.role))}</option>`).join('')
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-paper-plane text-teal-600 mr-2"></i>Direct payment to an individual</h3>
+    <p class="text-xs text-slate-500 mb-3">Pay someone directly — credit their in-app wallet, or push funds to a mobile / bank number via SasaPay.</p>
+    <label class="field-label">Destination</label>
+    <select id="dp_dest" onchange="onDirectPayDest()" class="w-full px-3 py-2 border rounded-lg mb-3">
+      <option value="wallet">In-app wallet (user)</option>
+      <option value="external">Mobile / Bank (SasaPay)</option>
+    </select>
+    <div id="dp_wallet_wrap">
+      <label class="field-label">User</label>
+      <select id="dp_user" class="w-full px-3 py-2 border rounded-lg mb-3">${userOpts || '<option value="">No users</option>'}</select>
+    </div>
+    <div id="dp_ext_wrap" style="display:none" class="space-y-3 mb-3">
+      <div><label class="field-label">Type</label>
+        <select id="dp_type" onchange="onDirectPayType()" class="w-full px-3 py-2 border rounded-lg">
+          <option value="mobile">Mobile Money</option><option value="bank">Bank Account</option><option value="wallet">SasaPay Wallet</option>
+        </select></div>
+      <div><label class="field-label" id="dp_chanlbl">Network</label><select id="dp_channel" class="w-full px-3 py-2 border rounded-lg"></select></div>
+      <div><label class="field-label">Account / phone number</label>
+        <div class="flex gap-2">
+          <input id="dp_account" class="flex-1 px-3 py-2 border rounded-lg" placeholder="e.g. 0712345678">
+          <button type="button" onclick="doValidateDirectAccount()" class="btn px-3 bg-slate-100 rounded-lg text-xs whitespace-nowrap">Verify</button>
+        </div>
+        <div id="dp_acctname" class="text-xs text-emerald-700 mt-1"></div></div>
+    </div>
+    <label class="field-label">Amount (KES)</label><input id="dp_amt" type="number" class="w-full px-3 py-2 border rounded-lg mb-3">
+    <label class="field-label">Reason</label><input id="dp_reason" placeholder="e.g. Supplier payment" class="w-full px-3 py-2 border rounded-lg mb-3">
+    <div id="dp_status"></div>
+    <div class="flex gap-2 mt-2"><button id="dp_btn" onclick="doDirectPay()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Send payment</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  onDirectPayType()
+}
+window.onDirectPayDest = () => {
+  const ext = $('dp_dest')?.value === 'external'
+  $('dp_wallet_wrap').style.display = ext ? 'none' : ''
+  $('dp_ext_wrap').style.display = ext ? '' : 'none'
+}
+window.onDirectPayType = () => {
+  const type = $('dp_type')?.value || 'mobile'
+  const sel = $('dp_channel'); const lbl = $('dp_chanlbl')
+  const cat = _sasaChannels || { mobile: [], banks: [], wallet: [] }
+  let list = type === 'mobile' ? (cat.mobile || []) : type === 'bank' ? (cat.banks || cat.bank || []) : (cat.wallet || [])
+  if (lbl) lbl.textContent = type === 'bank' ? 'Select Bank' : (type === 'wallet' ? 'Wallet' : 'Network')
+  if (sel) sel.innerHTML = list.map(ch => `<option value="${esc(ch.code)}">${esc(ch.name)}</option>`).join('') || '<option value="">— none —</option>'
+}
+window.doValidateDirectAccount = async () => {
+  const code = $('dp_channel')?.value; const acc = $('dp_account')?.value; const nm = $('dp_acctname')
+  if (!code || !acc) { if (nm) { nm.className = 'text-xs text-red-600 mt-1'; nm.textContent = 'Enter an account number first.' } return }
+  if (nm) { nm.className = 'text-xs text-slate-500 mt-1'; nm.textContent = 'Verifying…' }
+  try {
+    const { data } = await api.post('/sasapay/validate-account', { channel_code: code, account_number: acc })
+    if (nm) { nm.className = 'text-xs text-emerald-700 mt-1'; nm.textContent = data.account_name ? ('✓ ' + data.account_name) : '✓ Verified' }
+  } catch (err) { if (nm) { nm.className = 'text-xs text-red-600 mt-1'; nm.textContent = err.response?.data?.error || 'Could not verify.' } }
+}
+window.doDirectPay = async () => {
+  const amount = Number($('dp_amt')?.value || 0)
+  if (amount <= 0) return toast('Enter a valid amount', false)
+  const destination = $('dp_dest')?.value || 'wallet'
+  const payload = { destination, amount, reason: $('dp_reason')?.value || null }
+  if (destination === 'wallet') { payload.user_id = Number($('dp_user')?.value); if (!payload.user_id) return toast('Select a user', false) }
+  else { payload.channel_code = $('dp_channel')?.value; payload.account_number = $('dp_account')?.value; if (!payload.channel_code || !payload.account_number) return toast('Channel and account required', false) }
+  const btn = $('dp_btn'); btn.disabled = true; btn.classList.add('opacity-50')
+  $('dp_status').innerHTML = `<div class="text-xs text-slate-500 mb-2"><i class="fas fa-spinner fa-spin mr-1"></i>Processing payment…</div>`
+  try {
+    const { data } = await api.post('/wallet/direct-pay', payload)
+    closeModal(); toast(data.customer_message || `Payment ${data.status} (${data.reference})`); viewWallets()
+  } catch (err) {
+    $('dp_status').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-2">${esc(err.response?.data?.error || 'Payment failed')}</div>`
+    btn.disabled = false; btn.classList.remove('opacity-50')
+  }
+}
+
+// Confirm SasaPay merchant/organisation float balance.
+window.checkSasaBalance = async () => {
+  const box = $('sasaBalanceBox')
+  if (box) box.innerHTML = `<div class="card p-4 mb-4 text-sm text-slate-500"><i class="fas fa-spinner fa-spin mr-1"></i>Querying SasaPay balance…</div>`
+  try {
+    const { data } = await api.get('/sasapay/balance')
+    const accts = (data.accounts || []).map(a => `<div class="flex justify-between border-b border-slate-100 py-1"><span>${esc(a.label || a.account || a.AccountType || 'Account')}</span><span class="font-medium">${fmt(a.balance ?? a.Balance ?? a.available ?? 0)}</span></div>`).join('')
+    if (box) box.innerHTML = `<div class="card p-4 mb-4">
+      <div class="flex items-center justify-between mb-2"><span class="font-semibold text-slate-700"><i class="fas fa-scale-balanced text-teal-600 mr-2"></i>SasaPay balance${data.simulated ? ' <span class="text-[10px] text-amber-600">(simulation)</span>' : ''}</span><span class="text-lg font-bold text-teal-700">${fmt(data.org_balance)}</span></div>
+      <div class="text-sm">${accts || '<div class="text-slate-400">No account breakdown returned.</div>'}</div>
+    </div>`
+  } catch (err) {
+    if (box) box.innerHTML = `<div class="card p-4 mb-4 text-sm text-red-600">${esc(err.response?.data?.error || 'Balance query failed')}</div>`
+  }
 }
 
 // ---------------------------------------------------------------------------

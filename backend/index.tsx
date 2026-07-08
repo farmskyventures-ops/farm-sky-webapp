@@ -3,7 +3,13 @@ import { cors } from 'hono/cors'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
 import type { Bindings, SessionUser } from './types'
 import { stkPush, stkQuery, mpesaConfigured, normalizePhone } from './mpesa'
-import { sasapayStkPush, sasapayQuery, sasapayConfigured } from './sasapay'
+import {
+  sasapayStkPush, sasapayQuery, sasapayConfigured,
+  sasapayProcessPayment, sasapayB2C, sasapayValidateAccount, sasapayBalance,
+  verifySasapaySignature, isTrustedSasapayIp,
+  SASAPAY_CHANNELS, channelByCode, accountTypeForChannel,
+  normalizePhone as sasapayNormalizePhone
+} from './sasapay'
 import { buniStkPush, buniQuery, buniConfigured } from './buni'
 import paymentGateway from './payment-gateway'
 import { sendSms, smsConfigured, generateOtp } from './sms'
@@ -1274,20 +1280,36 @@ app.get('/api/mpesa/status', requireAuth, (c) => {
 // PAYMENTS - SasaPay STK Push (real when configured, simulated otherwise)
 // Docs: https://developer.sasapay.app/docs/getting-started
 // ----------------------------------------------------------------------------
+// Public channel/bank catalogue — everything SasaPay supports (wallet, mobile, all banks).
+app.get('/api/sasapay/channels', (c) => {
+  return c.json({
+    channels: SASAPAY_CHANNELS,
+    banks:  SASAPAY_CHANNELS.filter((x) => x.type === 'bank'),
+    mobile: SASAPAY_CHANNELS.filter((x) => x.type === 'mobile'),
+    wallet: SASAPAY_CHANNELS.filter((x) => x.type === 'wallet'),
+    live: sasapayConfigured(c.env),
+    mode: sasapayConfigured(c.env) ? (c.env.SASAPAY_ENV || 'sandbox') : 'simulation'
+  })
+})
+
+// ----------------------------------------------------------------------------
+// C2B CHECKOUT — pay a contract via SasaPay wallet, M-PESA/Airtel/T-Kash, or ANY bank.
+//   channel_code drives the rail:
+//     '0'      -> SasaPay wallet   (returns needs_otp=true; complete via /process)
+//     '63902'  -> M-PESA STK       ; '63903' Airtel ; '63907' T-Kash ; '97' Telkom
+//     '01'..   -> any supported bank (account_number required)
+// ----------------------------------------------------------------------------
 app.post('/api/sasapay/stkpush', requireAuth, async (c) => {
-  const { 
-    contract_id, 
-    amount, 
-    phone,
-    // Add C2B routing fields for channel elasticity
-    channel,           // 'MOBILE_MONEY' or 'BANK'
-    channel_code,      // Network code (e.g. '639021') or Bank Code (e.g. '01000')
-    account_number     // Customer's destination Bank Account number if channel === 'BANK'
-  } = await c.req.json()
+  const b = await c.req.json()
+  const { contract_id, amount, phone, account_number } = b
+  // Accept channel_code (preferred) or legacy channel string.
+  let channelCode: string = String(b.channel_code || '').trim()
+  if (!channelCode) channelCode = b.channel === 'BANK' ? '' : '63902'
+  const chan = channelByCode(channelCode)
 
   const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first<any>()
   if (!contract) return c.json({ error: 'Contract not found' }, 404)
-  
+
   if (contract.payment_type === 'cash' && ['pending_payment', 'awaiting_cash_balance', 'completed'].includes(contract.status)) {
     const p = await c.env.DB.prepare(`SELECT quantity FROM products WHERE id=?`).bind(contract.product_id).first<any>()
     if ((!contract.ownership_recorded) && (!p || p.quantity < contract.quantity)) return c.json({ error: 'This item is now out of stock.' }, 409)
@@ -1299,66 +1321,83 @@ app.post('/api/sasapay/stkpush', requireAuth, async (c) => {
   if (amt <= 0) return c.json({ error: 'Invalid amount' }, 400)
   if (amt > Number(contract.outstanding || 0)) return c.json({ error: 'Amount exceeds outstanding balance' }, 400)
 
-  // Enforce mandatory bank credentials if the user explicitly switches the flow to Bank Transfer
-  const selectedChannel = channel === 'BANK' ? 'BANK' : 'MOBILE_MONEY'
-  if (selectedChannel === 'BANK' && (!account_number || !channel_code)) {
-    return c.json({ error: 'Bank Code (channel_code) and Bank Account number are required for Bank payments.' }, 400)
+  const isBank = chan?.type === 'bank'
+  if (isBank && !account_number) {
+    return c.json({ error: 'A bank account number is required for bank payments.' }, 400)
   }
+  if (!chan && channelCode) return c.json({ error: 'Unknown payment channel selected.' }, 400)
 
   const desc = contract.payment_type === 'cash' ? 'Cash Equipment Purchase' : 'Equipment Financing Payment'
-  
-  // Forward parameters elegantly inside the options structure
-  const result = await sasapayStkPush(c.env, { 
-    phone: phone || c.get('user').phone, 
-    amount: amt, 
-    account: contract.contract_ref, 
+  const payerPhone = phone || c.get('user').phone
+
+  const result = await sasapayStkPush(c.env, {
+    phone: payerPhone,
+    amount: amt,
+    account: contract.contract_ref,
     description: desc,
-    channel: selectedChannel,
-    channelCode: channel_code || '639032', // Falls back safely to default Safaricom C2B token if empty
+    networkCode: channelCode || '63902',
+    channelCode: channelCode || '63902',
     accountNumber: account_number || ''
   })
 
   if (!result.success) return c.json({ error: result.error || 'SasaPay transaction initialization failed' }, 502)
 
   await c.env.DB.prepare(
-    `INSERT INTO payment_intents (checkout_request_id, merchant_request_id, contract_id, customer_id, amount, phone, method, status) 
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`
+    `INSERT INTO payment_intents
+       (checkout_request_id, merchant_request_id, contract_id, customer_id, amount, phone,
+        method, status, provider, direction, channel_code, channel_name, account_number,
+        transaction_reference, needs_otp)
+     VALUES (?,?,?,?,?,?, 'sasapay', 'pending', 'sasapay', 'payin', ?,?,?,?,?)`
   ).bind(
-    result.checkout_request_id, 
-    result.merchant_request_id, 
-    contract_id, 
-    contract.customer_id, 
-    amt, 
-    normalizePhone(phone || c.get('user').phone), 
-    `sasapay_${selectedChannel.toLowerCase()}` // Appending type signature simplifies trace visibility down the line
+    result.checkout_request_id, result.merchant_request_id, contract_id, contract.customer_id, amt,
+    sasapayNormalizePhone(payerPhone), channelCode || '63902', chan?.name || null,
+    account_number || null, result.transaction_reference || null, result.needs_otp ? 1 : 0
   ).run()
 
-  await audit(c, c.get('user').id, 'stk_push', 'sasapay', `KES ${amt} via ${selectedChannel} to ${contract.contract_ref} (${result.simulated ? 'sim' : 'live'})`)
-  
-  return c.json({ 
-    ok: true, 
-    simulated: result.simulated, 
-    checkout_request_id: result.checkout_request_id, 
-    customer_message: result.customer_message || (selectedChannel === 'BANK' ? 'Bank push payment initiated successfully.' : 'STK Push sent.')
+  await audit(c, c.get('user').id, 'stk_push', 'sasapay', `KES ${amt} via ${chan?.name || channelCode} to ${contract.contract_ref} (${result.simulated ? 'sim' : 'live'})`)
+
+  return c.json({
+    ok: true,
+    simulated: result.simulated,
+    checkout_request_id: result.checkout_request_id,
+    needs_otp: !!result.needs_otp,
+    channel: chan?.name || channelCode,
+    customer_message: result.customer_message || (result.needs_otp
+      ? 'Enter the OTP sent to your SasaPay wallet to authorise the payment.'
+      : (isBank ? 'Bank payment initiated. Approve it in your banking app.' : 'STK Push sent. Enter your PIN on your phone.'))
   })
 })
 
+// Complete a SasaPay WALLET checkout by submitting the OTP (VerificationCode).
+app.post('/api/sasapay/process', requireAuth, async (c) => {
+  const { checkout_request_id, verification_code } = await c.req.json()
+  if (!checkout_request_id || !verification_code) return c.json({ error: 'checkout_request_id and verification_code are required' }, 400)
+  const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
+  if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
+  if (intent.status === 'success') return c.json({ ok: true, status: 'success' })
+
+  const r = await sasapayProcessPayment(c.env, checkout_request_id, String(verification_code))
+  if (!r.success) return c.json({ ok: false, error: r.error || 'OTP verification failed' }, 400)
+  // Payment now moves to processing; final settlement arrives via callback / confirm.
+  return c.json({ ok: true, status: 'processing', customer_message: r.customer_message || 'OTP accepted. Confirming payment…' })
+})
+
+// Poll / confirm a SasaPay checkout status and settle the contract on success.
 app.post('/api/sasapay/confirm', requireAuth, async (c) => {
   const { checkout_request_id } = await c.req.json()
   const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
   if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
   if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
-  
+
   let success = false, receipt = ''
   if (!sasapayConfigured(c.env) || String(checkout_request_id).includes('SIM')) {
     success = true; receipt = 'SP' + Math.random().toString(36).slice(2, 9).toUpperCase()
   } else {
     const q = await sasapayQuery(c.env, checkout_request_id)
     if (q?.pending === true) return c.json({ ok: false, status: 'pending' })
-    
     const code = q.ResultCode ?? q.status_code
-    if (code === '0' || code === 0 || q.status === true) { 
-      success = true; receipt = 'SPL' + Date.now().toString().slice(-7) 
+    if (code === '0' || code === 0 || q.status === true) {
+      success = true; receipt = q.TransactionCode || q.TransactionID || ('SPL' + Date.now().toString().slice(-7))
     } else if (code !== undefined && code !== null && code !== '' && code !== 'ERR') {
       const rawDesc = String(q.ResultDesc || q.message || 'Payment not completed')
       const safeDesc = /</.test(rawDesc) ? 'Payment not completed' : rawDesc
@@ -1369,32 +1408,99 @@ app.post('/api/sasapay/confirm', requireAuth, async (c) => {
   if (success) {
     const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
     const res = await applyPayment(c, contract, intent.amount, receipt, 'sasapay', intent.phone)
-    await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run()
+    await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, transaction_code=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(receipt, receipt, checkout_request_id).run()
     return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, ...res })
   }
   return c.json({ ok: false, status: 'pending' })
 })
 
+// ----------------------------------------------------------------------------
+// C2B CALLBACK — SasaPay posts the payin result here (both success + failure).
+//   Secured by IP whitelist + HMAC-SHA512 signature (X-SasaPay-Signature) and
+//   made idempotent (a settled intent is never re-applied).
+// ----------------------------------------------------------------------------
 app.post('/api/sasapay/callback', async (c) => {
   try {
-    const body: any = await c.req.json()
+    const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || c.req.header('x-real-ip')
+    const sig = c.req.header('x-sasapay-signature') || c.req.header('X-SasaPay-Signature')
+    const body: any = await c.req.json().catch(() => ({}))
+
+    // Security: only enforce strict checks when running live (configured).
+    if (sasapayConfigured(c.env)) {
+      const ipOk = isTrustedSasapayIp(ip)
+      const sigOk = await verifySasapaySignature(c.env, sig, {
+        sasapay_transaction_code: body.TransactionCode || body.TransactionID || '',
+        merchant_code: body.MerchantCode || '',
+        account_number: body.AccountReference || body.BillRefNumber || '',
+        payment_reference: body.CheckoutRequestID || body.MerchantRequestID || '',
+        amount: body.Amount || body.TransAmount || ''
+      })
+      // Require at least one strong proof of authenticity in production.
+      if (!ipOk && !sigOk) {
+        await audit(c, null, 'callback_rejected', 'sasapay', `untrusted ip=${ip || '?'} sig=${sig ? 'bad' : 'missing'}`)
+        return c.json({ ResultCode: 1, ResultDesc: 'Rejected' }, 403)
+      }
+    }
+
     const checkout = body?.CheckoutRequestID || body?.MerchantRequestID
     if (!checkout) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-    
+
     const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+    // Idempotency: only act on a still-pending intent.
     if (intent && intent.status === 'pending') {
       const code = body.ResultCode ?? body.status_code
       if (code === 0 || code === '0' || body.status === true) {
-        const receipt = body.TransactionID || body.MpesaReceiptNumber || 'SPL' + Date.now()
+        const receipt = body.TransactionCode || body.TransactionID || body.MpesaReceiptNumber || ('SPL' + Date.now())
         const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
         if (contract) await applyPayment(c, contract, intent.amount, String(receipt), 'sasapay', intent.phone)
-        await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, result_desc=? WHERE checkout_request_id=?`).bind(String(receipt), body.ResultDesc || '', checkout).run()
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, transaction_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(String(receipt), String(receipt), body.ResultDesc || '', checkout).run()
       } else {
-        await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=? WHERE checkout_request_id=?`).bind(body.ResultDesc || body.message || 'Failed', checkout).run()
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(body.ResultDesc || body.message || 'Failed', checkout).run()
       }
     }
     return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
   } catch { return c.json({ ResultCode: 0, ResultDesc: 'Accepted' }) }
+})
+
+// IPN — SasaPay posts SUCCESSFUL payins here (secondary confirmation channel).
+app.post('/api/sasapay/ipn', async (c) => {
+  try {
+    const body: any = await c.req.json().catch(() => ({}))
+    const checkout = body?.CheckoutRequestID || body?.MerchantRequestID
+    if (!checkout) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+    const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+    if (intent && intent.status === 'pending') {
+      const receipt = body.TransactionCode || body.TransactionID || ('SPL' + Date.now())
+      const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+      if (contract) await applyPayment(c, contract, intent.amount, String(receipt), 'sasapay', intent.phone)
+      await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, transaction_code=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(String(receipt), String(receipt), checkout).run()
+    }
+    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+  } catch { return c.json({ ResultCode: 0, ResultDesc: 'Accepted' }) }
+})
+
+// ----------------------------------------------------------------------------
+// ACCOUNT VALIDATION — confirm the holder name of a mobile/bank/wallet before
+// paying it (used by the register-payout-account + direct-pay flows).
+// ----------------------------------------------------------------------------
+app.post('/api/sasapay/validate-account', requireAuth, async (c) => {
+  const { channel_code, account_number } = await c.req.json()
+  if (!channel_code || !account_number) return c.json({ error: 'channel_code and account_number are required' }, 400)
+  const chan = channelByCode(String(channel_code))
+  if (!chan) return c.json({ error: 'Unknown channel' }, 400)
+  const acct = chan.type === 'mobile' || chan.type === 'wallet' ? sasapayNormalizePhone(String(account_number)) : String(account_number)
+  const v = await sasapayValidateAccount(c.env, String(channel_code), acct)
+  if (!v.success) return c.json({ ok: false, error: v.error || 'Validation failed' }, 400)
+  return c.json({ ok: true, simulated: v.simulated, account_name: v.account_name, channel_name: v.channel_name || chan.name, normalized_account: acct })
+})
+
+// ----------------------------------------------------------------------------
+// BALANCE — confirm the merchant/organisation float across SasaPay accounts.
+// ----------------------------------------------------------------------------
+app.get('/api/sasapay/balance', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const bal = await sasapayBalance(c.env)
+  if (!bal.success) return c.json({ ok: false, error: bal.error || 'Balance query failed' }, 502)
+  return c.json({ ok: true, simulated: bal.simulated, currency: bal.currency, org_balance: bal.org_balance, accounts: bal.accounts || [] })
 })
 
 app.get('/api/sasapay/status', requireAuth, (c) => {
@@ -2082,7 +2188,7 @@ app.post('/api/wallet/payouts', requireAuth, requirePermission('manage_wallets')
       total += amount; count++
     }
     await c.env.DB.prepare(
-      `INSERT INTO payout_batches (batch_ref, category, description, total_amount, recipient_count, issued_by) VALUES (?,?,?,?,?,?)`
+      `INSERT INTO payout_batches (batch_ref, category, description, total_amount, recipient_count, issued_by, payment_method) VALUES (?,?,?,?,?,?, 'wallet_credit')`
     ).bind(batchRef, category, b.description || null, roundMoney(total), count, admin.id).run()
     return { total: roundMoney(total), count }
   })
@@ -2107,6 +2213,222 @@ app.get('/api/wallet/analytics', requireAuth, requirePermission('view_wallet', '
        FROM wallet_ledger`
   ).first<any>()
   return c.json({ scope: isAdmin ? 'global' : 'self', totals, by_category: byCategory.results })
+})
+
+// ============================================================================
+// PAYOUT DESTINATIONS — a user registers the mobile / bank / SasaPay accounts
+// they can withdraw to. Each is validated against SasaPay before it is usable.
+// ============================================================================
+app.get('/api/payout-accounts', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const { results } = await c.env.DB.prepare(`SELECT * FROM payout_accounts WHERE user_id=? ORDER BY is_default DESC, id DESC`).bind(user.id).all()
+  return c.json({ accounts: results })
+})
+
+app.post('/api/payout-accounts', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json()
+  const channelCode = String(b.channel_code || '').trim()
+  const chan = channelByCode(channelCode)
+  if (!chan) return c.json({ error: 'Unknown channel' }, 400)
+  const raw = String(b.account_number || '').trim()
+  if (!raw) return c.json({ error: 'account_number is required' }, 400)
+  const account = (chan.type === 'mobile' || chan.type === 'wallet') ? sasapayNormalizePhone(raw) : raw
+  const acctType = accountTypeForChannel(channelCode)
+
+  // Validate against SasaPay to capture + confirm the holder name.
+  const v = await sasapayValidateAccount(c.env, channelCode, account)
+  const verified = v.success ? 1 : 0
+  const accountName = v.account_name || b.account_name || null
+
+  if (b.is_default) {
+    await c.env.DB.prepare(`UPDATE payout_accounts SET is_default=0 WHERE user_id=?`).bind(user.id).run()
+  }
+  const r = await c.env.DB.prepare(
+    `INSERT INTO payout_accounts (user_id, label, channel_code, channel_name, account_type, account_number, account_name, is_verified, is_default, created_by)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`
+  ).bind(user.id, b.label || chan.name, channelCode, chan.name, acctType, account, accountName, verified, b.is_default ? 1 : 0, user.id).run()
+  await audit(c, user.id, 'create', 'payout_account', `${chan.name} ${account} (${verified ? 'verified' : 'unverified'})`)
+  return c.json({ ok: true, id: r.meta.last_row_id, is_verified: !!verified, account_name: accountName, simulated: v.simulated })
+})
+
+app.delete('/api/payout-accounts/:id', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const user = c.get('user') as SessionUser
+  await c.env.DB.prepare(`DELETE FROM payout_accounts WHERE id=? AND user_id=?`).bind(c.req.param('id'), user.id).run()
+  return c.json({ ok: true })
+})
+
+// ============================================================================
+// WALLET WITHDRAWAL — a wallet holder cashes out to their registered mobile /
+// bank / SasaPay destination. Debits the ledger first, then pushes B2C.
+// ============================================================================
+app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json()
+  const amount = roundMoney(numberVal(b.amount, 0))
+  if (amount <= 0) return c.json({ error: 'amount must be > 0' }, 400)
+
+  // Resolve the destination: either a saved payout account, or an inline channel+number.
+  let channelCode = String(b.channel_code || '').trim()
+  let receiver = String(b.account_number || '').trim()
+  let recipientName: string | null = b.account_name || null
+  if (b.payout_account_id) {
+    const acct = await c.env.DB.prepare(`SELECT * FROM payout_accounts WHERE id=? AND user_id=?`).bind(b.payout_account_id, user.id).first<any>()
+    if (!acct) return c.json({ error: 'Payout account not found' }, 404)
+    channelCode = String(acct.channel_code)
+    receiver = String(acct.account_number)
+    recipientName = acct.account_name || null
+  }
+  const chan = channelByCode(channelCode)
+  if (!chan) return c.json({ error: 'A valid withdrawal channel is required' }, 400)
+  if (!receiver) return c.json({ error: 'A destination account is required' }, 400)
+  if (chan.type === 'mobile' || chan.type === 'wallet') receiver = sasapayNormalizePhone(receiver)
+
+  const reference = ref('WD')
+  const walletId = await ensureWallet(c, user.id)
+
+  // 1) Debit the wallet ledger up-front (the trigger rejects if balance is short).
+  try {
+    await postLedger(c, { userId: user.id, walletId, type: 'debit', amount, category: 'withdrawal', reference, description: b.reason || `Withdrawal to ${chan.name}`, createdBy: user.id })
+  } catch (e: any) {
+    const msg = String(e?.message || '')
+    if (/insufficient/i.test(msg)) return c.json({ error: 'Insufficient wallet balance' }, 400)
+    return c.json({ error: 'Withdrawal could not be posted' }, 400)
+  }
+
+  // 2) Record the withdrawal, then push B2C.
+  await c.env.DB.prepare(
+    `INSERT INTO wallet_withdrawals (reference, flow, wallet_id, user_id, amount, currency, channel_code, channel_name, receiver_number, recipient_name, reason, status, ledger_debited, created_by)
+     VALUES (?, 'withdrawal', ?,?,?, 'KES', ?,?,?,?,?, 'processing', 1, ?)`
+  ).bind(reference, walletId, user.id, amount, channelCode, chan.name, receiver, recipientName, b.reason || 'Wallet withdrawal', user.id).run()
+
+  const payout = await sasapayB2C(c.env, { amount, receiverNumber: receiver, channel: channelCode, reason: b.reason || 'Wallet withdrawal', reference })
+
+  if (!payout.success) {
+    // Reverse the debit (credit back) and mark failed.
+    await postLedger(c, { userId: user.id, walletId, type: 'credit', amount, category: 'adjustment', reference, description: `Reversal — failed withdrawal ${reference}`, createdBy: user.id })
+    await c.env.DB.prepare(`UPDATE wallet_withdrawals SET status='failed', ledger_debited=0, result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`).bind(payout.error || 'B2C failed', reference).run()
+    return c.json({ error: payout.error || 'Disbursal failed; wallet has been refunded.' }, 502)
+  }
+
+  await c.env.DB.prepare(`UPDATE wallet_withdrawals SET simulated=?, b2c_request_id=?, conversation_id=?, transaction_charges=?, status=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`)
+    .bind(payout.simulated ? 1 : 0, payout.b2c_request_id || null, payout.conversation_id || null, numberVal(payout.transaction_charges, 0), payout.simulated ? 'success' : 'processing', reference).run()
+
+  await audit(c, user.id, 'withdraw', 'wallet', `KES ${amount} to ${chan.name} ${receiver} (${payout.simulated ? 'sim' : 'live'})`)
+  return c.json({ ok: true, simulated: payout.simulated, reference, status: payout.simulated ? 'success' : 'processing', customer_message: payout.customer_message || (payout.simulated ? 'Withdrawal completed (simulation).' : 'Withdrawal is being processed.') })
+})
+
+app.get('/api/wallet/withdrawals', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const { results } = await c.env.DB.prepare(`SELECT * FROM wallet_withdrawals ORDER BY id DESC LIMIT 100`).all()
+  return c.json({ withdrawals: results })
+})
+
+// ============================================================================
+// ADMIN DIRECT PAYMENT — an authorised admin pays an individual directly, to
+// either their in-app wallet OR a mobile/bank number via SasaPay B2C.
+//   destination: 'wallet' (credit an internal wallet) | 'external' (B2C payout)
+// ============================================================================
+app.post('/api/wallet/direct-pay', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const admin = c.get('user') as SessionUser
+  const b = await c.req.json()
+  const amount = roundMoney(numberVal(b.amount, 0))
+  if (amount <= 0) return c.json({ error: 'amount must be > 0' }, 400)
+  const destination = b.destination === 'external' ? 'external' : 'wallet'
+  const reference = ref('DP')
+
+  if (destination === 'wallet') {
+    // Credit an internal user's wallet directly.
+    const recipientId = Number(b.user_id)
+    if (!recipientId) return c.json({ error: 'user_id is required for a wallet payment' }, 400)
+    const result = await withAdminContext(c, async () => {
+      const walletId = await ensureWallet(c, recipientId, admin.id)
+      await postLedger(c, { userId: recipientId, walletId, type: 'credit', amount, category: b.category || 'direct_pay', reference, description: b.reason || 'Direct payment', createdBy: admin.id })
+      await c.env.DB.prepare(
+        `INSERT INTO wallet_withdrawals (reference, flow, wallet_id, user_id, recipient_user_id, amount, currency, channel_code, channel_name, receiver_number, reason, status, ledger_debited, created_by)
+         VALUES (?, 'direct_pay', ?,?,?,?, 'KES', '0', 'SasaPay Wallet (internal)', ?, ?, 'success', 0, ?)`
+      ).bind(reference, walletId, admin.id, recipientId, amount, String(recipientId), b.reason || 'Direct wallet payment', admin.id).run()
+      return { walletId }
+    })
+    await audit(c, admin.id, 'direct_pay', 'wallet', `KES ${amount} to user ${recipientId} wallet`)
+    return c.json({ ok: true, destination: 'wallet', reference, status: 'success', ...(result as any) })
+  }
+
+  // External B2C payout to a mobile / bank number.
+  const channelCode = String(b.channel_code || '').trim()
+  const chan = channelByCode(channelCode)
+  if (!chan) return c.json({ error: 'A valid payout channel is required' }, 400)
+  let receiver = String(b.account_number || '').trim()
+  if (!receiver) return c.json({ error: 'A destination account is required' }, 400)
+  if (chan.type === 'mobile' || chan.type === 'wallet') receiver = sasapayNormalizePhone(receiver)
+
+  await c.env.DB.prepare(
+    `INSERT INTO wallet_withdrawals (reference, flow, user_id, recipient_user_id, amount, currency, channel_code, channel_name, receiver_number, recipient_name, reason, status, ledger_debited, created_by)
+     VALUES (?, 'direct_pay', ?,?,?, 'KES', ?,?,?,?,?, 'processing', 0, ?)`
+  ).bind(reference, admin.id, b.user_id ? Number(b.user_id) : null, amount, channelCode, chan.name, receiver, b.account_name || null, b.reason || 'Direct payment', admin.id).run()
+
+  const payout = await sasapayB2C(c.env, { amount, receiverNumber: receiver, channel: channelCode, reason: b.reason || 'Direct payment', reference })
+  if (!payout.success) {
+    await c.env.DB.prepare(`UPDATE wallet_withdrawals SET status='failed', result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`).bind(payout.error || 'B2C failed', reference).run()
+    return c.json({ error: payout.error || 'Disbursal failed' }, 502)
+  }
+  await c.env.DB.prepare(`UPDATE wallet_withdrawals SET simulated=?, b2c_request_id=?, conversation_id=?, transaction_charges=?, status=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`)
+    .bind(payout.simulated ? 1 : 0, payout.b2c_request_id || null, payout.conversation_id || null, numberVal(payout.transaction_charges, 0), payout.simulated ? 'success' : 'processing', reference).run()
+  await audit(c, admin.id, 'direct_pay', 'sasapay', `KES ${amount} to ${chan.name} ${receiver} (${payout.simulated ? 'sim' : 'live'})`)
+  return c.json({ ok: true, destination: 'external', simulated: payout.simulated, reference, status: payout.simulated ? 'success' : 'processing', customer_message: payout.customer_message || 'Payment is being processed.' })
+})
+
+// ============================================================================
+// B2C CALLBACK — SasaPay posts the payout result here (success AND failure).
+// Secured by IP whitelist + HMAC-SHA512 signature; idempotent by reference.
+// ============================================================================
+app.post('/api/sasapay/b2c-callback', async (c) => {
+  try {
+    const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || c.req.header('x-real-ip')
+    const sig = c.req.header('x-sasapay-signature') || c.req.header('X-SasaPay-Signature')
+    const body: any = await c.req.json().catch(() => ({}))
+
+    if (sasapayConfigured(c.env)) {
+      const ipOk = isTrustedSasapayIp(ip)
+      const sigOk = await verifySasapaySignature(c.env, sig, {
+        sasapay_transaction_code: body.TransactionCode || body.SasaPayTransactionCode || '',
+        merchant_code: body.MerchantCode || '',
+        account_number: body.ReceiverNumber || '',
+        payment_reference: body.MerchantTransactionReference || body.OriginatorConversationID || '',
+        amount: body.Amount || ''
+      })
+      if (!ipOk && !sigOk) {
+        await audit(c, null, 'callback_rejected', 'sasapay_b2c', `untrusted ip=${ip || '?'} sig=${sig ? 'bad' : 'missing'}`)
+        return c.json({ ResultCode: 1, ResultDesc: 'Rejected' }, 403)
+      }
+    }
+
+    const reference = body.MerchantTransactionReference || body.OriginatorConversationID
+    const b2cId = body.B2CRequestID || body.ConversationID
+    const row = reference
+      ? await c.env.DB.prepare(`SELECT * FROM wallet_withdrawals WHERE reference=?`).bind(reference).first<any>()
+      : (b2cId ? await c.env.DB.prepare(`SELECT * FROM wallet_withdrawals WHERE b2c_request_id=? OR conversation_id=?`).bind(b2cId, b2cId).first<any>() : null)
+
+    if (row && (row.status === 'processing' || row.status === 'pending')) {
+      const code = body.ResultCode ?? body.status_code ?? body.TransactionCode
+      const success = (code === 0 || code === '0' || body.status === true || String(body.ResultDesc || '').toLowerCase().includes('success'))
+      if (success) {
+        await c.env.DB.prepare(`UPDATE wallet_withdrawals SET status='success', transaction_code=?, result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`)
+          .bind(body.TransactionCode || body.SasaPayTransactionCode || '', String(code ?? '0'), body.ResultDesc || 'Success', row.reference).run()
+      } else {
+        // Payout failed AFTER we debited a wallet → refund the source wallet.
+        if (row.ledger_debited && row.wallet_id && row.user_id) {
+          try {
+            await withAdminContext(c, async () => {
+              await postLedger(c, { userId: row.user_id, walletId: row.wallet_id, type: 'credit', amount: numberVal(row.amount, 0), category: 'adjustment', reference: row.reference, description: `Reversal — failed payout ${row.reference}`, createdBy: null })
+            })
+          } catch (_) {}
+        }
+        await c.env.DB.prepare(`UPDATE wallet_withdrawals SET status='failed', ledger_debited=0, result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`)
+          .bind(String(code ?? '1'), body.ResultDesc || 'Payout failed', row.reference).run()
+      }
+    }
+    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+  } catch { return c.json({ ResultCode: 0, ResultDesc: 'Accepted' }) }
 })
 
 // ----------------------------------------------------------------------------

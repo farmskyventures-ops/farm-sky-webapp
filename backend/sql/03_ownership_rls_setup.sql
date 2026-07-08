@@ -221,4 +221,32 @@ CREATE POLICY ownership_earning_rules ON earning_rules
 -- CREATE TRIGGER trg_wallet_balance_guard BEFORE UPDATE ON wallets
 --   FOR EACH ROW EXECUTE FUNCTION wallet_balance_guard();
 
+-- ---------------------------------------------------------------------
+-- 3e. Payout destinations + wallet withdrawals RLS.
+--     A user sees only their own registered payout accounts and their own
+--     withdrawals; admins see everything (for direct-pay + reconciliation).
+--     The tables may not exist on a very old DB, so guard with a DO block.
+-- ---------------------------------------------------------------------
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='payout_accounts') THEN
+    EXECUTE 'ALTER TABLE payout_accounts ENABLE ROW LEVEL SECURITY';
+    EXECUTE 'ALTER TABLE payout_accounts FORCE ROW LEVEL SECURITY';
+    EXECUTE 'DROP POLICY IF EXISTS ownership_payout_accounts ON payout_accounts';
+    EXECUTE 'CREATE POLICY ownership_payout_accounts ON payout_accounts
+               USING (current_app_is_admin() OR user_id = current_app_user_id())
+               WITH CHECK (current_app_is_admin() OR user_id = current_app_user_id())';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name='wallet_withdrawals') THEN
+    EXECUTE 'ALTER TABLE wallet_withdrawals ENABLE ROW LEVEL SECURITY';
+    EXECUTE 'ALTER TABLE wallet_withdrawals FORCE ROW LEVEL SECURITY';
+    EXECUTE 'DROP POLICY IF EXISTS ownership_wallet_withdrawals ON wallet_withdrawals';
+    -- A user sees withdrawals they own (source) or that pay them (recipient); admins global.
+    EXECUTE 'CREATE POLICY ownership_wallet_withdrawals ON wallet_withdrawals
+               USING (current_app_is_admin() OR user_id = current_app_user_id() OR recipient_user_id = current_app_user_id())
+               WITH CHECK (current_app_is_admin() OR user_id = current_app_user_id() OR recipient_user_id = current_app_user_id())';
+  END IF;
+END $$;
+
 -- Done. Verify policies with:  \d+ customers   \d+ products   \d+ wallets
