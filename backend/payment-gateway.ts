@@ -14,7 +14,8 @@
 //      POST /callbacks/mpesa            <- provider IPN
 //      POST /callbacks/sasapay          <- provider IPN
 //      POST /callbacks/buni             <- provider IPN
-//      POST /admin/recover-sasapay      <- manual transaction query recovery engine
+//      POST /admin/recover-sasapay      <- manual SasaPay checkout ID recovery engine
+//      POST /admin/recover-status       <- global multi-rail transaction status recovery script
 //
 //   Security:
 //      - Every /initiate call is HMAC-SHA256 signed using the calling app's
@@ -392,7 +393,7 @@ gateway.post('/callbacks/mpesa', async (c) => {
 gateway.post('/callbacks/sasapay', async (c) => {
   const raw = await c.req.text()
   
-  // FIX: Read incoming Forwarded-For tracking block context parsing headers safely across Render proxy routing
+  // FIX: Extract client IP correctly behind Render's load balancer proxy routing layer
   const forwardHeader = c.req.header('X-Forwarded-For') || c.req.header('CF-Connecting-IP') || ''
   const requestIp = forwardHeader.split(',')[0].trim()
 
@@ -512,7 +513,7 @@ gateway.get('/admin/suspicious-activity', async (c) => {
 })
 
 // ----------------------------------------------------------------------------
-// SasaPay Recovery Engine
+// SasaPay Recovery Engine (Targeted Checkout ID)
 // ----------------------------------------------------------------------------
 gateway.post('/admin/recover-sasapay', async (c) => {
   await setTenantScope(c, null, true)
@@ -524,14 +525,12 @@ gateway.post('/admin/recover-sasapay', async (c) => {
     return c.json({ success: false, error: 'Missing checkout_request_id parameter in body' }, 400);
   }
 
-  // Find the exact transaction tracking record
   const tx = await findTxByProviderRef(c, checkout_request_id);
   if (!tx) {
     return c.json({ success: false, error: `No transaction log maps to Checkout ID: ${checkout_request_id}` }, 404);
   }
 
   try {
-    // Fire dynamic inquiry handshake out to SasaPay API engine core using your explicit provider helper
     const queryResult = await sasapayQuery(c.env, checkout_request_id);
     const code = queryResult?.ResultCode ?? queryResult?.status_code;
     const isPaid = code === 0 || code === '0' || queryResult?.status === true || queryResult?.Paid === true;
@@ -540,7 +539,6 @@ gateway.post('/admin/recover-sasapay', async (c) => {
       const receipt = queryResult?.TransactionCode || queryResult?.TransID || queryResult?.ThirdPartyTransID || 'MANUAL_RECOVERY';
       const desc = queryResult?.ResultDescription || queryResult?.ResultDesc || 'Transaction recovered successfully.';
 
-      // Atomically settle the ledger transaction inside your DB matching the schema structure
       await c.env.DB.prepare(
         `UPDATE central_transactions
             SET status='SUCCESS', provider_receipt=COALESCE(?, provider_receipt),
@@ -548,7 +546,6 @@ gateway.post('/admin/recover-sasapay', async (c) => {
           WHERE transaction_ref=?`
       ).bind(String(receipt), String(code ?? '0'), desc, tx.transaction_ref).run();
 
-      // Fetch app configurations to generate secure cross-app webhooks out to the tenant platform apps
       const client = await loadClient(c, tx.origin_app);
       const refreshed = await c.env.DB.prepare(`SELECT * FROM central_transactions WHERE transaction_ref=?`).bind(tx.transaction_ref).first<any>();
       if (client && refreshed) await notifyOriginApp(c, client, refreshed);
@@ -569,6 +566,126 @@ gateway.post('/admin/recover-sasapay', async (c) => {
 
   } catch (error: any) {
     return c.json({ success: false, error: error?.message || 'Handshake recovery processing aborted' }, 500);
+  }
+})
+
+// ----------------------------------------------------------------------------
+// Transaction Status Recovery Script (Global Multi-Rail Recovery)
+// ----------------------------------------------------------------------------
+gateway.post('/admin/recover-status', async (c) => {
+  // Elevate credentials past tenant scopes to scan across logs globally
+  await setTenantScope(c, null, true)
+
+  const body = await c.req.json().catch(() => ({}))
+  const { transaction_ref } = body
+
+  if (!transaction_ref) {
+    return c.json({ success: false, error: 'Missing transaction_ref parameter in body' }, 400)
+  }
+
+  // Pull transaction from central ledger
+  const tx = await c.env.DB.prepare(
+    `SELECT * FROM central_transactions WHERE transaction_ref = ? LIMIT 1`
+  ).bind(transaction_ref).first<any>()
+
+  if (!tx) {
+    return c.json({ success: false, error: `Transaction ${transaction_ref} not found in gateway database` }, 404)
+  }
+
+  if (!tx.provider_request_id) {
+    return c.json({ success: false, error: 'Transaction lacks a provider request tracking token (CheckoutRequestID/MerchantRequestID)' }, 422)
+  }
+
+  try {
+    let queryResult: any
+    const method = tx.payment_method as PaymentMethod
+
+    // Dispatch status check dynamically based on the payment rails option configured
+    if (method === 'mpesa') {
+      queryResult = await stkQuery(c.env, tx.provider_request_id)
+    } else if (method === 'sasapay') {
+      queryResult = await sasapayQuery(c.env, tx.provider_request_id)
+    } else if (method === 'buni') {
+      queryResult = await buniQuery(c.env, tx.provider_request_id)
+    } else {
+      return c.json({ success: false, error: `Unsupported recovery rails type: ${method}` }, 400)
+    }
+
+    // Extract dynamic response parameters matching specific aggregators
+    let code: any
+    let isPaid = false
+    let receipt: string | null = null
+    let desc = 'Recovered via status check script.'
+
+    if (method === 'mpesa') {
+      code = queryResult?.ResultCode
+      isPaid = code === 0 || code === '0'
+      const items = queryResult?.CallbackMetadata?.Item || []
+      receipt = items.find((i: any) => i?.Name === 'MpesaReceiptNumber')?.Value || null
+      desc = queryResult?.ResultDesc || desc
+    } else if (method === 'sasapay') {
+      code = queryResult?.ResultCode ?? queryResult?.status_code
+      isPaid = code === 0 || code === '0' || queryResult?.status === true || queryResult?.Paid === true
+      receipt = queryResult?.TransactionCode || queryResult?.TransID || queryResult?.ThirdPartyTransID || null
+      desc = queryResult?.ResultDescription || queryResult?.ResultDesc || queryResult?.message || desc
+    } else if (method === 'buni') {
+      code = queryResult?.ResponseCode ?? queryResult?.ResultCode
+      isPaid = code === '00' || code === 0 || code === '0' || queryResult?.status === true
+      receipt = queryResult?.TransactionID || queryResult?.ReceiptNumber || null
+      desc = queryResult?.ResponseDescription || queryResult?.ResultDesc || desc
+    }
+
+    if (isPaid) {
+      const finalReceipt = receipt ? String(receipt) : `REC-${crypto.randomUUID().slice(0, 8).toUpperCase()}`
+
+      // Update central transaction record state cleanly
+      await c.env.DB.prepare(
+        `UPDATE central_transactions
+            SET status='SUCCESS', provider_receipt=COALESCE(?, provider_receipt),
+                result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
+          WHERE transaction_ref=?`
+      ).bind(finalReceipt, String(code ?? '0'), desc, transaction_ref).run()
+
+      // Pull the marketplace application credentials and distribute signed postback triggers
+      const client = await loadClient(c, tx.origin_app)
+      const refreshed = await c.env.DB.prepare(`SELECT * FROM central_transactions WHERE transaction_ref=?`).bind(transaction_ref).first<any>()
+      if (client && refreshed) await notifyOriginApp(c, client, refreshed)
+
+      return c.json({
+        success: true,
+        resolved_status: 'SUCCESS',
+        message: `Transaction state successfully verified and synced for payment method: ${method}`,
+        transaction_ref,
+        provider_receipt: finalReceipt
+      })
+    } else if (code !== undefined && code !== null) {
+      // Upstream responded but the payment explicitly failed or timed out
+      await c.env.DB.prepare(
+        `UPDATE central_transactions
+            SET status='FAILED', result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
+          WHERE transaction_ref=?`
+      ).bind(String(code), desc, transaction_ref).run()
+
+      const client = await loadClient(c, tx.origin_app)
+      const refreshed = await c.env.DB.prepare(`SELECT * FROM central_transactions WHERE transaction_ref=?`).bind(transaction_ref).first<any>()
+      if (client && refreshed) await notifyOriginApp(c, client, refreshed)
+
+      return c.json({
+        success: true,
+        resolved_status: 'FAILED',
+        message: 'Provider confirmed that the transaction failed or was canceled by the user.',
+        transaction_ref
+      })
+    }
+
+    return c.json({
+      success: false,
+      message: 'Provider status inquiry returned inconclusive status. Transaction remains unmodified.',
+      provider_raw_response: queryResult
+    }, 200)
+
+  } catch (err: any) {
+    return c.json({ success: false, error: err?.message || 'Upstream provider connectivity failure on status recovery execution.' }, 502)
   }
 })
 
