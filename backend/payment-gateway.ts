@@ -14,6 +14,7 @@
 //      POST /callbacks/mpesa            <- provider IPN
 //      POST /callbacks/sasapay          <- provider IPN
 //      POST /callbacks/buni             <- provider IPN
+//      POST /admin/recover-sasapay      <- manual transaction query recovery engine
 //
 //   Security:
 //      - Every /initiate call is HMAC-SHA256 signed using the calling app's
@@ -390,12 +391,29 @@ gateway.post('/callbacks/mpesa', async (c) => {
 
 gateway.post('/callbacks/sasapay', async (c) => {
   const raw = await c.req.text()
+  
+  // FIX: Read incoming Forwarded-For tracking block context parsing headers
+  const forwardHeader = c.req.header('X-Forwarded-For') || c.req.header('CF-Connecting-IP') || ''
+  const requestIp = forwardHeader.split(',')[0].trim()
+
+  const SASAPAY_TRUSTED_IPS = new Set([
+    '47.129.43.141', '13.229.247.179', '13.215.155.141', '13.214.60.231',
+    '54.169.74.198', '18.142.226.87', '47.129.243.116', '13.250.110.3',
+    '155.12.30.40', '155.12.30.58'
+  ])
+
+  if (!SASAPAY_TRUSTED_IPS.has(requestIp)) {
+    await auditSecurity(c, 'CALLBACK_IP_BLOCKED', 'CRITICAL', { originApp: 'sasapay', detail: `Blocked untrusted IP: ${requestIp}` })
+    return c.json({ error: 'Untrusted origin gateway transaction dropped.' }, 401)
+  }
+
   try {
     const body: any = JSON.parse(raw)
     const providerReqId = body?.CheckoutRequestID || body?.MerchantRequestID || null
     const code = body?.ResultCode ?? body?.status_code
     const success = code === 0 || code === '0' || body?.status === true
-    const receipt = body?.TransactionID || body?.MpesaReceiptNumber || null
+    const receipt = body?.TransactionCode || body?.ThirdPartyTransID || null
+    
     await settleCallback(c, 'sasapay', providerReqId, success, receipt ? String(receipt) : null, String(code ?? ''), body?.ResultDesc || body?.message || null, raw)
   } catch (_) {
     await logCallback(c, null, 'sasapay', null, raw, false)
@@ -491,6 +509,67 @@ gateway.get('/admin/suspicious-activity', async (c) => {
     integrity_breaks: integrity.results || [],
     invalid_callbacks: invalidCallbacks.results || []
   })
+})
+
+// ----------------------------------------------------------------------------
+// SasaPay Recovery Engine
+// ----------------------------------------------------------------------------
+gateway.post('/admin/recover-sasapay', async (c) => {
+  await setTenantScope(c, null, true)
+  
+  const body = await c.req.json().catch(() => ({}));
+  const { checkout_request_id } = body;
+
+  if (!checkout_request_id) {
+    return c.json({ success: false, error: 'Missing checkout_request_id parameter in body' }, 400);
+  }
+
+  // Find the exact transaction tracking record
+  const tx = await findTxByProviderRef(c, checkout_request_id);
+  if (!tx) {
+    return c.json({ success: false, error: `No transaction log maps to Checkout ID: ${checkout_request_id}` }, 404);
+  }
+
+  try {
+    // Fire dynamic inquiry handshake out to SasaPay API engine core
+    const queryResult = await sasapayQuery(c.env, checkout_request_id);
+    const code = queryResult?.ResultCode ?? queryResult?.status_code;
+    const isPaid = code === 0 || code === '0' || queryResult?.status === true || queryResult?.Paid === true;
+
+    if (isPaid) {
+      const receipt = queryResult?.TransactionCode || queryResult?.TransID || queryResult?.ThirdPartyTransID || 'MANUAL_RECOVERY';
+      const desc = queryResult?.ResultDescription || queryResult?.ResultDesc || 'Transaction recovered successfully.';
+
+      // Atomically settle the ledger transaction inside your DB matching the schema structure
+      await c.env.DB.prepare(
+        `UPDATE central_transactions
+            SET status='SUCCESS', provider_receipt=COALESCE(?, provider_receipt),
+                result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
+          WHERE transaction_ref=?`
+      ).bind(String(receipt), String(code ?? '0'), desc, tx.transaction_ref).run();
+
+      // Notify tenant e-commerce apps (equipment, feed, or input)
+      const client = await loadClient(c, tx.origin_app);
+      const refreshed = await c.env.DB.prepare(`SELECT * FROM central_transactions WHERE transaction_ref=?`).bind(tx.transaction_ref).first<any>();
+      if (client && refreshed) await notifyOriginApp(c, client, refreshed);
+
+      return c.json({
+        success: true,
+        message: 'Transaction verified and successfully moved to SUCCESS.',
+        transaction_ref: tx.transaction_ref,
+        provider_receipt: receipt
+      });
+    }
+
+    return c.json({
+      success: false,
+      message: 'SasaPay indicates transaction is still uncompleted or failed.',
+      provider_raw_response: queryResult
+    }, 200);
+
+  } catch (error: any) {
+    return c.json({ success: false, error: error?.message || 'Handshake recovery processing aborted' }, 500);
+  }
 })
 
 export default gateway
