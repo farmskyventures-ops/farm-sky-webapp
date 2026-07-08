@@ -392,7 +392,7 @@ gateway.post('/callbacks/mpesa', async (c) => {
 gateway.post('/callbacks/sasapay', async (c) => {
   const raw = await c.req.text()
   
-  // FIX: Read incoming Forwarded-For tracking block context parsing headers
+  // FIX: Read incoming Forwarded-For tracking block context parsing headers safely across Render proxy routing
   const forwardHeader = c.req.header('X-Forwarded-For') || c.req.header('CF-Connecting-IP') || ''
   const requestIp = forwardHeader.split(',')[0].trim()
 
@@ -531,7 +531,7 @@ gateway.post('/admin/recover-sasapay', async (c) => {
   }
 
   try {
-    // Fire dynamic inquiry handshake out to SasaPay API engine core
+    // Fire dynamic inquiry handshake out to SasaPay API engine core using your explicit provider helper
     const queryResult = await sasapayQuery(c.env, checkout_request_id);
     const code = queryResult?.ResultCode ?? queryResult?.status_code;
     const isPaid = code === 0 || code === '0' || queryResult?.status === true || queryResult?.Paid === true;
@@ -548,7 +548,7 @@ gateway.post('/admin/recover-sasapay', async (c) => {
           WHERE transaction_ref=?`
       ).bind(String(receipt), String(code ?? '0'), desc, tx.transaction_ref).run();
 
-      // Notify tenant e-commerce apps (equipment, feed, or input)
+      // Fetch app configurations to generate secure cross-app webhooks out to the tenant platform apps
       const client = await loadClient(c, tx.origin_app);
       const refreshed = await c.env.DB.prepare(`SELECT * FROM central_transactions WHERE transaction_ref=?`).bind(tx.transaction_ref).first<any>();
       if (client && refreshed) await notifyOriginApp(c, client, refreshed);
