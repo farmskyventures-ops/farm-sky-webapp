@@ -219,8 +219,6 @@ async function getToken(env: SasaPayEnv): Promise<string> {
 }
 
 // ---------- C2B: request-payment (collect) ----------------------------------
-// Handles SasaPay wallet (OTP), mobile money (STK) and bank (Pesalink) via the
-// single request-payment endpoint, keyed on NetworkCode.
 export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Promise<SasaPayResult> {
   if (!sasapayConfigured(env)) {
     const code = opts.channelCode || opts.networkCode || '63902'
@@ -259,7 +257,6 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
     TransactionDesc: String(opts.description || 'Farmsky payment').slice(0, 20),
     CallBackURL: callbackUrl
   }
-  // Bank collections need the payer's bank account number.
   if (ch?.type === 'bank' && opts.accountNumber) {
     body.BillBankAccountNumber = opts.accountNumber
   }
@@ -461,34 +458,49 @@ export async function sasapayBalance(env: SasaPayEnv): Promise<SasaPayBalance> {
 }
 
 // ---------- Transaction status query ----------------------------------------
-// Uses the status-query endpoint (results delivered to the callback). We also
-// fall back to a synchronous interpretation when the API answers inline.
+// Normalized to safely evaluate downstream and unblock PENDING state anomalies.
 export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, callbackUrl?: string): Promise<any> {
   if (!sasapayConfigured(env) || String(checkoutRequestId).includes('SIM')) {
-    return { ResultCode: '0', ResultDesc: 'Simulated success' }
+    return { ResultCode: '0', ResultDesc: 'Simulated success', status: true }
   }
   try {
     const token = await getToken(env)
     const url = `${baseUrl(env)}/api/v1/transactions/status-query/`
     const body: Record<string, any> = { MerchantCode: merchantCode(env), CheckoutRequestId: checkoutRequestId }
     if (callbackUrl) body.CallbackUrl = callbackUrl
+    
     const res = await fetch(url, {
       method: 'POST', redirect: 'follow',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(body)
     })
+    
     const { json } = await readBody(res)
-    // status-query is async — the definitive result lands on the callback URL.
-    if (json && (json.ResultCode !== undefined || json.status_code !== undefined)) return json
-    return { pending: true, status_code: null, ResultDesc: 'Transaction still processing' }
-  } catch {
-    return { pending: true, status_code: null, ResultDesc: 'Transaction still processing' }
+    
+    // Explicit runtime tracking inside your Render application logging environment
+    console.log("Raw SasaPay status payload received:", JSON.stringify(json));
+
+    if (json) {
+      // SasaPay properties fallback matrix normalization mapping
+      const code = json.ResultCode ?? json.ResponseCode ?? json.data?.ResultCode ?? json.statusCode;
+      const isSuccess = json.status === true || code === '0' || code === 0;
+
+      return {
+        ...json,
+        ResultCode: code !== undefined ? String(code) : undefined,
+        status: isSuccess,
+        pending: !isSuccess && (json.pending || json.data?.status === 'Processing' || res.status === 200)
+      }
+    }
+    
+    return { pending: true, ResultCode: null, ResultDesc: 'Transaction still processing', status: false }
+  } catch (err: any) {
+    console.error("SasaPay Status Query Exception caught on production server instance:", err);
+    return { pending: true, ResultCode: null, ResultDesc: 'Transaction still processing', status: false }
   }
 }
 
 // ---------- Callback signature verification (HMAC-SHA512) -------------------
-// Message: sasapay_transaction_code-merchant_code-account_number-payment_reference-amount
-// Secret : Merchant API Client ID.
 export async function verifySasapaySignature(
   env: SasaPayEnv,
   headerSignature: string | null | undefined,
