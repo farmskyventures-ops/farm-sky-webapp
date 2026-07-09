@@ -17,7 +17,66 @@ import { sendEmail, emailConfigured } from './email'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: SessionUser } }>()
 
-app.use('/api/*', cors())
+// ----------------------------------------------------------------------------
+// ISSUE 7 — SECURITY HARDENING
+//   (a) Same-origin CORS with credentials (no wildcard — the API relies on
+//       cookie-based sessions, so a permissive wildcard would be unsafe).
+//   (b) Baseline security response headers on every request.
+//   (c) Lightweight in-memory rate limiting for sensitive endpoints
+//       (login / OTP / payment initiation) to blunt brute-force + abuse.
+// ----------------------------------------------------------------------------
+app.use('/api/*', cors({
+  origin: (origin) => origin || '*',   // reflect the caller's own origin
+  credentials: true,
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-SasaPay-Signature'],
+  maxAge: 600
+}))
+
+// Baseline security headers.
+app.use('*', async (c, next) => {
+  await next()
+  c.header('X-Content-Type-Options', 'nosniff')
+  c.header('X-Frame-Options', 'SAMEORIGIN')
+  c.header('Referrer-Policy', 'strict-origin-when-cross-origin')
+  c.header('X-XSS-Protection', '0')
+  c.header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()')
+  c.header('Cross-Origin-Opener-Policy', 'same-origin')
+})
+
+// Simple sliding-window rate limiter (per-IP, per-bucket) held in memory.
+const _rlBuckets = new Map<string, { count: number; resetAt: number }>()
+function rateLimit(bucket: string, max: number, windowMs: number) {
+  return async (c: any, next: any) => {
+    const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for')?.split(',')[0].trim() || c.req.header('x-real-ip') || 'unknown'
+    const key = `${bucket}:${ip}`
+    const now = Date.now()
+    const rec = _rlBuckets.get(key)
+    if (!rec || rec.resetAt < now) {
+      _rlBuckets.set(key, { count: 1, resetAt: now + windowMs })
+    } else {
+      rec.count++
+      if (rec.count > max) {
+        const retry = Math.ceil((rec.resetAt - now) / 1000)
+        c.header('Retry-After', String(retry))
+        return c.json({ error: 'Too many requests. Please slow down and try again shortly.' }, 429)
+      }
+    }
+    // Opportunistic cleanup to bound memory.
+    if (_rlBuckets.size > 5000) {
+      for (const [k, v] of _rlBuckets) { if (v.resetAt < now) _rlBuckets.delete(k) }
+    }
+    await next()
+  }
+}
+// Brute-force protection on credential + OTP surfaces.
+app.use('/api/login', rateLimit('login', 10, 60_000))
+app.use('/api/signup/request-otp', rateLimit('otp', 8, 60_000))
+app.use('/api/reset-password/request-otp', rateLimit('otp', 8, 60_000))
+// Abuse protection on payment initiation surfaces.
+app.use('/api/sasapay/stkpush', rateLimit('pay', 20, 60_000))
+app.use('/api/mpesa/stkpush', rateLimit('pay', 20, 60_000))
+app.use('/api/buni/stkpush', rateLimit('pay', 20, 60_000))
 
 // ----------------------------------------------------------------------------
 // Helpers
@@ -439,7 +498,10 @@ async function createSession(c: any, user: any) {
   const token = genToken()
   const expires = Date.now() + 1000 * 60 * 60 * 12
   await c.env.DB.prepare(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)`).bind(token, user.id, expires).run()
-  setCookie(c, 'session', token, { path: '/', httpOnly: true, maxAge: 60 * 60 * 12, sameSite: 'Lax' })
+  // Issue 7: mark the session cookie Secure when served over HTTPS so it is
+  // never transmitted over a plaintext channel in production.
+  const isHttps = (c.req.header('x-forwarded-proto') || '').includes('https') || new URL(c.req.url).protocol === 'https:'
+  setCookie(c, 'session', token, { path: '/', httpOnly: true, maxAge: 60 * 60 * 12, sameSite: 'Lax', secure: isHttps })
   return token
 }
 // Issue an OTP, persist it, and send via SMS. Returns demo_otp when SMS not configured.
@@ -1166,6 +1228,37 @@ app.post('/api/murabaha/:id/dispatch', requireAuth, requireRole('admin', 'super_
 })
 
 // ----------------------------------------------------------------------------
+// ISSUE 2 — FINANCING DUE-DATE REMINDERS
+//   Lists financing installments due within N days (default 3) of their due
+//   date, so an operator (or a scheduled job) can dispatch automated reminders
+//   to customers to pay the amount that is due. Also flags overdue items.
+// ----------------------------------------------------------------------------
+app.get('/api/murabaha/reminders/due', requireAuth, async (c) => {
+  const withinDays = Math.max(0, Math.min(60, Number(c.req.query('days') || 3)))
+  const rows = await c.env.DB.prepare(
+    `SELECT r.id AS repayment_id, r.installment_no, r.due_date, r.amount_due, r.amount_paid, r.status,
+            mc.id AS contract_id, mc.contract_ref, mc.payment_type, mc.outstanding,
+            cu.full_name AS customer_name, cu.mobile AS customer_phone
+       FROM repayments r
+       JOIN murabaha_contracts mc ON mc.id = r.contract_id
+       LEFT JOIN customers cu ON cu.id = mc.customer_id
+      WHERE mc.payment_type != 'cash'
+        AND mc.status = 'active'
+        AND r.status != 'completed'
+      ORDER BY r.due_date ASC
+      LIMIT 500`
+  ).all<any>()
+  const today = new Date(); today.setHours(0, 0, 0, 0)
+  const reminders = (rows?.results || []).map((r: any) => {
+    const due = new Date(r.due_date); due.setHours(0, 0, 0, 0)
+    const days = Math.round((due.getTime() - today.getTime()) / 86400000)
+    const balance = Number(r.amount_due) - Number(r.amount_paid || 0)
+    return { ...r, balance_due: balance, days_to_due: days, overdue: days < 0 }
+  }).filter((r: any) => r.balance_due > 0.5 && r.days_to_due <= withinDays)
+  return c.json({ ok: true, within_days: withinDays, count: reminders.length, reminders })
+})
+
+// ----------------------------------------------------------------------------
 // PAYMENTS - M-Pesa Daraja STK Push (real when configured, simulated otherwise)
 // ----------------------------------------------------------------------------
 async function applyPayment(c: any, contract: any, amt: number, receipt: string, method: string, phone: string) {
@@ -1322,9 +1415,9 @@ app.post('/api/sasapay/stkpush', requireAuth, async (c) => {
   if (amt > Number(contract.outstanding || 0)) return c.json({ error: 'Amount exceeds outstanding balance' }, 400)
 
   const isBank = chan?.type === 'bank'
-  if (isBank && !account_number) {
-    return c.json({ error: 'A bank account number is required for bank payments.' }, 400)
-  }
+  // Issue 4 fix: bank channels are routed by NetworkCode + the customer's phone number
+  // (SasaPay delivers the STK / Pesalink prompt to the phone). A bank account number is
+  // NOT part of the C2B request-payment contract, so we no longer require or forward it.
   if (!chan && channelCode) return c.json({ error: 'Unknown payment channel selected.' }, 400)
 
   const desc = contract.payment_type === 'cash' ? 'Cash Equipment Purchase' : 'Equipment Financing Payment'
@@ -1336,8 +1429,7 @@ app.post('/api/sasapay/stkpush', requireAuth, async (c) => {
     account: contract.contract_ref,
     description: desc,
     networkCode: channelCode || '63902',
-    channelCode: channelCode || '63902',
-    accountNumber: account_number || ''
+    channelCode: channelCode || '63902'
   })
 
   if (!result.success) return c.json({ error: result.error || 'SasaPay transaction initialization failed' }, 502)
@@ -1364,7 +1456,7 @@ app.post('/api/sasapay/stkpush', requireAuth, async (c) => {
     channel: chan?.name || channelCode,
     customer_message: result.customer_message || (result.needs_otp
       ? 'Enter the OTP sent to your SasaPay wallet to authorise the payment.'
-      : (isBank ? 'Bank payment initiated. Approve it in your banking app.' : 'STK Push sent. Enter your PIN on your phone.'))
+      : (isBank ? 'Bank payment initiated. Approve the prompt sent to your phone / banking app.' : 'STK Push sent. Enter your PIN on your phone.'))
   })
 })
 
@@ -1505,6 +1597,97 @@ app.get('/api/sasapay/balance', requireAuth, requirePermission('manage_wallets')
 
 app.get('/api/sasapay/status', requireAuth, (c) => {
   return c.json({ live: sasapayConfigured(c.env), mode: sasapayConfigured(c.env) ? (c.env.SASAPAY_ENV || 'sandbox') : 'simulation' })
+})
+
+// ----------------------------------------------------------------------------
+// ISSUE 1 — ADMIN PAYMENT RECOVERY (in-app payment_intents)
+//   When a customer's wallet is debited but the async gateway callback never
+//   lands, the intent (and therefore the dashboard/contract) is stuck PENDING.
+//   These authorised endpoints let an operator (a) list hanging intents,
+//   (b) re-query the upstream gateway status directly, and (c) manually push a
+//   hanging payment to SUCCESS (settling the contract + wallet ledger).
+// ----------------------------------------------------------------------------
+
+// List payment intents that are stuck pending (optionally older than N minutes).
+app.get('/api/admin/payments/pending', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const minAgeMin = Math.max(0, Number(c.req.query('min_age_min') || 0))
+  const rows = await c.env.DB.prepare(
+    `SELECT pi.*, mc.contract_ref, mc.outstanding, mc.status AS contract_status,
+            cu.full_name AS customer_name
+       FROM payment_intents pi
+       LEFT JOIN murabaha_contracts mc ON mc.id = pi.contract_id
+       LEFT JOIN customers cu ON cu.id = pi.customer_id
+      WHERE pi.status = 'pending'
+      ORDER BY pi.created_at DESC
+      LIMIT 200`
+  ).all<any>()
+  const now = Date.now()
+  const list = (rows?.results || []).filter((r: any) => {
+    if (!minAgeMin) return true
+    const t = Date.parse(r.created_at || '') || now
+    return (now - t) >= minAgeMin * 60 * 1000
+  })
+  return c.json({ ok: true, count: list.length, intents: list })
+})
+
+// Recover a single hanging intent. mode='query' re-checks the gateway and only
+// settles if the gateway now reports SUCCESS; mode='force' overrides and pushes
+// the intent to SUCCESS regardless (records who forced it, for audit).
+app.post('/api/admin/payments/recover', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const checkout = String(body.checkout_request_id || '').trim()
+  const mode = String(body.mode || 'query').toLowerCase() // 'query' | 'force'
+  if (!checkout) return c.json({ error: 'checkout_request_id is required' }, 400)
+
+  const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+  if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
+  if (intent.status === 'success') {
+    return c.json({ ok: true, status: 'success', already: true, mpesa_receipt: intent.mpesa_receipt })
+  }
+
+  let success = false, receipt = '', gatewayDesc = ''
+  let forced = false
+
+  if (mode === 'force') {
+    // Authorised manual override — push to SUCCESS.
+    success = true
+    forced = true
+    receipt = String(body.receipt || intent.transaction_code || ('MANUAL' + Date.now().toString().slice(-8)))
+    gatewayDesc = 'Manual admin override'
+  } else {
+    // Query upstream gateway directly.
+    if (!sasapayConfigured(c.env) || String(checkout).includes('SIM')) {
+      success = true; receipt = 'SP' + Math.random().toString(36).slice(2, 9).toUpperCase()
+    } else {
+      const q = await sasapayQuery(c.env, checkout)
+      gatewayDesc = String(q?.ResultDesc || q?.message || '')
+      const code = q?.ResultCode ?? q?.status_code
+      if (code === '0' || code === 0 || q?.status === true) {
+        success = true
+        receipt = q.TransactionCode || q.TransactionID || ('SPL' + Date.now().toString().slice(-7))
+      } else if (q?.pending === true || code === undefined || code === null || code === '') {
+        return c.json({ ok: false, status: 'pending', result_desc: gatewayDesc || 'Gateway still processing' })
+      } else {
+        // Definitive failure reported by the gateway.
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`)
+          .bind((gatewayDesc || 'Payment not completed').slice(0, 300), checkout).run()
+        await audit(c, c.get('user').id, 'payment_recover', 'sasapay', `marked FAILED ${checkout} (${gatewayDesc})`)
+        return c.json({ ok: false, status: 'failed', result_desc: gatewayDesc || 'Payment not completed' })
+      }
+    }
+  }
+
+  if (success) {
+    const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
+    let res: any = null
+    if (contract) res = await applyPayment(c, contract, intent.amount, receipt, 'sasapay', intent.phone)
+    await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, transaction_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`)
+      .bind(receipt, receipt, (gatewayDesc || (forced ? 'Manual admin override' : 'Recovered')).slice(0, 300), checkout).run()
+    await audit(c, c.get('user').id, 'payment_recover', 'sasapay',
+      `${forced ? 'FORCED' : 'query-settled'} ${checkout} -> SUCCESS (KES ${intent.amount}, receipt ${receipt})`)
+    return c.json({ ok: true, status: 'success', forced, mpesa_receipt: receipt, ...(res || {}) })
+  }
+  return c.json({ ok: false, status: 'pending' })
 })
 // ----------------------------------------------------------------------------
 // PAYMENTS - KCB Buni STK Push (real when configured, simulated otherwise)

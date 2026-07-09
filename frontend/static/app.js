@@ -741,6 +741,52 @@ window.contractDetail = async (id) => {
   const canPay = state.user.role === 'customer' && c.status === 'active'
   const canDispatch = ['admin', 'super_admin', 'operations_finance'].includes(state.user.role) && ['active', 'completed', 'awaiting_cash_balance'].includes(c.status) && c.dispatch_status !== 'dispatched'
   const canRequest = !['admin', 'super_admin'].includes(state.user.role) && canDo('request_admin_action')
+
+  // ---- Issue 2: Milestone Payment & Balance Calculator ----------------------
+  const isCash = c.payment_type === 'cash'
+  const depositPct = Number(c.deposit_pct || 0)
+  const totalPayable = Number(c.murabaha_price || 0)
+  const amountPaid = Number(c.amount_paid || 0)
+  const outstanding = Number(c.outstanding || 0)
+  // A milestone contract is one where only a deposit (< 100%) was required up front.
+  const isMilestone = depositPct > 0 && depositPct < 100
+  const hasBalance = outstanding > 0.5
+  // Who may push a cash balance payment (button next to the contract).
+  const canCollect = state.user.role === 'customer' || canDo('collect_payment') ||
+    ['admin', 'super_admin', 'operations_finance', 'sales_agent'].includes(state.user.role)
+  // Cash contract that has taken a deposit but still owes a balance.
+  const cashBalanceDue = isCash && hasBalance && (c.status === 'awaiting_cash_balance' || c.ownership_recorded)
+
+  // Compute the next financing installment + days to due (for reminders).
+  let nextDue = null
+  if (!isCash && Array.isArray(data.repayments)) {
+    nextDue = data.repayments.find(r => r.status !== 'completed' && Number(r.amount_due) > Number(r.amount_paid || 0))
+  }
+  let dueBanner = ''
+  if (nextDue && nextDue.due_date) {
+    const days = Math.ceil((new Date(nextDue.due_date).getTime() - Date.now()) / 86400000)
+    const dueAmt = Number(nextDue.amount_due) - Number(nextDue.amount_paid || 0)
+    const tone = days < 0 ? 'red' : days <= 3 ? 'amber' : 'teal'
+    const label = days < 0 ? `Overdue by ${Math.abs(days)} day(s)` : days === 0 ? 'Due today' : `Due in ${days} day(s)`
+    dueBanner = `<div class="text-left mb-4 p-3 rounded-lg bg-${tone}-50 border border-${tone}-200">
+        <div class="text-xs font-semibold text-${tone}-800"><i class="fas fa-bell mr-1"></i>Installment reminder — ${label}</div>
+        <div class="text-xs text-${tone}-700 mt-0.5">Next payment of ${fmt(dueAmt)} is due on ${esc(nextDue.due_date)}.</div>
+      </div>`
+  }
+
+  // Reactive balance calculator card (deposit > 0).
+  let balanceCard = ''
+  if (isMilestone || hasBalance) {
+    const progress = totalPayable > 0 ? Math.min(100, Math.round((amountPaid / totalPayable) * 100)) : 0
+    balanceCard = `<div class="text-left mb-4 p-3 rounded-lg bg-white border border-slate-200">
+        <div class="text-[11px] font-semibold text-slate-600 uppercase tracking-wider mb-2 text-left">Balance Calculator</div>
+        <div class="flex justify-between text-xs mb-1"><span class="text-slate-500">Total payable</span><b>${fmt(totalPayable)}</b></div>
+        <div class="flex justify-between text-xs mb-1"><span class="text-slate-500">Deposit / paid so far${depositPct ? ` (${depositPct}% deposit)` : ''}</span><b class="text-emerald-700">${fmt(amountPaid)}</b></div>
+        <div class="flex justify-between text-xs mb-2"><span class="text-slate-500">Remaining balance</span><b class="text-${hasBalance ? 'amber' : 'emerald'}-700">${fmt(outstanding)}</b></div>
+        <div class="h-2 w-full bg-slate-100 rounded-full overflow-hidden"><div class="h-full bg-emerald-500" style="width:${progress}%"></div></div>
+        <div class="text-[10px] text-slate-400 mt-1 text-left">${progress}% settled</div>
+      </div>`
+  }
   showModal(`
     <div class="flex justify-between items-start mb-3">
       <div><h3 class="text-lg font-bold">${esc(c.contract_ref)}</h3><p class="text-xs text-slate-500">${esc(c.customer_name)} · ${esc(c.product_name)}</p></div>
@@ -759,11 +805,15 @@ window.contractDetail = async (id) => {
       <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Terms</p><b>${c.term_months || 0} month(s)</b></div>
     </div>
     ${c.terms_text ? `<div class="text-xs text-slate-600 bg-slate-50 p-3 rounded-lg mb-4 border border-slate-200"><b>Configured terms:</b> ${esc(c.terms_text)}</div>` : ''}
+    ${dueBanner}
+    ${balanceCard}
     ${data.repayments.length ? `<h4 class="font-semibold text-sm mb-2">Repayment Schedule</h4>
     <table class="w-full text-xs mb-4"><thead class="text-slate-400"><tr><th class="text-left">#</th><th class="text-left">Due</th><th class="text-right">Amount</th><th class="text-right">Paid</th><th>Status</th></tr></thead>
     <tbody>${data.repayments.map(r => `<tr class="border-t border-slate-100"><td>${r.installment_no}</td><td>${r.due_date}</td><td class="text-right">${fmt(r.amount_due)}</td><td class="text-right">${fmt(r.amount_paid)}</td><td class="text-center">${badge(r.status)}</td></tr>`).join('')}</tbody></table>` : ''}
     <div class="flex flex-wrap gap-2">
       ${canPay ? `<button onclick="payModal(${c.id}, ${c.monthly_payment || c.installment_amount || c.outstanding}, ${c.outstanding})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-mobile-alt mr-1"></i>Pay via M-Pesa</button>` : ''}
+      ${cashBalanceDue && canCollect ? `<button onclick="payModal(${c.id}, ${outstanding}, ${outstanding}, 'cash')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-wallet mr-1"></i>Pay Balance (${fmt(outstanding)})</button>` : ''}
+      ${!isCash && hasBalance && canCollect ? `<button onclick="payModal(${c.id}, ${nextDue ? (Number(nextDue.amount_due) - Number(nextDue.amount_paid||0)) : outstanding}, ${outstanding}, 'repay')" class="btn flex-1 bg-teal-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-coins mr-1"></i>Collect Installment</button>` : ''}
       ${canDispatch ? `<button onclick="dispatchContract(${c.id})" class="btn flex-1 bg-emerald-600 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-truck mr-1"></i>Dispatch Equipment</button>` : ''}
       ${canRequest ? `<button onclick="requestChangeModal('contract', ${c.id}, 'amend contract')" class="btn flex-1 bg-amber-500 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Request Admin Change</button>` : ''}
       <button onclick="viewDoc(${c.id})" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-file-pdf mr-1"></i>Documents</button>
@@ -819,17 +869,21 @@ window.payModal = async (id, amount, outstanding, kind) => {
         <select id="spChannelCode" class="w-full px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm"></select>
       </div>
       <div id="spBankAcctWrap" class="hidden">
-        <label class="text-xs font-semibold text-slate-600 uppercase tracking-wider block mb-1">Bank Account Number</label>
-        <div class="flex gap-2">
-          <input id="spAccNum" type="text" placeholder="e.g. 0123456789" class="flex-1 px-2 py-1.5 border border-slate-300 bg-white rounded-md text-sm">
-          <button type="button" onclick="doValidateCheckoutAccount()" class="btn px-3 bg-slate-100 rounded-md text-xs whitespace-nowrap">Verify</button>
-        </div>
-        <div id="spAcctName" class="text-xs text-emerald-700 mt-1"></div>
+        <p class="text-xs text-slate-500">Select your bank above, then approve the payment prompt sent to your phone. A bank account number is not required.</p>
       </div>
     </div>
 
     <label class="text-sm font-medium">Phone</label><input id="mpphone" value="${esc(state.user.phone)}" class="w-full mt-1 mb-3 px-3 py-2 border border-slate-300 rounded-lg">
-    <label class="text-sm font-medium">Amount (KES)</label><input id="mpamt" type="number" value="${amount}" ${isCash ? 'readonly' : ''} class="w-full mt-1 mb-4 px-3 py-2 border border-slate-300 rounded-lg ${isCash ? 'bg-slate-50' : ''}">
+    <label class="text-sm font-medium">Amount (KES)</label><input id="mpamt" type="number" value="${amount}" ${isCash ? 'readonly' : ''} class="w-full mt-1 mb-2 px-3 py-2 border border-slate-300 rounded-lg ${isCash ? 'bg-slate-50' : ''}">
+
+    <!-- Issue 6: Dynamic legal agreement block — toggles between asset financing
+         terms and cash sale terms, both left-aligned to the layout margin. -->
+    <div id="payTermsBlock" class="text-left mb-4 mt-1 p-3 bg-slate-50 border border-slate-200 rounded-lg">
+      <div class="text-[11px] font-semibold text-slate-600 uppercase tracking-wider mb-1 text-left">${isCash ? 'Cash Sale Agreement' : 'Asset Financing Agreement'}</div>
+      <p class="text-[11px] leading-relaxed text-slate-500 text-left">${isCash
+        ? 'This is an outright cash sale. By proceeding you confirm full/settlement payment of the amount due and accept transfer of ownership of the equipment upon settlement. All sales are governed by FarmSky cash sale terms and no financing profit or installment obligations apply.'
+        : 'This is a Sharia-compliant asset financing (Murabaha) transaction. By proceeding you agree to the disclosed murabaha price, deposit and the installment repayment schedule until the outstanding balance is fully settled. Ownership transfers per the executed financing agreement and applicable FarmSky financing terms.'}</p>
+    </div>
     <div id="payStatus"></div>
     <div class="flex gap-2"><button id="payBtn" onclick="doPay(${id}, '${kind}')" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Send Payment Prompt</button>
     <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
@@ -870,7 +924,6 @@ window.onSasaChanTypeChange = () => {
   else { list = cat.wallet || []; lbl.textContent = 'Wallet' }
   sel.innerHTML = list.map(ch => `<option value="${esc(ch.code)}">${esc(ch.name)}</option>`).join('') || '<option value="">— none —</option>'
   if (bankWrap) bankWrap.classList.toggle('hidden', type !== 'bank')
-  const nm = $('spAcctName'); if (nm) nm.textContent = ''
 }
 
 // Verify a bank/mobile account holder name before paying it.
@@ -883,6 +936,27 @@ window.doValidateCheckoutAccount = async () => {
     const { data } = await api.post('/sasapay/validate-account', { channel_code: code, account_number: acc })
     if (nm) { nm.className = 'text-xs text-emerald-700 mt-1'; nm.textContent = data.account_name ? ('✓ ' + data.account_name) : '✓ Account verified' }
   } catch (err) { if (nm) { nm.className = 'text-xs text-red-600 mt-1'; nm.textContent = err.response?.data?.error || 'Could not verify account.' } }
+}
+
+// Issue 3: render an explicit, persistent state alert inside the payment modal.
+// state = 'success' | 'failed' | 'info'. On success we auto-dismiss the modal
+// after a brief delay so the operator clearly sees the confirmation first.
+window.payStateAlert = (stateName, msg, receipt) => {
+  const box = $('payStatus'); if (!box) return
+  if (stateName === 'success') {
+    box.innerHTML = `<div class="bg-emerald-50 border border-emerald-300 rounded-lg p-3 mb-3 flex items-center gap-2">
+        <i class="fas fa-circle-check text-emerald-600 text-lg"></i>
+        <div><div class="text-sm font-semibold text-emerald-800">Paid Successfully</div>
+        ${receipt ? `<div class="text-xs text-emerald-700">Receipt: ${esc(receipt)}</div>` : ''}
+        <div class="text-[11px] text-emerald-600 mt-0.5">Closing…</div></div></div>`
+  } else if (stateName === 'failed') {
+    box.innerHTML = `<div class="bg-red-50 border border-red-300 rounded-lg p-3 mb-3 flex items-center gap-2">
+        <i class="fas fa-circle-xmark text-red-600 text-lg"></i>
+        <div><div class="text-sm font-semibold text-red-800">Payment Failed</div>
+        <div class="text-xs text-red-700">${esc(msg || 'The payment could not be completed.')}</div></div></div>`
+  } else {
+    box.innerHTML = `<div class="bg-slate-50 border border-slate-200 rounded-lg p-2 text-xs text-slate-600 mb-3">${esc(msg || '')}</div>`
+  }
 }
 
 window.doPay = async (id, kind) => {
@@ -900,17 +974,15 @@ window.doPay = async (id, kind) => {
   }
 
   // Inject SasaPay channel routing (mobile / bank / wallet) using the new API shape.
+  // Issue 4 fix: bank payments route via NetworkCode + the customer's phone number
+  // (prompt delivered to the phone) — no bank account number is required or sent.
   if (method === 'sasapay') {
     const type = $('spChanType')?.value || 'mobile'
     const code = $('spChannelCode')?.value || ''
     payload.channel_code = code
-    if (type === 'bank') {
-      const accNum = $('spAccNum')?.value
-      if (!code || !accNum) {
-        $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Please select a bank and enter your account number.</div>`;
-        return;
-      }
-      payload.account_number = accNum
+    if (type === 'bank' && !code) {
+      $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">Please select your bank.</div>`;
+      return;
     }
   }
 
@@ -937,8 +1009,13 @@ window.doPay = async (id, kind) => {
       tries++
       try {
         const { data: cd } = await api.post(confirmEndpoint, { checkout_request_id: data.checkout_request_id })
-        if (cd.status === 'success') { closeModal(); toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt); state.route = 'contracts'; renderApp(); return }
-        else if (cd.status === 'failed') { $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(cd.result_desc || 'Payment failed')}</div>`; btn.disabled = false; btn.classList.remove('opacity-50'); return }
+        if (cd.status === 'success') {
+          payStateAlert('success', null, cd.mpesa_receipt)
+          toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
+          setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 1800)
+          return
+        }
+        else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); btn.disabled = false; btn.classList.remove('opacity-50'); return }
       } catch (e) {}
       if (tries < 20) setTimeout(poll, 3000)
       else { $('payStatus').innerHTML = '<div class="text-xs text-amber-600 mb-3">Timed out waiting. Check Contracts later.</div>'; btn.disabled = false; btn.classList.remove('opacity-50') }
@@ -964,8 +1041,13 @@ window.doSasaOtp = async (checkoutId, id, kind) => {
       tries++
       try {
         const { data: cd } = await api.post('/sasapay/confirm', { checkout_request_id: checkoutId })
-        if (cd.status === 'success') { closeModal(); toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt); state.route = 'contracts'; renderApp(); return }
-        else if (cd.status === 'failed') { $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(cd.result_desc || 'Payment failed')}</div>`; return }
+        if (cd.status === 'success') {
+          payStateAlert('success', null, cd.mpesa_receipt)
+          toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
+          setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 1800)
+          return
+        }
+        else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); return }
       } catch (e) {}
       if (tries < 20) setTimeout(poll, 3000)
       else $('payStatus').innerHTML = '<div class="text-xs text-amber-600 mb-3">Timed out waiting. Check Contracts later.</div>'
@@ -2416,16 +2498,18 @@ function modeRadios(current, prefix, changeFn, disabled) {
 // Product selection chips + add-new inline form. cfg is _feeCfg or _mkCfg.
 function productPicker(cfg, ns, canEdit) {
   const selected = new Set((cfg.product_ids || []).map(Number))
+  // Issue 5: inventory list rows + their metadata must align to the far-left
+  // edge of the layout grid (justify-start / text-left, no residual centering).
   const options = _inventory.map(p =>
-    `<label class="flex items-center gap-2 text-sm py-1 ${canEdit ? 'cursor-pointer' : 'opacity-70'}">
+    `<label class="flex items-center justify-start gap-2 text-sm py-1 text-left w-full ${canEdit ? 'cursor-pointer' : 'opacity-70'}">
       <input type="checkbox" value="${p.id}" ${selected.has(Number(p.id)) ? 'checked' : ''} ${canEdit ? '' : 'disabled'} onchange="togglePicked('${ns}',${p.id},this.checked)">
-      <span>${esc(p.name)} <span class="text-slate-400 text-xs">(${esc(p.sku || '')}${p.category ? ' · ' + esc(p.category) : ''})</span></span>
-    </label>`).join('') || '<p class="text-xs text-slate-400 py-2">No products in inventory yet.</p>'
+      <span class="text-left">${esc(p.name)} <span class="text-slate-400 text-xs">(${esc(p.sku || '')}${p.category ? ' · ' + esc(p.category) : ''})</span></span>
+    </label>`).join('') || '<p class="text-xs text-slate-400 py-2 text-left">No products in inventory yet.</p>'
   return `
-    <div class="mt-4 border-t border-slate-100 pt-4">
-      <label class="field-label">Apply to products</label>
-      <p class="text-[11px] text-slate-500 mb-2">Tick the inventory products this applies to. Leave all unticked to apply to <b>every</b> product.</p>
-      <div class="max-h-48 overflow-y-auto border border-slate-200 rounded-lg p-3 bg-slate-50">${options}</div>
+    <div class="mt-4 border-t border-slate-100 pt-4 text-left">
+      <label class="field-label text-left">Apply to products</label>
+      <p class="text-[11px] text-slate-500 mb-2 text-left">Tick the inventory products this applies to. Leave all unticked to apply to <b>every</b> product.</p>
+      <div class="max-h-48 overflow-y-auto border border-slate-200 rounded-lg p-3 bg-slate-50 text-left flex flex-col items-start">${options}</div>
       ${canEdit ? `<button type="button" onclick="toggleQuickProduct('${ns}')" class="btn mt-3 bg-slate-800 text-white px-4 py-2 rounded-lg text-xs"><i class="fas fa-plus mr-1"></i>Add new product to inventory</button>` : ''}
       <div id="quickProduct_${ns}" class="hidden mt-3 border border-dashed border-slate-300 rounded-lg p-3 bg-white">
         <div class="grid grid-cols-2 gap-3">

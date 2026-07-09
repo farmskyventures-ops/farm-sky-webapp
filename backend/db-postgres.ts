@@ -132,13 +132,25 @@ export class PostgresD1 implements D1Like {
 }
 
 export async function openDatabase(connectionString: string): Promise<{ d1: PostgresD1; raw: Pool }> {
+  // Issue 7 (security hardening): bound the connection pool and apply
+  // conservative timeouts so a slow/hostile query cannot exhaust connections
+  // or hang a worker indefinitely. A statement_timeout caps runaway queries.
+  const requireSsl = process.env.PGSSLMODE === 'require' || process.env.DATABASE_SSL === 'require'
   const config: PoolConfig = {
     connectionString,
-    ssl: process.env.PGSSLMODE === 'require' || process.env.DATABASE_SSL === 'require'
-      ? { rejectUnauthorized: false }
-      : undefined
+    ssl: requireSsl ? { rejectUnauthorized: false } : undefined,
+    max: Number(process.env.PG_POOL_MAX || 10),
+    idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30_000),
+    connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS || 10_000),
+    statement_timeout: Number(process.env.PG_STATEMENT_TIMEOUT_MS || 20_000),
+    query_timeout: Number(process.env.PG_QUERY_TIMEOUT_MS || 20_000),
+    application_name: 'farmsky'
   }
   const raw = new Pool(config)
+  // Prevent an idle-client connection error from crashing the whole process.
+  raw.on('error', (err) => {
+    console.error('[db] idle client error (recovered):', err?.message || err)
+  })
   await raw.query('SELECT 1')
   return { d1: new PostgresD1(raw), raw }
 }

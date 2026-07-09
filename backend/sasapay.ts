@@ -257,9 +257,12 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
     TransactionDesc: String(opts.description || 'Farmsky payment').slice(0, 20),
     CallBackURL: callbackUrl
   }
-  if (ch?.type === 'bank' && opts.accountNumber) {
-    body.BillBankAccountNumber = opts.accountNumber
-  }
+  // NOTE (Issue 4 fix): The SasaPay C2B request-payment endpoint does NOT accept a
+  // BillBankAccountNumber field. Bank channels are routed purely via the NetworkCode
+  // and the customer's PhoneNumber (STK / Pesalink prompt is delivered to the phone).
+  // Sending the undocumented field caused SasaPay to drop the bank payload, which is
+  // why bank-channel transactions were failing to authenticate / complete. We deliberately
+  // do NOT attach opts.accountNumber to the outbound body.
 
   const url = `${baseUrl(env)}/api/v1/payments/request-payment/`
   let res: Response
