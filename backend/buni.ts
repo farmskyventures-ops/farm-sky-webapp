@@ -12,8 +12,14 @@ export type BuniEnv = {
 const SANDBOX_BASE = 'https://uat.buni.kcbgroup.com'
 const PROD_BASE = 'https://api.buni.kcbgroup.com'
 
+// Production is the default; only use the UAT/sandbox host when explicitly
+// opted in via BUNI_ENV=sandbox|development|test.
+function isSandbox(envValue?: string): boolean {
+  const v = String(envValue || '').trim().toLowerCase()
+  return v === 'sandbox' || v === 'development' || v === 'dev' || v === 'test' || v === 'uat'
+}
 function baseUrl(env: BuniEnv): string {
-  return env.BUNI_ENV === 'production' ? PROD_BASE : SANDBOX_BASE
+  return isSandbox(env.BUNI_ENV) ? SANDBOX_BASE : PROD_BASE
 }
 
 export function buniConfigured(env: BuniEnv): boolean {

@@ -63,8 +63,17 @@ export function mpesaConfigured(env: MpesaEnv): boolean {
   return !!(env.MPESA_CONSUMER_KEY && env.MPESA_CONSUMER_SECRET && env.MPESA_SHORTCODE && env.MPESA_PASSKEY)
 }
 
+// Production is the default. Only fall back to the sandbox host when the
+// operator has EXPLICITLY opted in via MPESA_ENV=sandbox|development|test.
+// On Render (where live credentials are configured) this means the platform
+// talks to the live Daraja API without needing MPESA_ENV to be set at all.
+function isSandbox(envValue?: string): boolean {
+  const v = String(envValue || '').trim().toLowerCase()
+  return v === 'sandbox' || v === 'development' || v === 'dev' || v === 'test'
+}
+
 function baseUrl(env: MpesaEnv): string {
-  return env.MPESA_ENV === 'production' ? PROD_BASE : SANDBOX_BASE
+  return isSandbox(env.MPESA_ENV) ? SANDBOX_BASE : PROD_BASE
 }
 
 function timestamp(): string {

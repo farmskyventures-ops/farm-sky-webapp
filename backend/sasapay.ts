@@ -151,10 +151,21 @@ export type SasaPayB2COpts = {
 }
 
 // ---------- URL helpers ------------------------------------------------------
+// Production is the default. Only use the sandbox host when the operator has
+// EXPLICITLY opted in via SASAPAY_ENV=sandbox|development|test. On Render (where
+// the live SasaPay credentials are configured) the platform therefore talks to
+// the live SasaPay API without needing SASAPAY_ENV to be set at all.
+export function sasapayIsSandbox(env: SasaPayEnv): boolean {
+  const v = String(env.SASAPAY_ENV || '').trim().toLowerCase()
+  return v === 'sandbox' || v === 'development' || v === 'dev' || v === 'test'
+}
+export function sasapayMode(env: SasaPayEnv): string {
+  return sasapayIsSandbox(env) ? 'sandbox' : 'production'
+}
 function baseUrl(env: SasaPayEnv) {
-  return env.SASAPAY_ENV === 'production'
-    ? 'https://api.sasapay.app'
-    : 'https://sandbox.sasapay.app'
+  return sasapayIsSandbox(env)
+    ? 'https://sandbox.sasapay.app'
+    : 'https://api.sasapay.app'
 }
 
 function clientId(env: SasaPayEnv): string | undefined {

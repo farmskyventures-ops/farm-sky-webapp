@@ -71,10 +71,14 @@ const PORT = Number(process.env.PORT || 8080)
 serve({ fetch: root.fetch, port: PORT }, (info) => {
   console.log(`Farmsky server running on http://0.0.0.0:${info.port}`)
   
+  // Both gateways default to PRODUCTION unless *_ENV is explicitly a sandbox value.
+  const sandboxValues = ['sandbox', 'development', 'dev', 'test', 'uat']
+  const modeOf = (v?: string) => sandboxValues.includes(String(v || '').trim().toLowerCase()) ? 'sandbox' : 'production'
+
   // Status check for M-Pesa
   console.log(
     process.env.MPESA_CONSUMER_KEY
-      ? 'M-Pesa: LIVE credentials detected (' + (process.env.MPESA_ENV || 'sandbox') + ')'
+      ? 'M-Pesa: LIVE credentials detected (' + modeOf(process.env.MPESA_ENV) + ')'
       : 'M-Pesa: SIMULATION mode (no Daraja credentials set).'
   )
 
@@ -84,7 +88,7 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
   const sasapayMerchant = process.env.SASAPAY_MERCHANT_CODE
   console.log(
     (sasapayId && sasapaySecret && sasapayMerchant)
-      ? 'SasaPay: LIVE credentials detected (' + (process.env.SASAPAY_ENV || 'sandbox') + ')'
+      ? 'SasaPay: LIVE credentials detected (' + modeOf(process.env.SASAPAY_ENV) + ')'
       : `SasaPay: SIMULATION mode (missing ${[!sasapayId && 'CLIENT_ID', !sasapaySecret && 'CLIENT_SECRET', !sasapayMerchant && 'MERCHANT_CODE'].filter(Boolean).join(', ') || 'credentials'}).`
   )
 })

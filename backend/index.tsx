@@ -6,7 +6,7 @@ import { stkPush, stkQuery, mpesaConfigured, normalizePhone } from './mpesa'
 import {
   sasapayStkPush, sasapayQuery, sasapayConfigured,
   sasapayProcessPayment, sasapayB2C, sasapayValidateAccount, sasapayBalance,
-  verifySasapaySignature, isTrustedSasapayIp,
+  verifySasapaySignature, isTrustedSasapayIp, sasapayMode,
   SASAPAY_CHANNELS, channelByCode, accountTypeForChannel,
   normalizePhone as sasapayNormalizePhone
 } from './sasapay'
@@ -1366,7 +1366,8 @@ app.post('/api/mpesa/callback', async (c) => {
   }
 })
 app.get('/api/mpesa/status', requireAuth, (c) => {
-  return c.json({ live: mpesaConfigured(c.env), mode: mpesaConfigured(c.env) ? (c.env.MPESA_ENV || 'sandbox') : 'simulation' })
+  const mpesaMode = ['sandbox', 'development', 'dev', 'test'].includes(String(c.env.MPESA_ENV || '').trim().toLowerCase()) ? 'sandbox' : 'production'
+  return c.json({ live: mpesaConfigured(c.env), mode: mpesaConfigured(c.env) ? mpesaMode : 'simulation' })
 })
 
 // ----------------------------------------------------------------------------
@@ -1381,7 +1382,7 @@ app.get('/api/sasapay/channels', (c) => {
     mobile: SASAPAY_CHANNELS.filter((x) => x.type === 'mobile'),
     wallet: SASAPAY_CHANNELS.filter((x) => x.type === 'wallet'),
     live: sasapayConfigured(c.env),
-    mode: sasapayConfigured(c.env) ? (c.env.SASAPAY_ENV || 'sandbox') : 'simulation'
+    mode: sasapayConfigured(c.env) ? sasapayMode(c.env) : 'simulation'
   })
 })
 
@@ -1596,7 +1597,7 @@ app.get('/api/sasapay/balance', requireAuth, requirePermission('manage_wallets')
 })
 
 app.get('/api/sasapay/status', requireAuth, (c) => {
-  return c.json({ live: sasapayConfigured(c.env), mode: sasapayConfigured(c.env) ? (c.env.SASAPAY_ENV || 'sandbox') : 'simulation' })
+  return c.json({ live: sasapayConfigured(c.env), mode: sasapayConfigured(c.env) ? sasapayMode(c.env) : 'simulation' })
 })
 
 // ----------------------------------------------------------------------------
