@@ -1,5 +1,5 @@
 // =====================================================================
-// SasaPay payment integration — PRODUCTION READY
+// SasaPay payment integration — PRODUCTION READY COMPLETE COMPONENT
 // Docs (as supplied by SasaPay):
 //   Auth              : GET  /api/v1/auth/token/?grant_type=client_credentials
 //   C2B (collect)     : POST /api/v1/payments/request-payment/
@@ -78,8 +78,6 @@ export function channelByCode(code: string): SasaPayChannel | undefined {
   return SASAPAY_CHANNELS.find((ch) => ch.code === String(code))
 }
 
-// account_type used by the account-validation endpoint:
-//   0 = SasaPay, 1 = Mobile Money, 4 = Bank
 export function accountTypeForChannel(code: string): number {
   const ch = channelByCode(code)
   if (!ch) return 1
@@ -88,7 +86,6 @@ export function accountTypeForChannel(code: string): number {
   return 1
 }
 
-// Trusted SasaPay callback source IPs (see docs: Callback Security).
 export const SASAPAY_CALLBACK_IPS = [
   '47.129.43.141', '13.229.247.179', '13.215.155.141', '13.214.60.231',
   '54.169.74.198', '18.142.226.87', '47.129.243.116', '13.250.110.3',
@@ -97,13 +94,9 @@ export const SASAPAY_CALLBACK_IPS = [
 
 export function isTrustedSasapayIp(ip?: string | null): boolean {
   if (!ip) return false
-  // X-Forwarded-For may contain a comma-separated list; check each token.
   return String(ip).split(',').map((s) => s.trim()).some((t) => SASAPAY_CALLBACK_IPS.includes(t))
 }
 
-// ---------------------------------------------------------------------------
-// Result shapes
-// ---------------------------------------------------------------------------
 export type SasaPayResult = {
   simulated: boolean
   success: boolean
@@ -112,7 +105,7 @@ export type SasaPayResult = {
   transaction_reference?: string
   payment_gateway?: string
   customer_message?: string
-  needs_otp?: boolean          // true for SasaPay wallet channel ("0")
+  needs_otp?: boolean
   raw?: any
   error?: string
 }
@@ -132,48 +125,45 @@ export type SasaPayPayoutResult = {
 export type SasaPayStkOpts = {
   phone: string
   amount: number
-  account: string              // AccountReference / merchant transaction id
+  account: string
   description: string
-  networkCode?: string         // channel code, e.g. "0", "63902", bank code "01"
+  networkCode?: string
   channel?: 'MOBILE_MONEY' | 'BANK' | 'WALLET'
-  channelCode?: string         // alias for networkCode
-  accountNumber?: string       // bank account number when paying a bank
-  callbackUrl?: string         // override the default payin callback
+  channelCode?: string
+  accountNumber?: string
+  callbackUrl?: string
 }
 
 export type SasaPayB2COpts = {
   amount: number
-  receiverNumber: string       // mobile (2547…) or bank account number
-  channel: string              // channel code: "0", "63902", "01" …
+  receiverNumber: string
+  channel: string
   reason: string
-  reference: string            // MerchantTransactionReference (unique)
+  reference: string
   callbackUrl?: string
 }
 
-// ---------- URL helpers ------------------------------------------------------
-// Production is the default. Only use the sandbox host when the operator has
-// EXPLICITLY opted in via SASAPAY_ENV=sandbox|development|test. On Render (where
-// the live SasaPay credentials are configured) the platform therefore talks to
-// the live SasaPay API without needing SASAPAY_ENV to be set at all.
 export function sasapayIsSandbox(env: SasaPayEnv): boolean {
   const v = String(env.SASAPAY_ENV || '').trim().toLowerCase()
   return v === 'sandbox' || v === 'development' || v === 'dev' || v === 'test'
 }
+
 export function sasapayMode(env: SasaPayEnv): string {
   return sasapayIsSandbox(env) ? 'sandbox' : 'production'
 }
+
 function baseUrl(env: SasaPayEnv) {
-  return sasapayIsSandbox(env)
-    ? 'https://sandbox.sasapay.app'
-    : 'https://api.sasapay.app'
+  return sasapayIsSandbox(env) ? 'https://sandbox.sasapay.app' : 'https://api.sasapay.app'
 }
 
 function clientId(env: SasaPayEnv): string | undefined {
   return (env.SASAPAY_CLIENT_ID || env.SASAPAY_CONSUMER_KEY || '').trim() || undefined
 }
+
 function clientSecret(env: SasaPayEnv): string | undefined {
   return (env.SASAPAY_CLIENT_SECRET || env.SASAPAY_CONSUMER_SECRET || '').trim() || undefined
 }
+
 export function merchantCode(env: SasaPayEnv): string | undefined {
   return (env.SASAPAY_MERCHANT_CODE || '').trim() || undefined
 }
@@ -198,7 +188,6 @@ async function readBody(res: Response): Promise<{ json: any; text: string }> {
   return { json, text }
 }
 
-// ---------- Auth (with per-process token cache) -----------------------------
 type TokenCache = { token: string; expiresAt: number }
 const _tokenCache = new Map<string, TokenCache>()
 
@@ -268,12 +257,6 @@ export async function sasapayStkPush(env: SasaPayEnv, opts: SasaPayStkOpts): Pro
     TransactionDesc: String(opts.description || 'Farmsky payment').slice(0, 20),
     CallBackURL: callbackUrl
   }
-  // NOTE (Issue 4 fix): The SasaPay C2B request-payment endpoint does NOT accept a
-  // BillBankAccountNumber field. Bank channels are routed purely via the NetworkCode
-  // and the customer's PhoneNumber (STK / Pesalink prompt is delivered to the phone).
-  // Sending the undocumented field caused SasaPay to drop the bank payload, which is
-  // why bank-channel transactions were failing to authenticate / complete. We deliberately
-  // do NOT attach opts.accountNumber to the outbound body.
 
   const url = `${baseUrl(env)}/api/v1/payments/request-payment/`
   let res: Response
@@ -472,18 +455,6 @@ export async function sasapayBalance(env: SasaPayEnv): Promise<SasaPayBalance> {
 }
 
 // ---------- Transaction status query ----------------------------------------
-// Normalizes the SasaPay status-query response into a single, unambiguous shape:
-//   { paid: boolean, pending: boolean, failed: boolean,
-//     ResultCode, TransactionCode, amount_paid, ResultDesc }
-//
-// IMPORTANT (root-cause of the "stuck PENDING / never settles" bug):
-// The SasaPay /transactions/status-query/ endpoint's top-level `status` field
-// only means "the QUERY request was accepted" — it does NOT mean the customer
-// paid. The authoritative payment signal is the `Paid` boolean (plus
-// `AmountPaid`). The previous implementation treated `status === true` as
-// success, which either (a) never fired because the real payload nests the data
-// differently, or (b) falsely reported success. We now key strictly off `Paid`.
-// Docs: https://developer.sasapay.app/docs/apis/transaction-status
 export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, callbackUrl?: string): Promise<any> {
   if (!sasapayConfigured(env) || String(checkoutRequestId).includes('SIM')) {
     return { paid: true, pending: false, failed: false, ResultCode: '0', ResultDesc: 'Simulated success', status: true, TransactionCode: 'SP' + Date.now().toString().slice(-7) }
@@ -491,8 +462,14 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
   try {
     const token = await getToken(env)
     const url = `${baseUrl(env)}/api/v1/transactions/status-query/`
-    const body: Record<string, any> = { MerchantCode: merchantCode(env), CheckoutRequestId: checkoutRequestId }
-    if (callbackUrl) body.CallbackUrl = callbackUrl
+    
+    const resolvedCallbackUrl = callbackUrl || env.SASAPAY_CALLBACK_URL || '';
+    
+    const body: Record<string, any> = { 
+      MerchantCode: merchantCode(env), 
+      CheckoutRequestId: checkoutRequestId,
+      CallbackUrl: resolvedCallbackUrl 
+    }
 
     const res = await fetch(url, {
       method: 'POST', redirect: 'follow',
@@ -501,21 +478,14 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
     })
 
     const { json, text } = await readBody(res)
-    // Runtime log for Render — helps confirm the exact live payload shape.
     console.log('SasaPay status-query payload:', JSON.stringify(json) || text?.slice(0, 300))
 
     if (!json) {
       return { paid: false, pending: true, failed: false, ResultCode: null, ResultDesc: 'Transaction still processing', status: false }
     }
 
-    // The query request itself may have been rejected (bad token, unknown ref…).
-    // Only treat that as a hard error when the HTTP call failed AND we have no
-    // usable body fields to inspect.
     const data = json.data || json
 
-    // ---- Authoritative payment signals ---------------------------------------
-    // `Paid` is the definitive flag. Fall back to a handful of alternative field
-    // names some SasaPay environments use.
     const paidFlag =
       data.Paid === true || data.paid === true ||
       String(data.PaymentStatus || data.payment_status || data.TransactionStatus || '').toLowerCase() === 'paid' ||
@@ -527,7 +497,6 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
 
     const amountPaid = Number(data.AmountPaid ?? data.amount_paid ?? data.TransactionAmount ?? 0)
 
-    // Explicit failure signals from SasaPay (payment cancelled / insufficient…).
     const rawStatusStr = String(data.PaymentStatus || data.TransactionStatus || data.payment_status || '').toLowerCase()
     const failedFlag =
       data.Paid === false && (rawStatusStr === 'failed' || rawStatusStr === 'cancelled' || rawStatusStr === 'canceled') ||
@@ -551,8 +520,6 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
       return { ...json, paid: false, pending: false, failed: true, status: false, ResultCode: '1', ResultDesc: desc || 'Payment not completed' }
     }
 
-    // Otherwise the payment is still in flight (customer hasn't entered PIN/OTP,
-    // or SasaPay is still settling). Keep polling.
     return { ...json, paid: false, pending: true, failed: false, status: false, ResultCode: null, ResultDesc: desc || 'Transaction still processing' }
   } catch (err: any) {
     console.error('SasaPay status-query exception:', err?.message || err)
