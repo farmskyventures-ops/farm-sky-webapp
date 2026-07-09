@@ -1337,7 +1337,7 @@ app.post('/api/mpesa/confirm', requireAuth, async (c) => {
     const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
     const res = await applyPayment(c, contract, intent.amount, receipt, 'mpesa', intent.phone)
     await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run()
-    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, ...res })
+    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, amount_paid: res?.amount_paid, outstanding: res?.outstanding, contract_status: res?.status })
   }
   return c.json({ ok: false, status: 'pending' })
 })
@@ -1486,23 +1486,33 @@ app.post('/api/sasapay/confirm', requireAuth, async (c) => {
   if (!sasapayConfigured(c.env) || String(checkout_request_id).includes('SIM')) {
     success = true; receipt = 'SP' + Math.random().toString(36).slice(2, 9).toUpperCase()
   } else {
+    // sasapayQuery now returns a normalized { paid, pending, failed } shape.
+    // `paid` is the ONLY signal that means the customer actually paid.
     const q = await sasapayQuery(c.env, checkout_request_id)
-    if (q?.pending === true) return c.json({ ok: false, status: 'pending' })
-    const code = q.ResultCode ?? q.status_code
-    if (code === '0' || code === 0 || q.status === true) {
-      success = true; receipt = q.TransactionCode || q.TransactionID || ('SPL' + Date.now().toString().slice(-7))
-    } else if (code !== undefined && code !== null && code !== '' && code !== 'ERR') {
+    if (q?.paid === true) {
+      success = true
+      receipt = q.TransactionCode || q.TransactionID || ('SPL' + Date.now().toString().slice(-7))
+    } else if (q?.failed === true) {
       const rawDesc = String(q.ResultDesc || q.message || 'Payment not completed')
       const safeDesc = /</.test(rawDesc) ? 'Payment not completed' : rawDesc
+      await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(safeDesc.slice(0, 300), checkout_request_id).run()
       return c.json({ ok: false, status: 'failed', result_desc: safeDesc })
-    } else return c.json({ ok: false, status: 'pending' })
+    } else {
+      return c.json({ ok: false, status: 'pending' })
+    }
   }
 
   if (success) {
+    // Idempotency guard: re-read the intent to make sure a concurrent callback
+    // (or a second poll) didn't already settle it — never double-apply funds.
+    const fresh = await c.env.DB.prepare(`SELECT status, mpesa_receipt FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
+    if (fresh?.status === 'success') {
+      return c.json({ ok: true, status: 'success', mpesa_receipt: fresh.mpesa_receipt })
+    }
     const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
     const res = await applyPayment(c, contract, intent.amount, receipt, 'sasapay', intent.phone)
     await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, transaction_code=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(receipt, receipt, checkout_request_id).run()
-    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, ...res })
+    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, amount_paid: res?.amount_paid, outstanding: res?.outstanding, contract_status: res?.status })
   }
   return c.json({ ok: false, status: 'pending' })
 })
@@ -1662,11 +1672,10 @@ app.post('/api/admin/payments/recover', requireAuth, requirePermission('manage_w
     } else {
       const q = await sasapayQuery(c.env, checkout)
       gatewayDesc = String(q?.ResultDesc || q?.message || '')
-      const code = q?.ResultCode ?? q?.status_code
-      if (code === '0' || code === 0 || q?.status === true) {
+      if (q?.paid === true) {
         success = true
         receipt = q.TransactionCode || q.TransactionID || ('SPL' + Date.now().toString().slice(-7))
-      } else if (q?.pending === true || code === undefined || code === null || code === '') {
+      } else if (q?.pending === true) {
         return c.json({ ok: false, status: 'pending', result_desc: gatewayDesc || 'Gateway still processing' })
       } else {
         // Definitive failure reported by the gateway.
@@ -1686,7 +1695,7 @@ app.post('/api/admin/payments/recover', requireAuth, requirePermission('manage_w
       .bind(receipt, receipt, (gatewayDesc || (forced ? 'Manual admin override' : 'Recovered')).slice(0, 300), checkout).run()
     await audit(c, c.get('user').id, 'payment_recover', 'sasapay',
       `${forced ? 'FORCED' : 'query-settled'} ${checkout} -> SUCCESS (KES ${intent.amount}, receipt ${receipt})`)
-    return c.json({ ok: true, status: 'success', forced, mpesa_receipt: receipt, ...(res || {}) })
+    return c.json({ ok: true, status: 'success', forced, mpesa_receipt: receipt, amount_paid: res?.amount_paid, outstanding: res?.outstanding, contract_status: res?.status })
   }
   return c.json({ ok: false, status: 'pending' })
 })
@@ -1734,7 +1743,7 @@ app.post('/api/buni/confirm', requireAuth, async (c) => {
     const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
     const res = await applyPayment(c, contract, intent.amount, receipt, 'buni', intent.phone)
     await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=? WHERE checkout_request_id=?`).bind(receipt, checkout_request_id).run()
-    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, ...res })
+    return c.json({ ok: true, status: 'success', mpesa_receipt: receipt, amount_paid: res?.amount_paid, outstanding: res?.outstanding, contract_status: res?.status })
   }
   return c.json({ ok: false, status: 'pending' })
 })

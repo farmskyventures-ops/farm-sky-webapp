@@ -1065,8 +1065,8 @@ window.doPay = async (id, kind) => {
         if (st === 401 || st === 403 || !e?.response) { reEnable(); return }
       }
       if (!$('payStatus') || !state.user) return
-      if (tries < 20) setTimeout(poll, 3000)
-      else { setHTML('payStatus', '<div class="text-xs text-amber-600 mb-3">Timed out waiting. Check Contracts later.</div>'); reEnable() }
+      if (tries < 40) setTimeout(poll, 3000)
+      else { setHTML('payStatus', '<div class="bg-amber-50 border border-amber-200 rounded-lg p-2 text-xs text-amber-700 mb-3">Still waiting for confirmation. If you completed the payment, it will settle automatically once confirmed — check your Purchases shortly. An admin can also recover it from Wallets &rsaquo; Recover pending payments.</div>'); reEnable() }
     }
     setTimeout(poll, data.simulated ? 1200 : 4000)
   } catch (err) {
@@ -1102,8 +1102,8 @@ window.doSasaOtp = async (checkoutId, id, kind) => {
         if (st === 401 || st === 403 || !e?.response) return
       }
       if (!$('payStatus') || !state.user) return
-      if (tries < 20) setTimeout(poll, 3000)
-      else setHTML('payStatus', '<div class="text-xs text-amber-600 mb-3">Timed out waiting. Check Contracts later.</div>')
+      if (tries < 40) setTimeout(poll, 3000)
+      else setHTML('payStatus', '<div class="bg-amber-50 border border-amber-200 rounded-lg p-2 text-xs text-amber-700 mb-3">Still confirming your wallet payment. It will settle automatically once SasaPay confirms — check your Purchases shortly.</div>')
     }
     setTimeout(poll, 1500)
   } catch (err) {
@@ -1546,8 +1546,10 @@ async function viewWallets() {
     <button onclick="batchPayoutModal('all_agents')" class="btn bg-white border px-4 py-2 rounded-lg text-sm"><i class="fas fa-money-check-dollar mr-1 text-teal-600"></i>Batch payout to all agents</button>
     <button onclick="directPayModal()" class="btn bg-white border px-4 py-2 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1 text-teal-600"></i>Direct payment</button>
     <button onclick="checkSasaBalance()" class="btn bg-white border px-4 py-2 rounded-lg text-sm"><i class="fas fa-scale-balanced mr-1 text-teal-600"></i>Confirm SasaPay balance</button>
+    <button onclick="loadPendingPayments()" class="btn bg-white border px-4 py-2 rounded-lg text-sm"><i class="fas fa-rotate mr-1 text-amber-600"></i>Recover pending payments</button>
   </div>
   <div id="sasaBalanceBox"></div>
+  <div id="pendingPaymentsBox"></div>
   <div class="card table-card mb-6">
     <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-wallet text-teal-600 mr-2"></i>Wallets</div>
     <table class="w-full text-sm">
@@ -1871,6 +1873,85 @@ window.checkSasaBalance = async () => {
     </div>`
   } catch (err) {
     if (box) box.innerHTML = `<div class="card p-4 mb-4 text-sm text-red-600">${esc(err.response?.data?.error || 'Balance query failed')}</div>`
+  }
+}
+
+// ---------------------------------------------------------------------------
+// PENDING PAYMENT RECOVERY (admin) — Issue 3
+//   Lists payment intents stuck in 'pending' (money may have already reached
+//   the SasaPay merchant wallet but the async callback never settled the
+//   contract). Operators can (a) re-query the gateway to auto-settle if paid,
+//   or (b) force-complete a genuinely paid transaction manually.
+// ---------------------------------------------------------------------------
+window.loadPendingPayments = async () => {
+  const box = $('pendingPaymentsBox')
+  if (!box) return
+  box.innerHTML = `<div class="card p-4 mb-6 text-sm text-slate-500"><i class="fas fa-spinner fa-spin mr-1"></i>Loading pending payments…</div>`
+  try {
+    const { data } = await api.get('/admin/payments/pending')
+    const intents = data.intents || []
+    const rows = intents.map(p => {
+      const cid = esc(p.checkout_request_id)
+      const when = p.created_at ? esc(String(p.created_at).replace('T', ' ').slice(0, 16)) : '—'
+      return `<tr class="border-t border-slate-100" id="pi-row-${cid}">
+        <td class="px-4 py-3">
+          <div class="font-medium">${esc(p.customer_name || '—')}</div>
+          <div class="text-xs text-slate-500">${esc(p.contract_ref || '')} · ${esc(p.channel_name || p.channel_code || '')}</div>
+          <div class="text-[10px] text-slate-400 break-all">${cid}</div>
+        </td>
+        <td class="px-4 py-3 text-right font-medium text-teal-700">${fmt(p.amount)}</td>
+        <td class="px-4 py-3 text-xs text-slate-500">${when}</td>
+        <td class="px-4 py-3">
+          <span class="text-amber-600 bg-amber-50 px-2 py-1 rounded text-xs font-semibold">PENDING</span>
+        </td>
+        <td class="px-4 py-3 text-right whitespace-nowrap">
+          <button onclick="recoverPayment('${cid}','query')" class="btn bg-teal-600 hover:bg-teal-700 text-white text-xs px-3 py-1.5 rounded mr-1"><i class="fas fa-rotate mr-1"></i>Query gateway</button>
+          <button onclick="recoverPayment('${cid}','force')" class="btn bg-slate-800 hover:bg-slate-900 text-white text-xs px-3 py-1.5 rounded"><i class="fas fa-check-double mr-1"></i>Force complete</button>
+        </td>
+      </tr>`
+    }).join('')
+    box.innerHTML = `<div class="card table-card mb-6">
+      <div class="px-4 py-3 border-b font-semibold text-slate-700 flex items-center justify-between">
+        <span><i class="fas fa-triangle-exclamation text-amber-600 mr-2"></i>Pending payments (${intents.length})</span>
+        <button onclick="loadPendingPayments()" class="text-xs text-teal-600 hover:underline"><i class="fas fa-arrows-rotate mr-1"></i>Refresh</button>
+      </div>
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+          <th class="text-left px-4 py-3">Customer / Ref</th>
+          <th class="text-right px-4 py-3">Amount</th>
+          <th class="text-left px-4 py-3">Created</th>
+          <th class="text-left px-4 py-3">Status</th>
+          <th></th>
+        </tr></thead>
+        <tbody>${rows || '<tr><td colspan="5" class="text-center py-8 text-emerald-600"><i class="fas fa-circle-check mr-1"></i>No pending payments — all settled.</td></tr>'}</tbody>
+      </table>
+    </div>`
+  } catch (err) {
+    box.innerHTML = `<div class="card p-4 mb-6 text-sm text-red-600">${esc(err.response?.data?.error || 'Failed to load pending payments (permission or network).')}</div>`
+  }
+}
+
+window.recoverPayment = async (checkoutId, mode) => {
+  const isForce = mode === 'force'
+  const confirmMsg = isForce
+    ? 'FORCE COMPLETE this payment? Only do this if you have confirmed the funds reached the SasaPay merchant wallet. This will settle the contract and update balances.'
+    : 'Re-query SasaPay for this transaction and settle automatically if it reports as paid?'
+  if (!confirm(confirmMsg)) return
+  const row = $(`pi-row-${checkoutId}`)
+  try {
+    const { data } = await api.post('/admin/payments/recover', { checkout_request_id: checkoutId, mode })
+    if (data.status === 'success') {
+      toast(`Payment settled${data.forced ? ' (forced)' : ''}. Receipt: ${data.mpesa_receipt || '—'}`)
+      if (row) row.remove()
+      setTimeout(loadPendingPayments, 600)
+    } else if (data.status === 'failed') {
+      toast('Gateway reports this payment FAILED: ' + (data.result_desc || 'not completed'), false)
+      setTimeout(loadPendingPayments, 600)
+    } else {
+      toast('Gateway still processing — funds not yet confirmed. Try again shortly or use Force complete if confirmed.', false)
+    }
+  } catch (err) {
+    toast(err.response?.data?.error || 'Recovery failed (permission or network).', false)
   }
 }
 

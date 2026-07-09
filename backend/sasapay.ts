@@ -472,45 +472,91 @@ export async function sasapayBalance(env: SasaPayEnv): Promise<SasaPayBalance> {
 }
 
 // ---------- Transaction status query ----------------------------------------
-// Normalized to safely evaluate downstream and unblock PENDING state anomalies.
+// Normalizes the SasaPay status-query response into a single, unambiguous shape:
+//   { paid: boolean, pending: boolean, failed: boolean,
+//     ResultCode, TransactionCode, amount_paid, ResultDesc }
+//
+// IMPORTANT (root-cause of the "stuck PENDING / never settles" bug):
+// The SasaPay /transactions/status-query/ endpoint's top-level `status` field
+// only means "the QUERY request was accepted" — it does NOT mean the customer
+// paid. The authoritative payment signal is the `Paid` boolean (plus
+// `AmountPaid`). The previous implementation treated `status === true` as
+// success, which either (a) never fired because the real payload nests the data
+// differently, or (b) falsely reported success. We now key strictly off `Paid`.
+// Docs: https://developer.sasapay.app/docs/apis/transaction-status
 export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, callbackUrl?: string): Promise<any> {
   if (!sasapayConfigured(env) || String(checkoutRequestId).includes('SIM')) {
-    return { ResultCode: '0', ResultDesc: 'Simulated success', status: true }
+    return { paid: true, pending: false, failed: false, ResultCode: '0', ResultDesc: 'Simulated success', status: true, TransactionCode: 'SP' + Date.now().toString().slice(-7) }
   }
   try {
     const token = await getToken(env)
     const url = `${baseUrl(env)}/api/v1/transactions/status-query/`
     const body: Record<string, any> = { MerchantCode: merchantCode(env), CheckoutRequestId: checkoutRequestId }
     if (callbackUrl) body.CallbackUrl = callbackUrl
-    
+
     const res = await fetch(url, {
       method: 'POST', redirect: 'follow',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(body)
     })
-    
-    const { json } = await readBody(res)
-    
-    // Explicit runtime tracking inside your Render application logging environment
-    console.log("Raw SasaPay status payload received:", JSON.stringify(json));
 
-    if (json) {
-      // SasaPay properties fallback matrix normalization mapping
-      const code = json.ResultCode ?? json.ResponseCode ?? json.data?.ResultCode ?? json.statusCode;
-      const isSuccess = json.status === true || code === '0' || code === 0;
+    const { json, text } = await readBody(res)
+    // Runtime log for Render — helps confirm the exact live payload shape.
+    console.log('SasaPay status-query payload:', JSON.stringify(json) || text?.slice(0, 300))
 
+    if (!json) {
+      return { paid: false, pending: true, failed: false, ResultCode: null, ResultDesc: 'Transaction still processing', status: false }
+    }
+
+    // The query request itself may have been rejected (bad token, unknown ref…).
+    // Only treat that as a hard error when the HTTP call failed AND we have no
+    // usable body fields to inspect.
+    const data = json.data || json
+
+    // ---- Authoritative payment signals ---------------------------------------
+    // `Paid` is the definitive flag. Fall back to a handful of alternative field
+    // names some SasaPay environments use.
+    const paidFlag =
+      data.Paid === true || data.paid === true ||
+      String(data.PaymentStatus || data.payment_status || data.TransactionStatus || '').toLowerCase() === 'paid' ||
+      String(data.PaymentStatus || data.payment_status || data.TransactionStatus || '').toLowerCase() === 'completed'
+
+    const receipt =
+      data.TransactionCode || data.TransactionID || data.MpesaReceiptNumber ||
+      data.ReceiptNumber || data.CheckoutId || data.CheckoutRequestId || ''
+
+    const amountPaid = Number(data.AmountPaid ?? data.amount_paid ?? data.TransactionAmount ?? 0)
+
+    // Explicit failure signals from SasaPay (payment cancelled / insufficient…).
+    const rawStatusStr = String(data.PaymentStatus || data.TransactionStatus || data.payment_status || '').toLowerCase()
+    const failedFlag =
+      data.Paid === false && (rawStatusStr === 'failed' || rawStatusStr === 'cancelled' || rawStatusStr === 'canceled') ||
+      rawStatusStr === 'failed' || rawStatusStr === 'cancelled' || rawStatusStr === 'canceled' ||
+      String(data.ResultCode ?? '') === '1'
+
+    const desc = data.ResultDesc || data.detail || data.message || json.detail || json.message || ''
+
+    if (paidFlag) {
       return {
         ...json,
-        ResultCode: code !== undefined ? String(code) : undefined,
-        status: isSuccess,
-        pending: !isSuccess && (json.pending || json.data?.status === 'Processing' || res.status === 200)
+        paid: true, pending: false, failed: false,
+        status: true, ResultCode: '0',
+        TransactionCode: String(receipt || ('SPL' + Date.now().toString().slice(-7))),
+        amount_paid: amountPaid,
+        ResultDesc: desc || 'Payment completed'
       }
     }
-    
-    return { pending: true, ResultCode: null, ResultDesc: 'Transaction still processing', status: false }
+
+    if (failedFlag) {
+      return { ...json, paid: false, pending: false, failed: true, status: false, ResultCode: '1', ResultDesc: desc || 'Payment not completed' }
+    }
+
+    // Otherwise the payment is still in flight (customer hasn't entered PIN/OTP,
+    // or SasaPay is still settling). Keep polling.
+    return { ...json, paid: false, pending: true, failed: false, status: false, ResultCode: null, ResultDesc: desc || 'Transaction still processing' }
   } catch (err: any) {
-    console.error("SasaPay Status Query Exception caught on production server instance:", err);
-    return { pending: true, ResultCode: null, ResultDesc: 'Transaction still processing', status: false }
+    console.error('SasaPay status-query exception:', err?.message || err)
+    return { paid: false, pending: true, failed: false, ResultCode: null, ResultDesc: 'Transaction still processing', status: false }
   }
 }
 
