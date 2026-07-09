@@ -4,6 +4,36 @@
 const api = axios.create({ baseURL: '/api', withCredentials: true })
 let state = { user: null, route: 'dashboard', data: {} }
 const $ = (id) => document.getElementById(id)
+// Safely set innerHTML only if the target element still exists (prevents
+// "Cannot set properties of null" crashes when a modal/view was closed while
+// an async task — e.g. a payment poll — was still running).
+const setHTML = (id, html) => { const el = $(id); if (el) { el.innerHTML = html; return true } return false }
+
+// Global auth/network guard. A single expired-session (401) response should
+// send the user back to the login screen ONCE and silently halt the many
+// in-flight polling requests, instead of flooding the console with 401s.
+let _authExpired = false
+api.interceptors.response.use(
+  (resp) => resp,
+  (error) => {
+    const status = error?.response?.status
+    if (status === 401) {
+      // Ignore 401s from the initial /me probe and the login attempt itself.
+      const url = String(error.config?.url || '')
+      const isProbe = url.endsWith('/me') || url.endsWith('/login')
+      if (!isProbe && state.user && !_authExpired) {
+        _authExpired = true
+        state.user = null
+        try { if (typeof stopLive === 'function') stopLive() } catch (_) {}
+        try { closeModal() } catch (_) {}
+        try { toast('Your session has expired. Please sign in again.', false) } catch (_) {}
+        try { renderLogin() } catch (_) {}
+        setTimeout(() => { _authExpired = false }, 1500)
+      }
+    }
+    return Promise.reject(error)
+  }
+)
 const fmt = (n) => 'KES ' + Number(n || 0).toLocaleString()
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]))
 // Friendly labels for equipment payment types
@@ -421,7 +451,15 @@ function authResetVerify(phone, demoOtp) {
 }
 window.renderLogin = renderLogin
 window.fill = (p, pw) => { $('phone').value = p; $('password').value = pw }
-async function logout() { await api.post('/logout'); state.user = null; renderLogin() }
+async function logout() {
+  // Always clear local session + return to login, even if the network request
+  // fails (e.g. connection dropped) — never leave the user stuck logged-in.
+  try { await api.post('/logout') } catch (_) {}
+  try { if (typeof stopLive === 'function') stopLive() } catch (_) {}
+  state.user = null
+  renderLogin()
+}
+window.logout = logout
 
 // ---------------------------------------------------------------------------
 // APP SHELL + NAV
@@ -1003,9 +1041,13 @@ window.doPay = async (id, kind) => {
       return
     }
 
-    $('payStatus').innerHTML = `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'STK push sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Waiting for ${methodLabel} confirmation...</div>`
+    setHTML('payStatus', `<div class="bg-teal-50 border border-teal-200 rounded-lg p-2 text-xs text-teal-700 mb-3"><i class="fas fa-mobile-alt mr-1"></i>${esc(data.customer_message || 'STK push sent. Confirm on your phone.')}</div><div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Waiting for ${methodLabel} confirmation...</div>`)
+    const reEnable = () => { const b = $('payBtn'); if (b) { b.disabled = false; b.classList.remove('opacity-50') } }
     let tries = 0
     const poll = async () => {
+      // Stop immediately if the modal was closed or the session ended — this
+      // avoids the null-innerHTML crash and the 401 request flood.
+      if (!$('payStatus') || !state.user) return
       tries++
       try {
         const { data: cd } = await api.post(confirmEndpoint, { checkout_request_id: data.checkout_request_id })
@@ -1015,15 +1057,21 @@ window.doPay = async (id, kind) => {
           setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 1800)
           return
         }
-        else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); btn.disabled = false; btn.classList.remove('opacity-50'); return }
-      } catch (e) {}
+        else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); reEnable(); return }
+      } catch (e) {
+        // Auth failure or lost connectivity — stop polling (the interceptor
+        // handles the redirect for 401; nothing more to do here).
+        const st = e?.response?.status
+        if (st === 401 || st === 403 || !e?.response) { reEnable(); return }
+      }
+      if (!$('payStatus') || !state.user) return
       if (tries < 20) setTimeout(poll, 3000)
-      else { $('payStatus').innerHTML = '<div class="text-xs text-amber-600 mb-3">Timed out waiting. Check Contracts later.</div>'; btn.disabled = false; btn.classList.remove('opacity-50') }
+      else { setHTML('payStatus', '<div class="text-xs text-amber-600 mb-3">Timed out waiting. Check Contracts later.</div>'); reEnable() }
     }
     setTimeout(poll, data.simulated ? 1200 : 4000)
   } catch (err) {
-    $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || 'Payment failed')}</div>`
-    btn.disabled = false; btn.classList.remove('opacity-50')
+    setHTML('payStatus', `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || (!err.response ? 'Network error — please check your connection and try again.' : 'Payment failed'))}</div>`)
+    const b = $('payBtn'); if (b) { b.disabled = false; b.classList.remove('opacity-50') }
   }
 }
 
@@ -1032,12 +1080,13 @@ window.doSasaOtp = async (checkoutId, id, kind) => {
   const isCash = kind === 'cash'
   const code = $('spOtp')?.value?.trim()
   if (!code) return toast('Enter the OTP code', false)
-  $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Verifying OTP…</div>`
+  setHTML('payStatus', `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>Verifying OTP…</div>`)
   try {
     await api.post('/sasapay/process', { checkout_request_id: checkoutId, verification_code: code })
-    $('payStatus').innerHTML = `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>OTP accepted. Confirming payment…</div>`
+    setHTML('payStatus', `<div class="text-xs text-slate-500 mb-3"><i class="fas fa-spinner fa-spin mr-1"></i>OTP accepted. Confirming payment…</div>`)
     let tries = 0
     const poll = async () => {
+      if (!$('payStatus') || !state.user) return
       tries++
       try {
         const { data: cd } = await api.post('/sasapay/confirm', { checkout_request_id: checkoutId })
@@ -1048,13 +1097,17 @@ window.doSasaOtp = async (checkoutId, id, kind) => {
           return
         }
         else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); return }
-      } catch (e) {}
+      } catch (e) {
+        const st = e?.response?.status
+        if (st === 401 || st === 403 || !e?.response) return
+      }
+      if (!$('payStatus') || !state.user) return
       if (tries < 20) setTimeout(poll, 3000)
-      else $('payStatus').innerHTML = '<div class="text-xs text-amber-600 mb-3">Timed out waiting. Check Contracts later.</div>'
+      else setHTML('payStatus', '<div class="text-xs text-amber-600 mb-3">Timed out waiting. Check Contracts later.</div>')
     }
     setTimeout(poll, 1500)
   } catch (err) {
-    $('payStatus').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || 'OTP verification failed')}</div>`
+    setHTML('payStatus', `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-3">${esc(err.response?.data?.error || (!err.response ? 'Network error — please check your connection and try again.' : 'OTP verification failed'))}</div>`)
   }
 }
 window.viewDoc = async (id) => {
