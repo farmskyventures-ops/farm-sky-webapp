@@ -465,11 +465,14 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
     
     const resolvedCallbackUrl = callbackUrl || env.SASAPAY_CALLBACK_URL || '';
     
-    // FIX: Changed property from 'CallbackUrl' to SasaPay absolute spec 'CallBackURL'
+    // Debug log to ensure the callback url context string is accurately parsed from environment
+    console.log('Sending status query with Callback URL:', resolvedCallbackUrl);
+
+    // FIX: Updated structure payload property key casing from 'CallBackURL' to 'CallbackURL'
     const body: Record<string, any> = { 
       MerchantCode: merchantCode(env), 
       CheckoutRequestId: checkoutRequestId,
-      CallBackURL: resolvedCallbackUrl 
+      CallbackURL: resolvedCallbackUrl 
     }
 
     const res = await fetch(url, {
@@ -491,7 +494,7 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
     //   {"status": true, "message": "Your request has been received.
     //    Check your callback url for response"}
     // and posts the real result (Paid / AmountPaid / TransactionCode) to the
-    // configured CallBackURL. In that case there are NO payment fields to read
+    // configured CallbackURL. In that case there are NO payment fields to read
     // here, so we MUST treat it as still-pending and let the callback settle the
     // intent — NOT as paid (top-level `status:true` only means "query received").
     const data = json.data || json
