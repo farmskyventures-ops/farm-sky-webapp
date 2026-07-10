@@ -470,11 +470,10 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
     // FIX: SasaPay gateway internal rules are highly unpredictable regarding case-sensitivity. 
     // Sending fully lowercase key + snake_case fallback variant within the query data parameters
     // ensures the internal validator accepts the context routing target.
-    const body: Record<string, any> = { 
+  const body: Record<string, any> = { 
       MerchantCode: merchantCode(env), 
-      CheckoutRequestId: checkoutRequestId,
-      callbackurl: resolvedCallbackUrl,
-      callback_url: resolvedCallbackUrl
+      CheckoutRequestID: checkoutRequestId,
+      CallbackUrl: resolvedCallbackUrl
     }
 
     const res = await fetch(url, {
