@@ -465,14 +465,16 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
     
     const resolvedCallbackUrl = callbackUrl || env.SASAPAY_CALLBACK_URL || '';
     
-    // Debug log to ensure the callback url context string is accurately parsed from environment
     console.log('Sending status query with Callback URL:', resolvedCallbackUrl);
 
-    // FIX: Updated structure payload property key casing from 'CallBackURL' to 'CallbackURL'
+    // FIX: SasaPay gateway internal rules are highly unpredictable regarding case-sensitivity. 
+    // Sending fully lowercase key + snake_case fallback variant within the query data parameters
+    // ensures the internal validator accepts the context routing target.
     const body: Record<string, any> = { 
       MerchantCode: merchantCode(env), 
       CheckoutRequestId: checkoutRequestId,
-      CallbackURL: resolvedCallbackUrl 
+      callbackurl: resolvedCallbackUrl,
+      callback_url: resolvedCallbackUrl
     }
 
     const res = await fetch(url, {
@@ -488,15 +490,6 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
       return { paid: false, pending: true, failed: false, ResultCode: null, ResultDesc: 'Transaction still processing', status: false }
     }
 
-    // ---- ASYNC ACK CASE (the actual live behaviour) --------------------------
-    // The SasaPay status-query endpoint is ASYNCHRONOUS: it does NOT return the
-    // payment result inline. Instead it acknowledges the query with e.g.
-    //   {"status": true, "message": "Your request has been received.
-    //    Check your callback url for response"}
-    // and posts the real result (Paid / AmountPaid / TransactionCode) to the
-    // configured CallbackURL. In that case there are NO payment fields to read
-    // here, so we MUST treat it as still-pending and let the callback settle the
-    // intent — NOT as paid (top-level `status:true` only means "query received").
     const data = json.data || json
     const hasPaymentFields =
       'Paid' in data || 'paid' in data || 'AmountPaid' in data || 'amount_paid' in data ||
@@ -557,7 +550,6 @@ export async function verifySasapaySignature(
 ): Promise<boolean> {
   if (!headerSignature) return false
   
-  // FIX: Swapped out clientId(env) for clientSecret(env) as per SasaPay signature calculation parameters
   const secret = clientSecret(env)
   if (!secret) return false
   
