@@ -472,7 +472,7 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
     // ensures the internal validator accepts the context routing target.
   const body: Record<string, any> = { 
       MerchantCode: merchantCode(env), 
-      CheckoutRequestId: checkoutRequestId,
+      CheckoutRequestID: checkoutRequestId,
       callbackurl: resolvedCallbackUrl,
       callback_url: resolvedCallbackUrl
     }
