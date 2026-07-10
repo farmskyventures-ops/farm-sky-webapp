@@ -294,7 +294,7 @@ gateway.get('/status/:ref', async (c) => {
     return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
   }
 
-  const tx = await c.env.DB.prepare(
+  let tx = await c.env.DB.prepare(
     `SELECT * FROM central_transactions WHERE transaction_ref = ? AND origin_app = ? LIMIT 1`
   ).bind(transaction_ref, client_key).first<any>()
   if (!tx) return c.json({ success: false, error: 'Transaction not found' }, 404)
@@ -306,21 +306,35 @@ gateway.get('/status/:ref', async (c) => {
       else if (tx.payment_method === 'sasapay') pr = await sasapayQuery(c.env, tx.provider_request_id)
       else if (tx.payment_method === 'buni') pr = await buniQuery(c.env, tx.provider_request_id)
 
-      const code = pr?.ResultCode ?? pr?.status_code
-      if (code === 0 || code === '0' || pr?.status === true) {
-        await c.env.DB.prepare(
-          `UPDATE central_transactions
-              SET status='SUCCESS', result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
-            WHERE transaction_ref=?`
-        ).bind(String(code ?? '0'), String(pr?.ResultDesc || pr?.message || 'Success'), transaction_ref).run()
-        tx.status = 'SUCCESS'
-      } else if (code !== undefined && code !== null && code !== 0 && code !== '0') {
-        await c.env.DB.prepare(
-          `UPDATE central_transactions
-              SET status='FAILED', result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
-            WHERE transaction_ref=?`
-        ).bind(String(code), String(pr?.ResultDesc || pr?.message || 'Failed'), transaction_ref).run()
-        tx.status = 'FAILED'
+      // FIX: Handle SasaPay asynchronous acceptance payload
+      // SasaPay returns pr.status === true meaning "Received, look at callback".
+      // We check if the webhook already handled the insertion asynchronously.
+      if (tx.payment_method === 'sasapay' && pr?.status === true && !pr?.Paid) {
+        const structuralCheck = await c.env.DB.prepare(
+          `SELECT status, result_code, result_desc, provider_receipt, completed_at FROM central_transactions WHERE transaction_ref = ? LIMIT 1`
+        ).bind(transaction_ref).first<any>()
+        
+        if (structuralCheck && structuralCheck.status !== 'PENDING') {
+          tx = { ...tx, ...structuralCheck }
+        }
+      } else {
+        const code = pr?.ResultCode ?? pr?.status_code
+        if (code === 0 || code === '0' || pr?.status === true || pr?.Paid === true) {
+          const receipt = pr?.TransactionCode || pr?.TransID || pr?.ThirdPartyTransID || null
+          await c.env.DB.prepare(
+            `UPDATE central_transactions
+                SET status='SUCCESS', result_code=?, result_desc=?, provider_receipt=COALESCE(?, provider_receipt), updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
+              WHERE transaction_ref=?`
+          ).bind(String(code ?? '0'), String(pr?.ResultDesc || pr?.ResultDescription || pr?.message || 'Success'), receipt, transaction_ref).run()
+          tx.status = 'SUCCESS'
+        } else if (code !== undefined && code !== null && code !== 0 && code !== '0') {
+          await c.env.DB.prepare(
+            `UPDATE central_transactions
+                SET status='FAILED', result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
+              WHERE transaction_ref=?`
+          ).bind(String(code), String(pr?.ResultDesc || pr?.message || 'Failed'), transaction_ref).run()
+          tx.status = 'FAILED'
+        }
       }
     } catch (_) {}
   }
@@ -393,7 +407,6 @@ gateway.post('/callbacks/mpesa', async (c) => {
 gateway.post('/callbacks/sasapay', async (c) => {
   const raw = await c.req.text()
   
-  // FIX: Extract client IP correctly behind Render's load balancer proxy routing layer
   const forwardHeader = c.req.header('X-Forwarded-For') || c.req.header('CF-Connecting-IP') || ''
   const requestIp = forwardHeader.split(',')[0].trim()
 
@@ -532,10 +545,25 @@ gateway.post('/admin/recover-sasapay', async (c) => {
 
   try {
     const queryResult = await sasapayQuery(c.env, checkout_request_id);
+    
+    // Check if the query itself updated the record, or if we need to fall back to an active database verification check
+    const structuralCheck = await c.env.DB.prepare(
+      `SELECT status, provider_receipt, result_code, result_desc FROM central_transactions WHERE transaction_ref = ? LIMIT 1`
+    ).bind(tx.transaction_ref).first<any>()
+
+    if (structuralCheck && structuralCheck.status === 'SUCCESS') {
+      return c.json({
+        success: true,
+        message: 'Transaction successfully processed and resolved to SUCCESS via Webhook channel.',
+        transaction_ref: tx.transaction_ref,
+        provider_receipt: structuralCheck.provider_receipt
+      });
+    }
+
     const code = queryResult?.ResultCode ?? queryResult?.status_code;
     const isPaid = code === 0 || code === '0' || queryResult?.status === true || queryResult?.Paid === true;
 
-    if (isPaid) {
+    if (isPaid && queryResult?.Paid === true) {
       const receipt = queryResult?.TransactionCode || queryResult?.TransID || queryResult?.ThirdPartyTransID || 'MANUAL_RECOVERY';
       const desc = queryResult?.ResultDescription || queryResult?.ResultDesc || 'Transaction recovered successfully.';
 
@@ -560,7 +588,7 @@ gateway.post('/admin/recover-sasapay', async (c) => {
 
     return c.json({
       success: false,
-      message: 'SasaPay indicates transaction is still uncompleted or failed.',
+      message: 'SasaPay indicates transaction is still uncompleted, asynchronous, or failed.',
       provider_raw_response: queryResult
     }, 200);
 
@@ -573,7 +601,6 @@ gateway.post('/admin/recover-sasapay', async (c) => {
 // Transaction Status Recovery Script (Global Multi-Rail Recovery)
 // ----------------------------------------------------------------------------
 gateway.post('/admin/recover-status', async (c) => {
-  // Elevate credentials past tenant scopes to scan across logs globally
   await setTenantScope(c, null, true)
 
   const body = await c.req.json().catch(() => ({}))
@@ -583,7 +610,6 @@ gateway.post('/admin/recover-status', async (c) => {
     return c.json({ success: false, error: 'Missing transaction_ref parameter in body' }, 400)
   }
 
-  // Pull transaction from central ledger
   const tx = await c.env.DB.prepare(
     `SELECT * FROM central_transactions WHERE transaction_ref = ? LIMIT 1`
   ).bind(transaction_ref).first<any>()
@@ -593,14 +619,13 @@ gateway.post('/admin/recover-status', async (c) => {
   }
 
   if (!tx.provider_request_id) {
-    return c.json({ success: false, error: 'Transaction lacks a provider request tracking token (CheckoutRequestID/MerchantRequestID)' }, 422)
+    return c.json({ success: false, error: 'Transaction lacks a provider request tracking token' }, 422)
   }
 
   try {
     let queryResult: any
     const method = tx.payment_method as PaymentMethod
 
-    // Dispatch status check dynamically based on the payment rails option configured
     if (method === 'mpesa') {
       queryResult = await stkQuery(c.env, tx.provider_request_id)
     } else if (method === 'sasapay') {
@@ -611,7 +636,23 @@ gateway.post('/admin/recover-status', async (c) => {
       return c.json({ success: false, error: `Unsupported recovery rails type: ${method}` }, 400)
     }
 
-    // Extract dynamic response parameters matching specific aggregators
+    // Secondary database sync check for asynchronous SasaPay execution environments
+    if (method === 'sasapay' && queryResult?.status === true && !queryResult?.Paid) {
+      const liveCheck = await c.env.DB.prepare(
+        `SELECT status, provider_receipt FROM central_transactions WHERE transaction_ref = ? LIMIT 1`
+      ).bind(transaction_ref).first<any>()
+
+      if (liveCheck && liveCheck.status === 'SUCCESS') {
+        return c.json({
+          success: true,
+          resolved_status: 'SUCCESS',
+          message: `Transaction state updated successfully over verified channel.`,
+          transaction_ref,
+          provider_receipt: liveCheck.provider_receipt
+        })
+      }
+    }
+
     let code: any
     let isPaid = false
     let receipt: string | null = null
@@ -625,7 +666,7 @@ gateway.post('/admin/recover-status', async (c) => {
       desc = queryResult?.ResultDesc || desc
     } else if (method === 'sasapay') {
       code = queryResult?.ResultCode ?? queryResult?.status_code
-      isPaid = code === 0 || code === '0' || queryResult?.status === true || queryResult?.Paid === true
+      isPaid = code === 0 || code === '0' || queryResult?.Paid === true
       receipt = queryResult?.TransactionCode || queryResult?.TransID || queryResult?.ThirdPartyTransID || null
       desc = queryResult?.ResultDescription || queryResult?.ResultDesc || queryResult?.message || desc
     } else if (method === 'buni') {
@@ -638,7 +679,6 @@ gateway.post('/admin/recover-status', async (c) => {
     if (isPaid) {
       const finalReceipt = receipt ? String(receipt) : `REC-${crypto.randomUUID().slice(0, 8).toUpperCase()}`
 
-      // Update central transaction record state cleanly
       await c.env.DB.prepare(
         `UPDATE central_transactions
             SET status='SUCCESS', provider_receipt=COALESCE(?, provider_receipt),
@@ -646,7 +686,6 @@ gateway.post('/admin/recover-status', async (c) => {
           WHERE transaction_ref=?`
       ).bind(finalReceipt, String(code ?? '0'), desc, transaction_ref).run()
 
-      // Pull the marketplace application credentials and distribute signed postback triggers
       const client = await loadClient(c, tx.origin_app)
       const refreshed = await c.env.DB.prepare(`SELECT * FROM central_transactions WHERE transaction_ref=?`).bind(transaction_ref).first<any>()
       if (client && refreshed) await notifyOriginApp(c, client, refreshed)
@@ -658,8 +697,7 @@ gateway.post('/admin/recover-status', async (c) => {
         transaction_ref,
         provider_receipt: finalReceipt
       })
-    } else if (code !== undefined && code !== null) {
-      // Upstream responded but the payment explicitly failed or timed out
+    } else if (code !== undefined && code !== null && method !== 'sasapay') {
       await c.env.DB.prepare(
         `UPDATE central_transactions
             SET status='FAILED', result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
