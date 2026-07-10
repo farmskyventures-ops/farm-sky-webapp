@@ -416,10 +416,13 @@ gateway.post('/callbacks/sasapay', async (c) => {
     '155.12.30.40', '155.12.30.58'
   ])
 
-  if (!SASAPAY_TRUSTED_IPS.has(requestIp)) {
+  // Only check the IP if we are NOT in development mode
+const isDevelopment = process.env.NODE_ENV === 'development';
+
+if (!isDevelopment && !SASAPAY_TRUSTED_IPS.has(requestIp)) {
     await auditSecurity(c, 'CALLBACK_IP_BLOCKED', 'CRITICAL', { originApp: 'sasapay', detail: `Blocked untrusted IP: ${requestIp}` })
     return c.json({ error: 'Untrusted origin gateway transaction dropped.' }, 401)
-  }
+}
 
   try {
     const body: any = JSON.parse(raw)
