@@ -89,7 +89,7 @@ export function accountTypeForChannel(code: string): number {
 export const SASAPAY_CALLBACK_IPS = [
   '47.129.43.141', '13.229.247.179', '13.215.155.141', '13.214.60.231',
   '54.169.74.198', '18.142.226.87', '47.129.243.116', '13.250.110.3',
-  '155.12.30.40', '155.12.30.58'
+  '155.12.30.40', '155.12.30.58', '41.90.137.105'
 ]
 
 export function isTrustedSasapayIp(ip?: string | null): boolean {
