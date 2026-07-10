@@ -1501,7 +1501,7 @@ app.post('/api/sasapay/confirm', requireAuth, async (c) => {
     //      otherwise report 'pending' and let the callback (or a later poll that
     //      sees intent.status='success') finish the job.
     const q = await sasapayQuery(c.env, checkout_request_id, c.env.SASAPAY_CALLBACK_URL)
-    if (q?.paid === true) {
+    if (q?.paid === true || q?.status === true) {
       success = true
       receipt = q.TransactionCode || q.TransactionID || ('SPL' + Date.now().toString().slice(-7))
     } else if (q?.failed === true) {
@@ -1725,7 +1725,7 @@ app.post('/api/admin/payments/recover', requireAuth, requirePermission('manage_w
     } else {
       const q = await sasapayQuery(c.env, checkout)
       gatewayDesc = String(q?.ResultDesc || q?.message || '')
-      if (q?.paid === true) {
+      if (q?.paid === true || q?.status === true) {
         success = true
         receipt = q.TransactionCode || q.TransactionID || ('SPL' + Date.now().toString().slice(-7))
       } else if (q?.pending === true) {
