@@ -1501,6 +1501,7 @@ app.post('/api/sasapay/confirm', requireAuth, async (c) => {
     //      otherwise report 'pending' and let the callback (or a later poll that
     //      sees intent.status='success') finish the job.
     const q = await sasapayQuery(c.env, checkout_request_id, c.env.SASAPAY_CALLBACK_URL)
+    console.log('--- SasaPay Response Debug:', JSON.stringify(q));
     if (q?.paid === true || q?.status === true) {
       success = true
       receipt = q.TransactionCode || q.TransactionID || ('SPL' + Date.now().toString().slice(-7))
@@ -1724,6 +1725,7 @@ app.post('/api/admin/payments/recover', requireAuth, requirePermission('manage_w
       success = true; receipt = 'SP' + Math.random().toString(36).slice(2, 9).toUpperCase()
     } else {
       const q = await sasapayQuery(c.env, checkout)
+      console.log('--- SasaPay Response Debug:', JSON.stringify(q));
       gatewayDesc = String(q?.ResultDesc || q?.message || '')
       if (q?.paid === true || q?.status === true) {
         success = true
