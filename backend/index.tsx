@@ -1480,15 +1480,27 @@ app.post('/api/sasapay/confirm', requireAuth, async (c) => {
   const { checkout_request_id } = await c.req.json()
   const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
   if (!intent) return c.json({ error: 'Payment intent not found' }, 404)
+  // Terminal states win — the callback/IPN is authoritative. Never auto-settle a
+  // payment the gateway already reported as failed (or re-apply a success).
   if (intent.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: intent.mpesa_receipt })
+  if (intent.status === 'failed') return c.json({ ok: false, status: 'failed', result_desc: intent.result_desc || 'Payment not completed' })
 
   let success = false, receipt = ''
+  // Only auto-settle in SIMULATION mode (no live creds) or for explicit SIM ids.
   if (!sasapayConfigured(c.env) || String(checkout_request_id).includes('SIM')) {
     success = true; receipt = 'SP' + Math.random().toString(36).slice(2, 9).toUpperCase()
   } else {
-    // sasapayQuery now returns a normalized { paid, pending, failed } shape.
-    // `paid` is the ONLY signal that means the customer actually paid.
-    const q = await sasapayQuery(c.env, checkout_request_id)
+    // Primary settlement path is the async CALLBACK: SasaPay posts the payin
+    // result to SASAPAY_CALLBACK_URL, and /api/sasapay/callback flips the intent
+    // to 'success'. The status-query endpoint is ASYNCHRONOUS — it usually just
+    // returns "Your request has been received. Check your callback url…" and does
+    // NOT carry the payment result inline. So:
+    //   1) Pass the callback URL to the query to NUDGE SasaPay into re-posting
+    //      the result to our webhook (helps recover a dropped first callback).
+    //   2) Only settle here if the query genuinely returns paid/failed inline;
+    //      otherwise report 'pending' and let the callback (or a later poll that
+    //      sees intent.status='success') finish the job.
+    const q = await sasapayQuery(c.env, checkout_request_id, c.env.SASAPAY_CALLBACK_URL)
     if (q?.paid === true) {
       success = true
       receipt = q.TransactionCode || q.TransactionID || ('SPL' + Date.now().toString().slice(-7))
@@ -1498,6 +1510,12 @@ app.post('/api/sasapay/confirm', requireAuth, async (c) => {
       await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(safeDesc.slice(0, 300), checkout_request_id).run()
       return c.json({ ok: false, status: 'failed', result_desc: safeDesc })
     } else {
+      // Still processing (async ack / customer hasn't entered PIN/OTP yet).
+      // Re-read the intent in case the callback settled it between our first
+      // read and now — this is what lets the poll succeed once the webhook lands.
+      const latest = await c.env.DB.prepare(`SELECT status, mpesa_receipt, result_desc FROM payment_intents WHERE checkout_request_id=?`).bind(checkout_request_id).first<any>()
+      if (latest?.status === 'success') return c.json({ ok: true, status: 'success', mpesa_receipt: latest.mpesa_receipt })
+      if (latest?.status === 'failed') return c.json({ ok: false, status: 'failed', result_desc: latest.result_desc || 'Payment not completed' })
       return c.json({ ok: false, status: 'pending' })
     }
   }
@@ -1545,20 +1563,39 @@ app.post('/api/sasapay/callback', async (c) => {
       }
     }
 
+    // Match the intent by CheckoutRequestID (primary), falling back to the
+    // MerchantRequestID / AccountReference (== our contract_ref) if needed.
+    // Per SasaPay C2B docs the callback body carries:
+    //   CheckoutRequestID, MerchantRequestID, ResultCode ("0"=success),
+    //   Paid (bool), TransactionCode, TransAmount, BillRefNumber, ...
     const checkout = body?.CheckoutRequestID || body?.MerchantRequestID
-    if (!checkout) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+    const billRef = body?.BillRefNumber || body?.AccountReference
+    if (!checkout && !billRef) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
 
-    const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+    let intent = checkout
+      ? await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+      : null
+    // Fallback: correlate via the contract reference sent as AccountReference.
+    if (!intent && billRef) {
+      intent = await c.env.DB.prepare(
+        `SELECT pi.* FROM payment_intents pi JOIN murabaha_contracts mc ON mc.id = pi.contract_id
+          WHERE mc.contract_ref = ? AND pi.status = 'pending' ORDER BY pi.created_at DESC LIMIT 1`
+      ).bind(String(billRef)).first<any>()
+    }
+
     // Idempotency: only act on a still-pending intent.
     if (intent && intent.status === 'pending') {
       const code = body.ResultCode ?? body.status_code
-      if (code === 0 || code === '0' || body.status === true) {
-        const receipt = body.TransactionCode || body.TransactionID || body.MpesaReceiptNumber || ('SPL' + Date.now())
+      // Success = ResultCode "0" OR the explicit Paid boolean OR status:true.
+      const paid = code === 0 || code === '0' || body.Paid === true || body.paid === true || body.status === true
+      if (paid) {
+        const receipt = body.TransactionCode || body.TransID || body.TransactionID || body.ThirdPartyTransID || body.MpesaReceiptNumber || ('SPL' + Date.now())
         const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
         if (contract) await applyPayment(c, contract, intent.amount, String(receipt), 'sasapay', intent.phone)
-        await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, transaction_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(String(receipt), String(receipt), body.ResultDesc || '', checkout).run()
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, transaction_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(String(receipt), String(receipt), body.ResultDesc || 'Transaction processed successfully.', intent.checkout_request_id).run()
+        await audit(c, null, 'callback_settled', 'sasapay', `settled ${intent.checkout_request_id} KES ${intent.amount} receipt ${receipt}`)
       } else {
-        await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(body.ResultDesc || body.message || 'Failed', checkout).run()
+        await c.env.DB.prepare(`UPDATE payment_intents SET status='failed', result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(body.ResultDesc || body.message || 'Failed', intent.checkout_request_id).run()
       }
     }
     return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
@@ -1566,17 +1603,33 @@ app.post('/api/sasapay/callback', async (c) => {
 })
 
 // IPN — SasaPay posts SUCCESSFUL payins here (secondary confirmation channel).
+// NOTE (per SasaPay docs): the IPN payload does NOT include CheckoutRequestID.
+// It carries { BillRefNumber, TransID, ThirdPartyTransID, TransAmount, MSISDN,
+// TransactionType, ... } — so we correlate the payin to a pending intent via
+// BillRefNumber (== the AccountReference we sent == the contract_ref).
 app.post('/api/sasapay/ipn', async (c) => {
   try {
     const body: any = await c.req.json().catch(() => ({}))
     const checkout = body?.CheckoutRequestID || body?.MerchantRequestID
-    if (!checkout) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-    const intent = await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+    const billRef = body?.BillRefNumber || body?.AccountReference || body?.InvoiceNumber
+    if (!checkout && !billRef) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+
+    let intent = checkout
+      ? await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
+      : null
+    if (!intent && billRef) {
+      intent = await c.env.DB.prepare(
+        `SELECT pi.* FROM payment_intents pi JOIN murabaha_contracts mc ON mc.id = pi.contract_id
+          WHERE mc.contract_ref = ? AND pi.status = 'pending' ORDER BY pi.created_at DESC LIMIT 1`
+      ).bind(String(billRef)).first<any>()
+    }
+
     if (intent && intent.status === 'pending') {
-      const receipt = body.TransactionCode || body.TransactionID || ('SPL' + Date.now())
+      const receipt = body.TransID || body.TransactionCode || body.TransactionID || body.ThirdPartyTransID || ('SPL' + Date.now())
       const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
       if (contract) await applyPayment(c, contract, intent.amount, String(receipt), 'sasapay', intent.phone)
-      await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, transaction_code=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(String(receipt), String(receipt), checkout).run()
+      await c.env.DB.prepare(`UPDATE payment_intents SET status='success', mpesa_receipt=?, transaction_code=?, updated_at=CURRENT_TIMESTAMP WHERE checkout_request_id=?`).bind(String(receipt), String(receipt), intent.checkout_request_id).run()
+      await audit(c, null, 'ipn_settled', 'sasapay', `settled ${intent.checkout_request_id} KES ${intent.amount} receipt ${receipt}`)
     }
     return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
   } catch { return c.json({ ResultCode: 0, ResultDesc: 'Accepted' }) }

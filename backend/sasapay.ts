@@ -484,7 +484,25 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
       return { paid: false, pending: true, failed: false, ResultCode: null, ResultDesc: 'Transaction still processing', status: false }
     }
 
+    // ---- ASYNC ACK CASE (the actual live behaviour) --------------------------
+    // The SasaPay status-query endpoint is ASYNCHRONOUS: it does NOT return the
+    // payment result inline. Instead it acknowledges the query with e.g.
+    //   {"status": true, "message": "Your request has been received.
+    //    Check your callback url for response"}
+    // and posts the real result (Paid / AmountPaid / TransactionCode) to the
+    // configured CallBackURL. In that case there are NO payment fields to read
+    // here, so we MUST treat it as still-pending and let the callback settle the
+    // intent — NOT as paid (top-level `status:true` only means "query received").
     const data = json.data || json
+    const hasPaymentFields =
+      'Paid' in data || 'paid' in data || 'AmountPaid' in data || 'amount_paid' in data ||
+      'PaymentStatus' in data || 'payment_status' in data || 'TransactionStatus' in data ||
+      'TransactionCode' in data || 'ResultCode' in data
+    const ackMessage = String(json.message || json.detail || '').toLowerCase()
+    const isAsyncAck = !hasPaymentFields && (ackMessage.includes('check your callback') || ackMessage.includes('request has been received') || ackMessage.includes('being processed'))
+    if (isAsyncAck) {
+      return { ...json, paid: false, pending: true, failed: false, status: false, ResultCode: null, ResultDesc: json.message || 'Awaiting SasaPay callback confirmation' }
+    }
 
     const paidFlag =
       data.Paid === true || data.paid === true ||
