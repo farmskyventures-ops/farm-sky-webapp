@@ -473,8 +473,7 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
   const body: Record<string, any> = { 
       MerchantCode: merchantCode(env), 
       CheckoutRequestID: checkoutRequestId,
-      callbackurl: resolvedCallbackUrl,
-      callback_url: resolvedCallbackUrl
+      CallbackUrl: resolvedCallbackUrl,
     }
 
     const res = await fetch(url, {
