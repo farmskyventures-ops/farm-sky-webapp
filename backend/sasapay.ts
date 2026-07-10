@@ -465,10 +465,11 @@ export async function sasapayQuery(env: SasaPayEnv, checkoutRequestId: string, c
     
     const resolvedCallbackUrl = callbackUrl || env.SASAPAY_CALLBACK_URL || '';
     
+    // FIX: Changed property from 'CallbackUrl' to SasaPay absolute spec 'CallBackURL'
     const body: Record<string, any> = { 
       MerchantCode: merchantCode(env), 
       CheckoutRequestId: checkoutRequestId,
-      CallbackUrl: resolvedCallbackUrl 
+      CallBackURL: resolvedCallbackUrl 
     }
 
     const res = await fetch(url, {
@@ -552,8 +553,11 @@ export async function verifySasapaySignature(
   fields: { sasapay_transaction_code?: string; merchant_code?: string; account_number?: string; payment_reference?: string; amount?: string | number }
 ): Promise<boolean> {
   if (!headerSignature) return false
-  const secret = clientId(env)
+  
+  // FIX: Swapped out clientId(env) for clientSecret(env) as per SasaPay signature calculation parameters
+  const secret = clientSecret(env)
   if (!secret) return false
+  
   const message = [
     fields.sasapay_transaction_code ?? '',
     fields.merchant_code ?? '',
