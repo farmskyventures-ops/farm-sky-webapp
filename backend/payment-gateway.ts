@@ -417,6 +417,7 @@ gateway.post('/callbacks/sasapay', async (c) => {
   ])
 
    if (!SASAPAY_TRUSTED_IPS.has(requestIp)) {
+     console.log(`--- 🔍 SECURITY ALERT: Blocked untrusted IP: ${requestIp} ---`);
     await auditSecurity(c, 'CALLBACK_IP_BLOCKED', 'CRITICAL', { originApp: 'sasapay', detail: `Blocked untrusted IP: ${requestIp}` })
     return c.json({ error: 'Untrusted origin gateway transaction dropped.' }, 401)
   }
