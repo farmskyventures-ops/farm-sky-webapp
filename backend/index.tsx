@@ -1734,6 +1734,44 @@ app.get('/api/sasapay/status', requireAuth, (c) => {
   return c.json({ live: sasapayConfigured(c.env), mode: sasapayConfigured(c.env) ? sasapayMode(c.env) : 'simulation' })
 })
 
+// Some gateways (SasaPay included) probe a callback URL with a GET during
+// registration / health-checks and will REFUSE to POST results to a URL that
+// does not answer that probe with 200. Answer it explicitly for both the
+// payin callback and IPN paths so the URL is always accepted upstream.
+app.get('/api/sasapay/callback', (c) => c.json({ ok: true, service: 'sasapay-callback', method: 'expects POST' }))
+app.get('/api/sasapay/ipn', (c) => c.json({ ok: true, service: 'sasapay-ipn', method: 'expects POST' }))
+
+// Callback health diagnostic — lets an operator confirm, without DB access,
+// whether SasaPay callbacks/IPNs are actually reaching this server. Reads the
+// audit trail our webhook handlers write (callback_settled / callback_unverified
+// / callback_no_match / ipn_settled …) and the current pending payin backlog.
+app.get('/api/sasapay/callback-health', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const events = await c.env.DB.prepare(
+    `SELECT action, detail, created_at FROM audit_logs
+      WHERE entity='sasapay' AND (action LIKE 'callback%' OR action LIKE 'ipn%')
+      ORDER BY created_at DESC LIMIT 20`
+  ).all<any>()
+  const last = await c.env.DB.prepare(
+    `SELECT action, detail, created_at FROM audit_logs
+      WHERE action IN ('callback_settled','callback_unverified','callback_no_match','callback_amount_mismatch','ipn_settled','ipn_no_match')
+      ORDER BY created_at DESC LIMIT 1`
+  ).first<any>()
+  const pending = await c.env.DB.prepare(
+    `SELECT checkout_request_id, amount, phone, channel_name, created_at
+       FROM payment_intents
+      WHERE provider='sasapay' AND direction='payin' AND status='pending'
+      ORDER BY created_at DESC LIMIT 20`
+  ).all<any>()
+  return c.json({
+    live: sasapayConfigured(c.env),
+    callback_url: c.env.SASAPAY_CALLBACK_URL || null,
+    last_webhook_event: last || null,
+    recent_webhook_events: events?.results || [],
+    pending_payins: pending?.results || [],
+    pending_count: (pending?.results || []).length
+  })
+})
+
 // ----------------------------------------------------------------------------
 // ISSUE 1 — ADMIN PAYMENT RECOVERY (in-app payment_intents)
 //   When a customer's wallet is debited but the async gateway callback never
