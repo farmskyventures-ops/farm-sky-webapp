@@ -1298,6 +1298,22 @@ async function applyPayment(c: any, contract: any, amt: number, receipt: string,
   }
   return { amount_paid: newPaid, outstanding: newOutstanding, status }
 }
+
+// Run background work WITHOUT blocking the HTTP response.
+//   - On Cloudflare Workers, c.executionCtx.waitUntil keeps the worker alive
+//     until the promise settles.
+//   - On Node (@hono/node-server, our authoritative production runtime) there
+//     is no executionCtx, but the process stays alive across the event loop, so
+//     a plain fire-and-forget promise runs to completion after we've already
+//     returned the ACK. Either way we NEVER make the webhook sender wait for our
+//     (multi-query) settlement — SasaPay only needs the fast 200 ACK.
+function runInBackground(c: any, work: () => Promise<void>) {
+  const p = (async () => {
+    try { await work() } catch (err: any) { console.error('Background settlement error:', err?.message || err) }
+  })()
+  try { c.executionCtx?.waitUntil?.(p) } catch (_) { /* no executionCtx on Node — fire-and-forget */ }
+}
+
 app.post('/api/mpesa/stkpush', requireAuth, async (c) => {
   const { contract_id, amount, phone } = await c.req.json()
   const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(contract_id).first<any>()
@@ -1547,23 +1563,25 @@ app.post('/api/sasapay/confirm', requireAuth, async (c) => {
 //   made idempotent (a settled intent is never re-applied).
 // ----------------------------------------------------------------------------
 app.post('/api/sasapay/callback', async (c) => {
-  try {
-    const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || c.req.header('x-real-ip')
-    const sig = c.req.header('x-sasapay-signature') || c.req.header('X-SasaPay-Signature')
-    const body: any = await c.req.json().catch(() => ({}))
+  // IMPORTANT (timeout fix): SasaPay reported "Max retries exceeded / timed out"
+  // reaching this URL. They process in seconds and expect an near-instant ACK.
+  // The settlement work here is multiple sequential DB round-trips (applyPayment
+  // touches products, stock, invoices, transactions, contract, repayments,
+  // commission) which, over a networked Postgres, can exceed SasaPay's HTTP
+  // client timeout — so their side gave up and marked the callback failed even
+  // though we were still working. FIX: parse + log fast, then do ALL settlement
+  // work in the BACKGROUND and return the 200 ACK immediately.
+  const ip = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || c.req.header('x-real-ip')
+  const sig = c.req.header('x-sasapay-signature') || c.req.header('X-SasaPay-Signature')
+  const body: any = await c.req.json().catch(() => ({}))
 
-    // ALWAYS log the raw callback first — this is our single source of truth on
-    // Render for confirming SasaPay actually reached us and what shape it sent.
-    console.log('SasaPay C2B callback received:', JSON.stringify({ ip: ip || null, hasSig: !!sig, body }))
+  // ALWAYS log the raw callback first — our single source of truth on Render.
+  console.log('SasaPay C2B callback received:', JSON.stringify({ ip: ip || null, hasSig: !!sig, body }))
 
-    // Authenticity check — VERIFY, but NEVER drop a real settlement.
-    // The money has ALREADY moved on SasaPay's side by the time this fires, so
-    // rejecting the callback with a 403 does not un-charge the customer — it only
-    // leaves our ledger permanently out of sync (the exact "stuck PENDING" bug).
-    // We therefore log/audit an unverified callback but STILL process it. Safety
-    // comes from: (a) we only settle a still-pending intent that we can match to
-    // a real CheckoutRequestID / contract_ref we issued, (b) idempotency, and
-    // (c) we only credit a genuine success payload.
+  // Defer every DB touch (auth-audit + matching + settlement) to the background.
+  runInBackground(c, async () => {
+    // Authenticity check — VERIFY, but NEVER drop a real settlement. The money
+    // has ALREADY moved on SasaPay's side, so refusing only desyncs our ledger.
     if (sasapayConfigured(c.env)) {
       const ipOk = isTrustedSasapayIp(ip)
       const sigOk = await verifySasapaySignature(c.env, sig, {
@@ -1581,12 +1599,9 @@ app.post('/api/sasapay/callback', async (c) => {
 
     // Match the intent by CheckoutRequestID (primary), falling back to the
     // MerchantRequestID / AccountReference (== our contract_ref) if needed.
-    // Per SasaPay C2B docs the callback body carries:
-    //   CheckoutRequestID, MerchantRequestID, ResultCode ("0"=success),
-    //   Paid (bool), TransactionCode, TransAmount, BillRefNumber, ...
     const checkout = body?.CheckoutRequestID || body?.MerchantRequestID
     const billRef = body?.BillRefNumber || body?.AccountReference
-    if (!checkout && !billRef) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+    if (!checkout && !billRef) return
 
     let intent = checkout
       ? await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
@@ -1616,26 +1631,17 @@ app.post('/api/sasapay/callback', async (c) => {
     }
 
     if (!intent) {
-      // Callback arrived but we could not correlate it to any intent we issued.
-      // Log loudly so it shows up in Render — usually means the BillRefNumber /
-      // CheckoutRequestID SasaPay echoed back differs from what we stored.
       console.warn('SasaPay callback: NO matching intent', JSON.stringify({ checkout, billRef }))
       await audit(c, null, 'callback_no_match', 'sasapay', `checkout=${checkout || '?'} billRef=${billRef || '?'}`)
-      return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+      return
     }
 
     // Idempotency: only act on a still-pending intent.
     if (intent.status === 'pending') {
       const code = body.ResultCode ?? body.status_code
-      // Success signals per SasaPay C2B docs: ResultCode "0", the explicit Paid
-      // boolean, or the settlement `status:true`. (The status-QUERY ack also uses
-      // status:true, but that endpoint never posts here — only real payin results
-      // hit this callback URL — so this is safe.)
       const paid = code === 0 || code === '0' || body.Paid === true || body.paid === true || body.status === true
       if (paid) {
         const receipt = body.TransactionCode || body.TransID || body.TransactionID || body.ThirdPartyTransID || body.MpesaReceiptNumber || ('SPL' + Date.now())
-        // Soft amount check — settle on our recorded intent amount, but flag any
-        // mismatch so it can be investigated (we do NOT block settlement).
         const paidAmt = Number(body.TransAmount ?? body.Amount ?? body.amount ?? 0)
         if (paidAmt && Math.abs(paidAmt - Number(intent.amount)) > 0.5) {
           console.warn('SasaPay callback amount mismatch:', `intent=${intent.amount} callback=${paidAmt} ref=${intent.checkout_request_id}`)
@@ -1653,11 +1659,10 @@ app.post('/api/sasapay/callback', async (c) => {
     } else {
       console.log('SasaPay callback: intent already', intent.status, `(${intent.checkout_request_id}) — ignoring (idempotent)`)
     }
-    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-  } catch (err: any) {
-    console.error('SasaPay callback exception:', err?.message || err)
-    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-  }
+  })
+
+  // Respond INSTANTLY — SasaPay only needs the fast 200 ACK, not the settlement.
+  return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
 })
 
 // IPN — SasaPay posts SUCCESSFUL payins here (secondary confirmation channel).
@@ -1666,12 +1671,14 @@ app.post('/api/sasapay/callback', async (c) => {
 // TransactionType, ... } — so we correlate the payin to a pending intent via
 // BillRefNumber (== the AccountReference we sent == the contract_ref).
 app.post('/api/sasapay/ipn', async (c) => {
-  try {
-    const body: any = await c.req.json().catch(() => ({}))
-    console.log('SasaPay IPN received:', JSON.stringify(body))
+  // Same timeout fix as /callback: ACK instantly, settle in the background.
+  const body: any = await c.req.json().catch(() => ({}))
+  console.log('SasaPay IPN received:', JSON.stringify(body))
+
+  runInBackground(c, async () => {
     const checkout = body?.CheckoutRequestID || body?.MerchantRequestID
     const billRef = body?.BillRefNumber || body?.AccountReference || body?.InvoiceNumber
-    if (!checkout && !billRef) return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+    if (!checkout && !billRef) return
 
     let intent = checkout
       ? await c.env.DB.prepare(`SELECT * FROM payment_intents WHERE checkout_request_id=?`).bind(checkout).first<any>()
@@ -1686,7 +1693,7 @@ app.post('/api/sasapay/ipn', async (c) => {
     if (!intent) {
       console.warn('SasaPay IPN: NO matching intent', JSON.stringify({ checkout, billRef }))
       await audit(c, null, 'ipn_no_match', 'sasapay', `checkout=${checkout || '?'} billRef=${billRef || '?'}`)
-      return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
+      return
     }
 
     if (intent.status === 'pending') {
@@ -1699,11 +1706,10 @@ app.post('/api/sasapay/ipn', async (c) => {
     } else {
       console.log('SasaPay IPN: intent already', intent.status, `(${intent.checkout_request_id}) — ignoring (idempotent)`)
     }
-    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-  } catch (err: any) {
-    console.error('SasaPay IPN exception:', err?.message || err)
-    return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
-  }
+  })
+
+  // Respond INSTANTLY.
+  return c.json({ ResultCode: 0, ResultDesc: 'Accepted' })
 })
 
 // ----------------------------------------------------------------------------
