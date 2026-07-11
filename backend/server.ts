@@ -14,11 +14,22 @@ const PROJECT_ROOT = join(__dirname, '..')
 const DATABASE_URL = process.env.DATABASE_URL || 'postgresql://postgres:postgres@127.0.0.1:5432/farmsky'
 const migrateOnly = process.argv.includes('--migrate-only')
 
+// Open a pool immediately (cheap, lazy connections) so `d1` can be wired into ENV
+// before the (potentially slow) migration/seed pass runs. On Render cold starts the
+// migration pass can take several seconds; we must NOT let it block the HTTP port
+// from binding, otherwise inbound webhooks (e.g. SasaPay callbacks) hit a refused /
+// timed-out connection => "Max retries exceeded" and the settlement is lost.
 const { d1, raw } = await openDatabase(DATABASE_URL)
-await initializeDatabase(raw, PROJECT_ROOT)
-console.log(`PostgreSQL ready: ${DATABASE_URL.replace(/:[^:@/]+@/, ':***@')}`)
+
+// Tracks whether migrations/seed have finished. Requests that need the DB before
+// this flips true get a fast 503 (retryable) instead of hanging the connection.
+let dbReady = false
+let dbInitError: string | null = null
 
 if (migrateOnly) {
+  // In migrate-only mode we DO want to block and exit after migrating.
+  await initializeDatabase(raw, PROJECT_ROOT)
+  console.log(`PostgreSQL ready: ${DATABASE_URL.replace(/:[^:@/]+@/, ':***@')}`)
   await raw.end()
   process.exit(0)
 }
@@ -64,12 +75,68 @@ const ENV = {
 }
 
 const root = new Hono()
+
+// ---------------------------------------------------------------------------
+// Ultra-lightweight liveness endpoints. These are dependency-free and are
+// declared BEFORE the static/catch-all handlers so they respond the instant the
+// process is listening — even while migrations are still running. Point a free
+// uptime pinger (UptimeRobot / cron-job.org, every 5-10 min) at /health to keep
+// the Render service warm so SasaPay callbacks never hit a cold-start timeout.
+// ---------------------------------------------------------------------------
+root.get('/health', (c) => c.json({ ok: true, dbReady, ts: Date.now() }))
+root.get('/healthz', (c) => c.text(dbReady ? 'ok' : 'starting', dbReady ? 200 : 200))
+root.get('/api/ping', (c) => c.json({ ok: true, service: 'farmsky', dbReady, ts: Date.now() }))
+
 root.use('/static/*', serveStatic({ root: './frontend' }))
-root.all('*', (c) => app.fetch(c.req.raw, ENV as any))
+
+// A Node-side executionCtx shim so `c.executionCtx.waitUntil(promise)` inside the
+// app (used by runInBackground for webhook settlement) keeps the promise alive on
+// the event loop instead of silently falling through. This makes background
+// settlement after the instant callback ACK reliable on the Node runtime.
+const nodeExecutionCtx = {
+  waitUntil: (p: Promise<any>) => { Promise.resolve(p).catch(() => {}) },
+  passThroughOnException: () => {}
+}
+
+// Payment webhook paths must ALWAYS be allowed through so they can ACK instantly,
+// even during the brief startup window — SasaPay's connect timeout is short (~8s)
+// and a lost/timed-out callback drops the settlement. The in-app handlers ACK
+// immediately and settle in the background (runInBackground), so it is safe to
+// admit them here; if the DB isn't ready yet the background task will surface via
+// the admin recovery/pending tooling.
+const ALWAYS_ADMIT = /^\/api\/(sasapay|mpesa|buni)\/(callback|ipn|confirm|result|timeout|b2c)/i
+
+root.all('*', (c) => {
+  const path = new URL(c.req.url).pathname
+  // If a DB-dependent request arrives before migrations finish, fail fast with a
+  // retryable 503 rather than hanging the socket. Webhook senders will see a clean
+  // HTTP response instead of a connection timeout, and can retry.
+  if (!dbReady && !ALWAYS_ADMIT.test(path)) {
+    return c.json(
+      { error: 'service_starting', message: 'Server is starting, please retry shortly.', dbReady: false, dbInitError },
+      503,
+      { 'Retry-After': '3' }
+    )
+  }
+  return app.fetch(c.req.raw, ENV as any, nodeExecutionCtx as any)
+})
 
 const PORT = Number(process.env.PORT || 8080)
 serve({ fetch: root.fetch, port: PORT }, (info) => {
-  console.log(`Farmsky server running on http://0.0.0.0:${info.port}`)
+  console.log(`Farmsky server running on http://0.0.0.0:${info.port} (binding port first; DB migrating in background)`)
+
+  // Kick off migrations/seed AFTER the port is bound. This guarantees the socket
+  // accepts connections immediately on cold start, eliminating the connection-level
+  // timeout that caused SasaPay "Max retries exceeded" callback failures.
+  initializeDatabase(raw, PROJECT_ROOT)
+    .then(() => {
+      dbReady = true
+      console.log(`PostgreSQL ready: ${DATABASE_URL.replace(/:[^:@/]+@/, ':***@')}`)
+    })
+    .catch((err: any) => {
+      dbInitError = err?.message || String(err)
+      console.error('Database initialization failed:', dbInitError)
+    })
   
   // Both gateways default to PRODUCTION unless *_ENV is explicitly a sandbox value.
   const sandboxValues = ['sandbox', 'development', 'dev', 'test', 'uat']
