@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS marketplaces (
 
 INSERT INTO marketplaces (marketplace_key, display_name, domain, is_main, is_active) VALUES
   ('equipment', 'Farmsky Equipment', 'equipment.farmsky.africa', 1, 1),
-  ('feed',      'Farmsky Feed',      'feed.farmsky.africa',      0, 1),
+  ('feed',      'Farmsky Feed',      'feed-webapp.onrender.com',      0, 1),
   ('mazao',     'Farmsky Mazao',     'mazao.farmsky.africa',     0, 1)
 ON CONFLICT (marketplace_key) DO NOTHING;
 
