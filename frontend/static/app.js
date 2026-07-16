@@ -1,5 +1,5 @@
 // ============================================================================
-// Farmsky - Sharia-Compliant Agri-Finance Platform - SPA frontend
+// Farmsky SPA frontend
 // ============================================================================
 const api = axios.create({ baseURL: '/api', withCredentials: true })
 let state = { user: null, route: 'dashboard', data: {} }
