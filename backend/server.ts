@@ -98,28 +98,14 @@ const nodeExecutionCtx = {
   passThroughOnException: () => {}
 }
 
-// Payment webhook paths must ALWAYS be allowed through so they can ACK instantly,
-// even during the brief startup window — SasaPay's connect timeout is short (~8s)
-// and a lost/timed-out callback drops the settlement. The in-app handlers ACK
-// immediately and settle in the background (runInBackground), so it is safe to
-// admit them here; if the DB isn't ready yet the background task will surface via
-// the admin recovery/pending tooling.
-const ALWAYS_ADMIT = /^\/api\/(sasapay|mpesa|buni)\/(callback|ipn|confirm|result|timeout|b2c)/i
-
-root.all('*', (c) => {
-  const path = new URL(c.req.url).pathname
-  // If a DB-dependent request arrives before migrations finish, fail fast with a
-  // retryable 503 rather than hanging the socket. Webhook senders will see a clean
-  // HTTP response instead of a connection timeout, and can retry.
-  if (!dbReady && !ALWAYS_ADMIT.test(path)) {
-    return c.json(
-      { error: 'service_starting', message: 'Server is starting, please retry shortly.', dbReady: false, dbInitError },
-      503,
-      { 'Retry-After': '3' }
-    )
-  }
-  return app.fetch(c.req.raw, ENV as any, nodeExecutionCtx as any)
-})
+// Serve the app for every request. We do NOT gate requests behind `dbReady`:
+// gating caused the whole site to return 503 "service_starting" whenever DB init
+// was slow or errored on Render. Instead we bind the port immediately and let the
+// app run; the pool uses lazy connections, so the rare request that lands in the
+// sub-second window before migrations finish either succeeds (pool waits for a
+// connection) or fails at the individual query and the client retries. The page,
+// login and webhooks all work as soon as the process is listening.
+root.all('*', (c) => app.fetch(c.req.raw, ENV as any, nodeExecutionCtx as any))
 
 const PORT = Number(process.env.PORT || 8080)
 serve({ fetch: root.fetch, port: PORT }, (info) => {

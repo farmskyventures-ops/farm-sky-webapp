@@ -1,5 +1,5 @@
 -- =====================================================================
--- Farmsky - Sharia-Compliant Murabaha Lending Platform - Initial Schema
+-- Farmsky - Agriculture Financing Platform - Initial Schema
 -- =====================================================================
 
 CREATE TABLE IF NOT EXISTS users (

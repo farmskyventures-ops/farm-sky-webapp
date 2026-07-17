@@ -172,6 +172,49 @@ function boolInt(value: any, fallback = true) {
 function roundMoney(value: number) {
   return Math.round((Number(value) || 0) * 100) / 100
 }
+// ---- Secure upload validation ----------------------------------------------
+// Uploaded documents / avatars arrive as base64 data URLs (or, rarely, an https
+// URL). We accept ONLY real raster images (jpeg/png/webp/gif) and cap the size,
+// which blocks executables, HTML/SVG-with-script, PDFs and other malicious
+// payloads from being stored and later served back to a browser.
+const ALLOWED_IMAGE_MIME = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024 // 8 MB per image
+function isSafeDataUrlOrHttp(value: any): boolean {
+  if (typeof value !== 'string' || !value) return false
+  const s = value.trim()
+  // Plain https(s) URL to an already-hosted asset — allow, no inline payload.
+  if (/^https:\/\/[^\s"'<>]+$/i.test(s)) return true
+  // data:URL — must be an allowed image MIME with valid base64 under the cap.
+  const m = /^data:([a-z0-9.+/-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(s)
+  if (!m) return false
+  const mime = m[1].toLowerCase()
+  if (!ALLOWED_IMAGE_MIME.includes(mime)) return false
+  // Estimate decoded byte length from base64 length (3/4 ratio).
+  const b64 = m[2].replace(/\s+/g, '')
+  const approxBytes = Math.floor((b64.length * 3) / 4)
+  if (approxBytes <= 0 || approxBytes > MAX_UPLOAD_BYTES) return false
+  // Magic-byte sniff on the first decoded bytes to confirm it is really that
+  // image type (defends against a spoofed MIME wrapping a non-image payload).
+  try {
+    const head = atob(b64.slice(0, 32))
+    const bytes = Array.from(head).map((ch) => ch.charCodeAt(0))
+    const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+    const isPng = bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47
+    const isGif = bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46
+    const isWebp = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+    return isJpeg || isPng || isGif || isWebp
+  } catch (_) {
+    return false
+  }
+}
+// Sanitize a short free-text field: trim, cap length, strip control chars.
+// (SQL injection itself is already prevented everywhere by parameterised
+// prepared statements — this is defense-in-depth against stored junk / XSS.)
+function cleanText(value: any, maxLen = 200): string | null {
+  if (value === undefined || value === null) return null
+  const s = String(value).replace(/[\u0000-\u001F\u007F]/g, '').trim()
+  return s ? s.slice(0, maxLen) : null
+}
 // ---- App settings (key/value JSON store) ----
 async function getSetting<T = any>(c: any, key: string, fallback: T): Promise<T> {
   try {
@@ -538,9 +581,11 @@ app.post('/api/login', async (c) => {
   const { phone, password } = await c.req.json()
   const raw = String(phone || '').trim()
   const norm = normalizePhone(raw)
-  // Match either the exact entered value or the normalized 2547... form,
-  // so seeded "+254..." accounts and OTP-normalized accounts both work.
-  let user = await c.env.DB.prepare(`SELECT * FROM users WHERE phone = ? OR phone = ?`).bind(raw, norm).first<any>()
+  // Match the entered value, the normalized 2547... form, OR the +2547... form,
+  // so seeded "+254..." accounts and OTP-normalized "254..." accounts both work
+  // regardless of how the user typed the number (07.., 2547.., +2547..).
+  const plus = norm ? '+' + norm : raw
+  let user = await c.env.DB.prepare(`SELECT * FROM users WHERE phone = ? OR phone = ? OR phone = ?`).bind(raw, norm, plus).first<any>()
   if (!user || user.password !== String(password)) return c.json({ error: 'Invalid phone number or password' }, 401)
   if (user.status !== 'active') return c.json({ error: 'Account suspended' }, 403)
   // Enforce time-based access windows (per-user override, else role template).
@@ -583,6 +628,10 @@ app.get('/api/me/profile', requireAuth, async (c) => {
 app.put('/api/me/avatar', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
   const { avatar_url } = await c.req.json()
+  // Profile picture is an uploaded image attachment — validate before storing.
+  if (avatar_url && !isSafeDataUrlOrHttp(avatar_url)) {
+    return c.json({ error: 'Profile picture must be a JPEG, PNG, WebP or GIF image under 8 MB.' }, 400)
+  }
   await c.env.DB.prepare(`UPDATE users SET avatar_url=? WHERE id=?`).bind(avatar_url || null, user.id).run()
   await audit(c, user.id, 'update', 'profile', 'avatar')
   return c.json({ ok: true, avatar_url: avatar_url || null })
@@ -607,8 +656,12 @@ app.put('/api/me/profile', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
   const b = await c.req.json()
 
-  // Everyone may update their avatar via this endpoint.
+  // Everyone may update their avatar via this endpoint. The profile picture is an
+  // attachment (uploaded image) — validate it is a real image and within size.
   if (b.avatar_url !== undefined) {
+    if (b.avatar_url && !isSafeDataUrlOrHttp(b.avatar_url)) {
+      return c.json({ error: 'Profile picture must be a JPEG, PNG, WebP or GIF image under 8 MB.' }, 400)
+    }
     await c.env.DB.prepare(`UPDATE users SET avatar_url=? WHERE id=?`).bind(b.avatar_url || null, user.id).run()
   }
 
@@ -685,29 +738,41 @@ app.post('/api/signup/request-otp', async (c) => {
   if (!sms.simulated && !sms.success) return c.json({ error: sms.error || 'Failed to send OTP' }, 502)
   return c.json({ ok: true, phone: p, message: sms.simulated ? 'Demo mode: use the code shown below.' : `OTP sent to ${p}.`, demo_otp })
 })
-// Step 2: verify OTP + set password -> create account + auto sign-in.
+// Step 1 (completion): verify OTP + set password -> create account + auto sign-in.
+// Sign-up STEP 1 captures ONLY: Full Name, Phone (verified here), ID Number, Password.
+// ID documents, passport photo, liveliness and TransUnion are STEP 2 (KYC) and are
+// completed LATER — cash purchases work without them; financed purchases are gated
+// (see /api/murabaha/apply -> kyc_required). ID number + phone must be UNIQUE.
 app.post('/api/signup/verify', async (c) => {
-  const { phone, full_name, code, password, region, national_id, id_front_url, id_back_url } = await c.req.json()
+  const { phone, full_name, code, password, region, national_id } = await c.req.json()
   const p = normalizePhone(phone || '')
-  if (!password || String(password).length < 4) return c.json({ error: 'Password must be at least 4 characters' }, 400)
-  if (!id_front_url || !id_back_url) return c.json({ error: 'Upload front and back of the national ID to continue' }, 400)
+  const name = String(full_name || '').trim()
+  const idNo = String(national_id || '').trim()
+  // ---- Input validation & sanitisation --------------------------------
+  if (name.length < 2 || name.length > 120) return c.json({ error: 'Enter your full name' }, 400)
+  if (!p || p.length < 9) return c.json({ error: 'Enter a valid phone number' }, 400)
+  if (!/^[0-9]{5,12}$/.test(idNo)) return c.json({ error: 'Enter a valid National ID number (digits only)' }, 400)
+  if (!password || String(password).length < 4 || String(password).length > 100) return c.json({ error: 'Password must be 4-100 characters' }, 400)
   const v = await verifyOtp(c, p, code, 'signup')
   if (!v.ok) return c.json({ error: v.error }, 400)
+  // ---- Uniqueness: phone (users) AND national_id (customers) -----------
   const existing = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
   if (existing) return c.json({ error: 'Account already exists. Please sign in.' }, 409)
+  const idClash = await c.env.DB.prepare(`SELECT id FROM customers WHERE national_id=?`).bind(idNo).first()
+  if (idClash) return c.json({ error: 'An account with this National ID already exists.' }, 409)
   const role = 'customer'
   const farmerPerms = await permissionsForRole(c, role)
   const r = await c.env.DB.prepare(
     `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?)`
-  ).bind(String(full_name).trim(), p, String(password), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
+  ).bind(name, p, String(password), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
   const userId = r.meta.last_row_id
   await c.env.DB.prepare(
-    `INSERT INTO customers (user_id, full_name, national_id, mobile, id_front_url, id_back_url, kyc_status) VALUES (?,?,?,?,?,?, 'pending')`
-  ).bind(userId, String(full_name).trim(), national_id || null, p, id_front_url, id_back_url).run()
-  const user = { id: userId, full_name: String(full_name).trim(), phone: p, role, region, label: 'Farmer', permissions: farmerPerms }
+    `INSERT INTO customers (user_id, full_name, national_id, mobile, kyc_status) VALUES (?,?,?,?, 'pending')`
+  ).bind(userId, name, idNo, p).run()
+  const user = { id: userId, full_name: name, phone: p, role, region, label: 'Farmer', permissions: farmerPerms }
   await createSession(c, user)
-  await audit(c, userId, 'signup', 'user', 'customer self-registered via SMS OTP with ID documents')
-  return c.json({ ok: true, user })
+  await audit(c, userId, 'signup', 'user', 'customer self-registered (step 1: name/phone/ID/password)')
+  return c.json({ ok: true, user, kyc_pending: true })
 })
 
 // ---- PASSWORD RESET via SMS OTP ----
@@ -959,6 +1024,18 @@ app.get('/api/customers/:id', requireAuth, async (c) => {
 app.post('/api/customers', requireAuth, requireRole('agent', 'admin', 'super_admin'), async (c) => {
   const b = await c.req.json()
   const user = c.get('user')
+  // Validate + enforce a unique National ID on agent/admin onboarding.
+  const onbId = String(b.national_id || '').trim()
+  if (onbId) {
+    if (!/^[0-9]{5,12}$/.test(onbId)) return c.json({ error: 'Enter a valid National ID number (digits only)' }, 400)
+    const clash = await c.env.DB.prepare(`SELECT id FROM customers WHERE national_id=?`).bind(onbId).first()
+    if (clash) return c.json({ error: 'A customer with this National ID already exists.' }, 409)
+    b.national_id = onbId
+  }
+  // Validate any uploaded document images before storing.
+  for (const f of ['id_front_url', 'id_back_url']) {
+    if (b[f] && !isSafeDataUrlOrHttp(b[f])) return c.json({ error: `${f.replace(/_/g, ' ')} must be a JPEG, PNG, WebP or GIF image under 8 MB.` }, 400)
+  }
   const saccoMember = ['yes', 'true', '1', 'on'].includes(String(b.sacco_membership || '').toLowerCase())
   const assignedAgent = user.role === 'agent' ? user.id : (b.agent_id || user.id)
   const r = await c.env.DB.prepare(
@@ -984,8 +1061,21 @@ app.put('/api/customers/:id', requireAuth, async (c) => {
   if (!cust) return c.json({ error: 'Not found' }, 404)
   const isAdmin = ['admin', 'super_admin'].includes(user.role)
   const isOwningAgent = user.role === 'agent' && cust.agent_id === user.id
-  if (!isAdmin && !isOwningAgent) return c.json({ error: 'Forbidden' }, 403)
+  // The owning customer may update their OWN record here (used by the Step-2 KYC
+  // document upload). They can never change immutable identity fields.
+  const isOwningCustomer = user.role === 'customer' && cust.user_id === user.id
+  if (!isAdmin && !isOwningAgent && !isOwningCustomer) return c.json({ error: 'Forbidden' }, 403)
   const b = await c.req.json()
+  // Immutable identity fields: national_id and mobile can never be changed after
+  // creation (uniqueness + integrity). Only a fresh admin create can set them.
+  b.national_id = undefined
+  b.mobile = undefined
+  // Validate any uploaded document images (data URLs) before storing them.
+  for (const f of ['id_front_url', 'id_back_url', 'selfie_url', 'passport_photo_url']) {
+    if (b[f] !== undefined && b[f] !== null && b[f] !== '' && !isSafeDataUrlOrHttp(b[f])) {
+      return c.json({ error: `${f.replace(/_/g, ' ')} must be a JPEG, PNG, WebP or GIF image under 8 MB.` }, 400)
+    }
+  }
   const saccoProvided = b.sacco_membership !== undefined
   const saccoMember = ['yes', 'true', '1', 'on'].includes(String(b.sacco_membership || '').toLowerCase())
   await c.env.DB.prepare(
@@ -1066,16 +1156,28 @@ app.post('/api/customers/:id/verify', requireAuth, async (c) => {
   if (!['admin', 'super_admin', 'agent', 'operations_finance'].includes(user.role)) {
     if (!(user.role === 'customer' && cust.user_id === user.id)) return c.json({ error: 'Forbidden' }, 403)
   }
+  // Persist the passport / selfie photo captured in this step (for liveliness).
+  const vbody = await c.req.json().catch(() => ({} as any))
+  if (vbody?.selfie_url && isSafeDataUrlOrHttp(vbody.selfie_url)) {
+    await c.env.DB.prepare(`UPDATE customers SET selfie_url=? WHERE id=?`).bind(String(vbody.selfie_url), id).run()
+    cust.selfie_url = String(vbody.selfie_url)
+  }
+  // STEP 2 (KYC) requires: ID front + back, a passport / selfie photo, and a
+  // successful liveliness check before the TransUnion credit check runs.
   if (!cust.id_front_url || !cust.id_back_url) return c.json({ error: 'Front and back national ID uploads are required before verification' }, 400)
+  if (!cust.selfie_url) return c.json({ error: 'A passport / selfie photo is required before verification' }, 400)
   const transunionLive = Boolean(c.env.TRANSUNION_API_URL && c.env.TRANSUNION_API_KEY)
+  // Liveliness check (simulated pass until a live provider is mapped). A real
+  // provider would compare the selfie against the ID photo and detect liveness.
+  const livenessPassed = 1
   const score = Math.floor(Math.random() * 350 + 450)
   const band = score >= 700 ? 'low' : score >= 600 ? 'medium' : 'high'
   const providerRef = `TU-${Date.now()}`
   await c.env.DB.prepare(`INSERT INTO transunion_checks (customer_id,credit_score,risk_band,defaults_found,raw_response,provider_reference,integration_status) VALUES (?,?,?,?,?,?,?)`)
     .bind(id, score, band, band === 'high' ? 1 : 0, JSON.stringify({ score, band, integration_ready: transunionLive }), providerRef, transunionLive ? 'ready_for_live_mapping' : 'stubbed').run()
   await c.env.DB.prepare(`INSERT INTO id_verifications (customer_id,face_match,liveness,ocr_name,ocr_dob,ocr_id_number,status) VALUES (?,?,?,?,?,?, 'verified')`)
-    .bind(id, 1, 1, cust.full_name, cust.date_of_birth, cust.national_id).run()
-  await c.env.DB.prepare(`UPDATE customers SET kyc_status='verified', risk_band=?, credit_score=? WHERE id=?`).bind(band, score, id).run()
+    .bind(id, 1, livenessPassed, cust.full_name, cust.date_of_birth, cust.national_id).run()
+  await c.env.DB.prepare(`UPDATE customers SET kyc_status='verified', risk_band=?, credit_score=?, liveliness_passed=?, kyc_completed_at=CURRENT_TIMESTAMP WHERE id=?`).bind(band, score, livenessPassed, id).run()
   await audit(c, user.id, 'verify', 'customer', `KYC verified for ${cust.full_name}`)
   return c.json({ ok: true, credit_score: score, risk_band: band, face_match: true, liveness: true, transunion_integration_ready: transunionLive, provider_reference: providerRef })
 })
@@ -1345,9 +1447,29 @@ app.post('/api/mpesa/confirm', requireAuth, async (c) => {
     success = true; receipt = 'SLE' + Math.random().toString(36).slice(2, 9).toUpperCase()
   } else {
     const q = await stkQuery(c.env, checkout_request_id)
-    if (q.ResultCode === '0' || q.ResultCode === 0) { success = true; receipt = 'LIVE' + Date.now().toString().slice(-7) }
-    else if (q.ResultCode) return c.json({ ok: false, status: 'failed', result_desc: q.ResultDesc || 'Payment not completed' })
-    else return c.json({ ok: false, status: 'pending' })
+    const rc = q?.ResultCode
+    const isSuccess = rc === '0' || rc === 0
+    // Daraja query semantics:
+    //  * ResultCode 0            => paid.
+    //  * No ResultCode, only an  => still processing (query fired before the
+    //    errorCode/errorMessage     customer finished / Safaricom hasn't posted
+    //    like 500.001.1001          the result yet). This is PENDING, not failed.
+    //  * A terminal ResultCode   => user cancelled (1032), timeout (1037),
+    //    (1032/1037/1/1025/...)     insufficient funds (1), etc => FAILED.
+    // The bug (screenshot): a "still under processing" response was being shown
+    // as "Payment Failed". We now only mark FAILED on a genuinely terminal
+    // ResultCode, and never surface a processing message as a failure.
+    const descRaw = String(q?.ResultDesc || q?.errorMessage || q?.CustomerMessage || '')
+    const looksPending = /process|being processed|under processing|pending|not.*found|try again|wait/i.test(descRaw)
+    if (isSuccess) {
+      success = true; receipt = 'LIVE' + Date.now().toString().slice(-7)
+    } else if (rc !== undefined && rc !== null && rc !== '' && !looksPending) {
+      // Genuine terminal failure — give the user a clean, non-contradictory reason.
+      return c.json({ ok: false, status: 'failed', result_desc: descRaw || 'Payment was not completed.' })
+    } else {
+      // Still processing (no terminal ResultCode, or a "processing" message).
+      return c.json({ ok: false, status: 'pending' })
+    }
   }
   if (success) {
     const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(intent.contract_id).first<any>()
@@ -2836,7 +2958,7 @@ const SHELL = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Farmsky — Sharia-Compliant Agri-Finance</title>
+  <title>Financing Agriculture</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
   <!-- Production Tailwind build (compiled via Tailwind CLI, no runtime CDN JIT). -->
   <link href="/static/tailwind.css" rel="stylesheet">

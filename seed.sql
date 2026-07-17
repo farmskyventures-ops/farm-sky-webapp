@@ -3,10 +3,10 @@
 -- =====================================================================
 
 INSERT OR IGNORE INTO users (id, full_name, phone, email, password, role, status, region) VALUES
-  (1, 'System Administrator', '+2547500000', 'admin@farmsky.demo', '1224', 'super_admin', 'active', 'HQ - Nairobi'),
-  (2, 'Field Agent - James Mwangi', '+2547400000', 'agent@farmsky.demo', '1225', 'agent', 'active', 'Nakuru'),
-  (3, 'Fatuma Hassan (Farmer)', '+2547300000', 'user@farmsky.demo', '1226', 'customer', 'active', 'Nakuru'),
-  (4, 'Customer Support - Aisha', '+2547200000', 'support@farmsky.demo', '1227', 'support', 'active', 'HQ - Nairobi');
+  (1, 'System Administrator', '+254702875711', 'admin@farmsky.demo', '1224', 'super_admin', 'active', 'HQ - Nairobi'),
+  (2, 'Field Agent - James Mwangi', '+254729436383', 'agent@farmsky.demo', '1225', 'agent', 'active', 'Nakuru'),
+  (3, 'Fatuma Hassan (Farmer)', '+254716401463', 'user@farmsky.demo', '1226', 'customer', 'active', 'Nakuru'),
+  (4, 'Customer Support - Aisha', '+254712612489', 'support@farmsky.demo', '1227', 'support', 'active', 'HQ - Nairobi');
 
 INSERT OR IGNORE INTO agents (id, user_id, region, permissions, commission_rate) VALUES
   (1, 2, 'Nakuru', '{"lead_generation":true,"inventory_access":false,"customer_support":true,"loan_approval":false}', 0.025);
@@ -28,7 +28,7 @@ INSERT OR IGNORE INTO products (id, sku, name, category, supplier_id, buying_pri
 
 -- Test customer starts KYC pending so "Complete User Registration" flow is demonstrable
 INSERT OR IGNORE INTO customers (id, user_id, agent_id, full_name, national_id, date_of_birth, gender, mobile, county, sub_county, ward, village, latitude, longitude, value_chain_type, value_chain, acreage, herd_size, farm_experience, kyc_status, risk_band, credit_score) VALUES
-  (1, 3, 2, 'Fatuma Hassan', '29384756', '1988-04-12', 'Female', '+2547300000', 'Nakuru', 'Naivasha', 'Hells Gate', 'Mai Mahiu', -0.7167, 36.4333, 'livestock', 'Dairy', 5.0, 8, 6, 'pending', NULL, NULL);
+  (1, 3, 2, 'Fatuma Hassan', '29384756', '1988-04-12', 'Female', '+254716401463', 'Nakuru', 'Naivasha', 'Hells Gate', 'Mai Mahiu', -0.7167, 36.4333, 'livestock', 'Dairy', 5.0, 8, 6, 'pending', NULL, NULL);
 
 INSERT OR IGNORE INTO customers (id, agent_id, full_name, national_id, gender, mobile, county, value_chain_type, value_chain, kyc_status, risk_band, credit_score) VALUES
   (2, 2, 'Peter Kamau', '31245678', 'Male', '+254790112233', 'Nakuru', 'crop', 'Maize', 'pending', 'medium', 610);

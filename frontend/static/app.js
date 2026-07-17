@@ -376,39 +376,33 @@ function authSignUp() {
   }
 }
 function authSignUpVerify(phone, name, demoOtp) {
+  // STEP 1 completion: verify the phone (OTP) and capture ID Number + Password.
+  // Identity documents, passport photo, liveliness & TransUnion are STEP 2 (KYC)
+  // and are completed later from "My Account" — cash purchases work without them;
+  // financed purchases prompt the customer to finish KYC first.
   $('authBody').innerHTML = `
     <p class="text-sm text-slate-600 mb-1">Enter the code sent to <b>${esc(phone)}</b></p>
     ${demoOtp ? `<div class="bg-teal-50 border border-teal-200 text-teal-800 text-sm rounded-lg p-2 mb-3">Demo code: <b class="tracking-widest">${esc(demoOtp)}</b></div>` : ''}
     <form id="suvForm" class="space-y-4">
       <div><label class="text-sm font-medium text-slate-600">Verification Code</label>
-        <input id="su_code" type="text" inputmode="numeric" placeholder="6-digit code" value="${esc(demoOtp || '')}" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg tracking-widest" required></div>
+        <input id="su_code" type="text" inputmode="numeric" maxlength="6" placeholder="6-digit code" value="${esc(demoOtp || '')}" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg tracking-widest" required></div>
       <div><label class="text-sm font-medium text-slate-600">National ID Number</label>
-        <input id="su_nid" type="text" placeholder="National ID" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
+        <input id="su_nid" type="text" inputmode="numeric" placeholder="e.g. 12345678" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
       <div><label class="text-sm font-medium text-slate-600">Create Password</label>
         ${passwordField('su_pass', { placeholder: 'Choose a password', required: true })}</div>
-      <div class="border-t pt-4">
-        <h4 class="font-semibold text-slate-800 mb-1">Identity capture</h4>
-        <p class="text-xs text-slate-500 mb-4">Step 1: ID front. Step 2: ID back. Step 3: passport photo for liveness.</p>
-        <div class="space-y-4">
-          ${kycStepCard({ sectionId: 'su_front_section', title: 'Step 1 — National ID front', subtitle: 'Upload from gallery or use the back camera.', previewId: 'su_front_preview', statusId: 'su_front_status', hiddenId: 'su_id_front_url', galleryId: 'su_front_gallery', cameraId: 'su_front_camera', cameraFacing: 'environment', cameraLabel: 'Open back camera', nextSectionId: 'su_back_section' })}
-          ${kycStepCard({ sectionId: 'su_back_section', title: 'Step 2 — National ID back', subtitle: 'Unlocks after the front image is captured.', previewId: 'su_back_preview', statusId: 'su_back_status', hiddenId: 'su_id_back_url', galleryId: 'su_back_gallery', cameraId: 'su_back_camera', cameraFacing: 'environment', cameraLabel: 'Open back camera', nextSectionId: 'su_selfie_section', hidden: true })}
-          ${kycStepCard({ sectionId: 'su_selfie_section', title: 'Step 3 — Passport photo / live selfie', subtitle: 'Use the front camera for liveness verification.', previewId: 'su_selfie_preview', statusId: 'su_selfie_status', hiddenId: 'su_selfie_url', galleryId: 'su_selfie_gallery', cameraId: 'su_selfie_camera', cameraFacing: 'user', cameraLabel: 'Open front camera', hidden: true })}
-        </div>
-      </div>
-      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Verify & Create Account</button>
+      <p class="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-2">You can shop and pay <b>cash</b> right away. To unlock <b>financing</b>, complete your KYC (ID photos, passport photo, liveliness & credit check) from <b>My Account</b> after signing up.</p>
+      <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Verify &amp; Create Account</button>
     </form>
     <button onclick="renderLogin('signup')" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Back</button>`
   $('suvForm').onsubmit = async (e) => {
     e.preventDefault()
+    const nid = ($('su_nid').value || '').trim()
+    if (!/^[0-9]{5,12}$/.test(nid)) return toast('Enter a valid National ID number (digits only)', false)
     try {
-      const id_front_url = $('su_id_front_url').value
-      const id_back_url = $('su_id_back_url').value
-      const selfie_url = $('su_selfie_url').value
-      if (!id_front_url) return toast('Capture the front of the ID first', false)
-      if (!id_back_url) return toast('Capture the back of the ID next', false)
-      if (!selfie_url) return toast('Take the passport photo / selfie to continue', false)
-      const { data } = await api.post('/signup/verify', { phone, full_name: name, code: $('su_code').value, password: $('su_pass').value, national_id: $('su_nid').value, id_front_url, id_back_url, selfie_url })
-      state.user = data.user; toast('Account created. Welcome, ' + data.user.full_name); renderApp()
+      const { data } = await api.post('/signup/verify', { phone, full_name: name, code: $('su_code').value, password: $('su_pass').value, national_id: nid })
+      state.user = data.user
+      toast('Account created. Welcome, ' + data.user.full_name)
+      renderApp()
     } catch (err) { toast(err.response?.data?.error || 'Verification failed', false) }
   }
 }
@@ -723,7 +717,7 @@ window.getQuote = async (productId) => {
     </div>`
 }
 window.submitBuy = async (productId) => {
-  if (!$('consent').checked) return toast('Consent is required (Sharia requirement)', false)
+  if (!$('consent').checked) return toast('Consent is required', false)
   const body = { product_id: productId, quantity: $('qty').value, payment_type: $('ptype').value, term_months: $('term') ? $('term').value : 0, delivery_location: $('dloc').value, consent: true }
   try {
     const { data } = await api.post('/murabaha/apply', body)
@@ -882,12 +876,12 @@ window.payModal = async (id, amount, outstanding, kind) => {
     <div class="grid grid-cols-2 gap-3 mb-3">
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-emerald-500 has-[:checked]:border-emerald-400">
         <input type="radio" name="paymethod" value="mpesa" checked onchange="toggleSasaChannels()" class="hidden">
-        <img src="/static/mpesa-logo.svg" alt="M-Pesa" class="h-10 mx-auto mb-1 object-contain">
+        <img src="/static/mpesa-logo.png" alt="M-Pesa" class="h-10 mx-auto mb-1 object-contain">
         <div>${modeBadge(mpMode)}</div>
       </label>
       <label class="border rounded-lg p-3 text-center cursor-pointer bg-white border-slate-200 has-[:checked]:ring-2 has-[:checked]:ring-green-500 has-[:checked]:border-green-400">
         <input type="radio" name="paymethod" value="sasapay" onchange="toggleSasaChannels()" class="hidden">
-        <img src="/static/sasapay-logo.svg" alt="SasaPay" class="h-10 mx-auto mb-1 object-contain">
+        <img src="/static/sasapay-logo.png" alt="SasaPay" class="h-10 mx-auto mb-1 object-contain">
         <div>${modeBadge(spMode)}</div>
       </label>
     </div>
@@ -920,7 +914,7 @@ window.payModal = async (id, amount, outstanding, kind) => {
       <div class="text-[11px] font-semibold text-slate-600 uppercase tracking-wider mb-1 text-left">${isCash ? 'Cash Sale Agreement' : 'Asset Financing Agreement'}</div>
       <p class="text-[11px] leading-relaxed text-slate-500 text-left">${isCash
         ? 'This is an outright cash sale. By proceeding you confirm full/settlement payment of the amount due and accept transfer of ownership of the equipment upon settlement. All sales are governed by FarmSky cash sale terms and no financing profit or installment obligations apply.'
-        : 'This is a Sharia-compliant asset financing (Murabaha) transaction. By proceeding you agree to the disclosed murabaha price, deposit and the installment repayment schedule until the outstanding balance is fully settled. Ownership transfers per the executed financing agreement and applicable FarmSky financing terms.'}</p>
+        : 'This is an asset financing transaction. By proceeding you agree to the disclosed financing price, deposit and the installment repayment schedule until the outstanding balance is fully settled. Ownership transfers per the executed financing agreement and applicable FarmSky financing terms.'}</p>
     </div>
     <div id="payStatus"></div>
     <div class="flex gap-2"><button id="payBtn" onclick="doPay(${id}, '${kind}')" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Send Payment Prompt</button>
@@ -2474,12 +2468,17 @@ async function viewProfile() {
           </div>
         </div>
         <div class="mt-4 field-group">
-          <label class="field-label">Profile picture URL</label>
-          <div class="flex gap-2">
-            <input id="pf_avatar" value="${esc(u.avatar_url || '')}" class="flex-1 px-3 py-2 border rounded-lg text-sm" placeholder="https://... image URL">
+          <label class="field-label">Profile picture</label>
+          <input id="pf_avatar" type="hidden" value="${esc(u.avatar_url || '')}">
+          <div class="flex gap-2 items-center">
+            <label class="btn bg-slate-100 px-3 py-2 rounded-lg text-sm cursor-pointer border">
+              <i class="fas fa-upload mr-1"></i>Choose image
+              <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" class="hidden" onchange="pickAvatarFile(this)">
+            </label>
+            <span id="pf_avatar_name" class="text-xs text-slate-500 truncate flex-1"></span>
             <button onclick="saveAvatar()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-image mr-1"></i>Update</button>
           </div>
-          <p class="text-[11px] text-slate-500 mt-1">Everyone can update their profile picture.</p>
+          <p class="text-[11px] text-slate-500 mt-1">Attach a JPEG, PNG, WebP or GIF image (max 8 MB). Everyone can update their profile picture.</p>
         </div>
       </div>
 
@@ -2520,9 +2519,26 @@ async function viewProfile() {
       </div>
     </div>`
 }
+window.pickAvatarFile = (input) => {
+  const file = input.files?.[0]
+  if (!file) return
+  const okTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+  if (!okTypes.includes(file.type)) { toast('Please choose a JPEG, PNG, WebP or GIF image.', false); input.value = ''; return }
+  if (file.size > 8 * 1024 * 1024) { toast('Image is too large (max 8 MB).', false); input.value = ''; return }
+  const reader = new FileReader()
+  reader.onload = () => {
+    const dataUrl = reader.result
+    if ($('pf_avatar')) $('pf_avatar').value = dataUrl
+    if ($('pf_avatar_name')) $('pf_avatar_name').textContent = file.name
+    const box = $('avatarPreview')
+    if (box) box.innerHTML = `<img src="${dataUrl}" class="h-24 w-24 rounded-full object-cover border-2 border-teal-200">`
+  }
+  reader.readAsDataURL(file)
+}
 window.saveAvatar = async () => {
   try {
     const url = ($('pf_avatar') || {}).value || ''
+    if (!url) { toast('Choose an image first.', false); return }
     await api.put('/me/avatar', { avatar_url: url })
     if (state.user) state.user.avatar_url = url
     const box = $('avatarPreview')
