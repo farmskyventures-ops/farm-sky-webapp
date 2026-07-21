@@ -1996,7 +1996,7 @@ window.directPayModal = async () => {
   try { const { data } = await api.get('/users'); users = data.users || [] } catch (_) {}
   const userOpts = users.map(u => `<option value="${u.id}">${esc(u.full_name)} · ${esc(roleLabel(u.role))}</option>`).join('')
   showModal(`<h3 class="font-bold mb-1"><i class="fas fa-paper-plane text-teal-600 mr-2"></i>Direct payment to an individual</h3>
-    <p class="text-xs text-slate-500 mb-3">Pay someone directly — credit their in-app wallet, or push funds to a mobile / bank number via SasaPay.</p>
+    <p class="text-xs text-slate-500 mb-3">Pay Via in-app wallet, or MPESA / Bank.</p>
     <label class="field-label">Destination</label>
     <select id="dp_dest" onchange="onDirectPayDest()" class="w-full px-3 py-2 border rounded-lg mb-3">
       <option value="wallet">In-app wallet (user)</option>
