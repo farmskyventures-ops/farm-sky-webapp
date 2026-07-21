@@ -36,6 +36,29 @@ api.interceptors.response.use(
 )
 const fmt = (n) => 'KES ' + Number(n || 0).toLocaleString()
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m]))
+// btnLoading(btn|id, label): disable a button and show a spinner; returns a
+// reset() closure. Used across the ported parity views (backups / imports).
+function btnLoading(target, label = 'Processing…') {
+  const btn = typeof target === 'string' ? $(target) : target
+  if (!btn) return () => {}
+  if (btn.disabled) return () => {}
+  btn.disabled = true
+  btn.setAttribute('aria-busy', 'true')
+  btn.classList.add('opacity-60', 'cursor-not-allowed', 'pointer-events-none')
+  if (btn.dataset.origHtml === undefined) btn.dataset.origHtml = btn.innerHTML
+  btn.innerHTML = `<span class="inline-flex items-center justify-center gap-2"><span class="inline-block w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin"></span>${esc(label)}</span>`
+  return () => btnReset(btn)
+}
+function btnReset(target) {
+  const btn = typeof target === 'string' ? $(target) : target
+  if (!btn) return
+  btn.disabled = false
+  btn.removeAttribute('aria-busy')
+  btn.classList.remove('opacity-60', 'cursor-not-allowed', 'pointer-events-none')
+  if (btn.dataset.origHtml !== undefined) { btn.innerHTML = btn.dataset.origHtml; delete btn.dataset.origHtml }
+}
+window.btnLoading = btnLoading
+window.btnReset = btnReset
 // Friendly labels for equipment payment types
 const payLabel = (t, model) => {
   if (t === 'financing') {
@@ -424,9 +447,60 @@ function authSignIn() {
     e.preventDefault()
     try {
       const { data } = await api.post('/login', { phone: $('phone').value, password: $('password').value })
+      // Multi-user onboarding: a temporary password forces an immediate change.
+      if (data.must_change_password) { renderForceChangePassword(data.user); return }
       state.user = data.user; toast('Welcome, ' + data.user.full_name); renderApp()
-    } catch (err) { toast(err.response?.data?.error || 'Login failed', false) }
+    } catch (err) {
+      const resp = err.response?.data || {}
+      // Expired temporary password → offer to request an admin-triggered reset.
+      if (resp.temp_expired) { renderTempExpired(resp.phone || $('phone').value); return }
+      toast(resp.error || 'Login failed', false)
+    }
   }
+}
+// Mandatory password update on first login with a temporary password.
+function renderForceChangePassword(user) {
+  const f = $('authBody') || $('content')
+  f.innerHTML = `<div class="max-w-sm mx-auto">
+    <h2 class="text-xl font-bold mb-1">Set your password</h2>
+    <p class="text-sm text-slate-500 mb-4">Welcome${user && user.full_name ? ', ' + esc(user.full_name) : ''}. Your account uses a temporary password. Please choose your own secure password to continue.</p>
+    <div class="space-y-3">
+      ${passwordField('fc_new', { placeholder: 'New password (min 4 characters)' })}
+      ${passwordField('fc_confirm', { placeholder: 'Confirm new password' })}
+      <button id="fcBtn" onclick="doForceChangePassword()" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Save & Continue</button>
+    </div></div>`
+}
+window.doForceChangePassword = async () => {
+  const pw = $('fc_new').value, cf = $('fc_confirm').value
+  if (!pw || pw.length < 4) { toast('Password must be at least 4 characters', false); return }
+  if (pw !== cf) { toast('Passwords do not match', false); return }
+  const done = btnLoading('fcBtn', 'Saving…')
+  try {
+    // The session token from login (must_change) is already set; update password.
+    await api.put('/me/password', { new_password: pw })
+    const { data } = await api.get('/me')
+    state.user = data.user || data; toast('Password updated'); renderApp()
+  } catch (err) { done(); toast(err.response?.data?.error || 'Could not update password', false) }
+}
+// Login screen option shown when a temporary password has expired.
+function renderTempExpired(phone) {
+  const f = $('authBody') || $('content')
+  f.innerHTML = `<div class="max-w-sm mx-auto text-center">
+    <div class="w-14 h-14 mx-auto rounded-full bg-amber-100 text-amber-600 flex items-center justify-center text-2xl mb-3"><i class="fas fa-hourglass-end"></i></div>
+    <h2 class="text-xl font-bold mb-1">Temporary password expired</h2>
+    <p class="text-sm text-slate-500 mb-4">Your temporary password is no longer valid. Request an administrator to reset it — you'll receive a new one by SMS.</p>
+    <input id="te_phone" value="${esc(phone || '')}" placeholder="Phone" class="w-full px-3 py-2 border rounded-lg mb-3">
+    <button id="teBtn" onclick="doRequestAdminReset()" class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Request admin reset</button>
+    <button onclick="renderLogin('signin')" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Back to sign in</button>
+  </div>`
+}
+window.doRequestAdminReset = async () => {
+  const done = btnLoading('teBtn', 'Sending…')
+  try {
+    const { data } = await api.post('/onboard/request-reset', { phone: $('te_phone').value })
+    toast(data.message || 'Request sent to admin')
+    renderLogin('signin')
+  } catch (err) { done(); toast(err.response?.data?.error || 'Failed to send request', false) }
 }
 // ---------------------------------------------------------------------------
 // KYC helpers — gallery + camera capture for ID front, ID back, selfie
@@ -611,7 +685,10 @@ function navItems() {
     { k: 'ledger', i: 'fa-book', t: 'Payment Ledger' },
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
     { k: 'settings', i: 'fa-sliders', t: 'Financing Settings' },
-    { k: 'exports', i: 'fa-database', t: 'Data Export' }])
+    { k: 'exports', i: 'fa-database', t: 'Data Export' },
+    { k: 'amendments', i: 'fa-id-card-clip', t: 'Amendments' },
+    { k: 'imports', i: 'fa-file-arrow-up', t: 'Bulk Import' },
+    { k: 'backups', i: 'fa-shield-halved', t: 'Backups' }])
   if (r === 'operations_finance') return withAccount([...common,
     { k: 'approvals', i: 'fa-clipboard-check', t: 'Approvals' },
     financeQueue,
@@ -673,9 +750,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', ledger: 'Unified Payment Ledger' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', ledger: 'Unified Payment Ledger', amendments: 'Pending Profile Amendments', imports: 'Bulk User Data Upload', backups: 'Automated System Backups' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, ledger: viewLedger }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, ledger: viewLedger, amendments: viewAmendments, imports: viewImports, backups: viewBackups }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -2641,6 +2718,19 @@ async function viewProfile() {
         <p class="text-sm text-slate-500"><i class="fas fa-circle-info text-teal-600 mr-2"></i>As a <b>${esc(roleLabel(u.role))}</b>, you can update your profile picture and password here. Your account details are managed by an administrator.</p>
       </div>`}
 
+      <!-- FEATURE 4: Amendment request for locked identity fields -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-id-card-clip text-amber-600 mr-2"></i>Request National ID / Phone Change</h3>
+        <p class="text-xs text-slate-500 mb-4">Your <b>National ID</b> and <b>Phone number</b> are locked. To change them, submit a request below with a reason. An administrator will review and approve or reject it.</p>
+        <div id="amendStatus" class="mb-3"></div>
+        <div class="responsive-grid cols-2 text-sm">
+          ${isFarmer ? `<div><label class="field-label">New National ID</label><input id="am_national_id" placeholder="Leave blank to keep current" class="px-3 py-2 border rounded-lg w-full"></div>` : ''}
+          <div><label class="field-label">New Phone number</label><input id="am_phone" placeholder="e.g. 07XXXXXXXX (leave blank to keep)" class="px-3 py-2 border rounded-lg w-full"></div>
+          <div class="${isFarmer ? 'col-span-2' : ''}"><label class="field-label">Reason for change</label><textarea id="am_reason" rows="2" placeholder="Explain why this change is needed" class="px-3 py-2 border rounded-lg w-full"></textarea></div>
+        </div>
+        <div class="flex gap-2 mt-4"><button id="am_submit" onclick="submitAmendment()" class="btn bg-amber-600 hover:bg-amber-700 text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Submit Request</button></div>
+      </div>
+
       <!-- Change password (everyone) -->
       <div class="card p-6">
         <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-key text-teal-600 mr-2"></i>Change Password</h3>
@@ -2652,6 +2742,47 @@ async function viewProfile() {
         <div class="flex gap-2 mt-4"><button onclick="changeMyPassword()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-lock mr-1"></i>Update Password</button></div>
       </div>
     </div>`
+  loadMyAmendments()
+}
+// FEATURE 4 — submit + display my amendment requests.
+window.submitAmendment = async () => {
+  const body = {
+    new_national_id: ($('am_national_id') || {}).value || '',
+    new_phone: ($('am_phone') || {}).value || '',
+    reason: ($('am_reason') || {}).value || ''
+  }
+  if (!body.new_national_id && !body.new_phone) return toast('Enter a new National ID and/or phone number.', false)
+  if (!body.reason || body.reason.trim().length < 4) return toast('Please give a reason (at least 4 characters).', false)
+  const done = btnLoading('am_submit', 'Submitting…')
+  try {
+    await api.post('/profile-amendments', body)
+    done()
+    if ($('am_national_id')) $('am_national_id').value = ''
+    if ($('am_phone')) $('am_phone').value = ''
+    if ($('am_reason')) $('am_reason').value = ''
+    toast('Amendment request submitted for review')
+    loadMyAmendments()
+  } catch (err) { done(); toast(err.response?.data?.error || 'Failed to submit request', false) }
+}
+async function loadMyAmendments() {
+  const box = $('amendStatus')
+  if (!box) return
+  try {
+    const { data } = await api.get('/profile-amendments/mine')
+    const list = data.amendments || []
+    if (!list.length) { box.innerHTML = ''; return }
+    box.innerHTML = list.slice(0, 5).map(a => {
+      const tone = a.status === 'approved' ? 'emerald' : a.status === 'rejected' ? 'red' : 'amber'
+      const parts = []
+      if (a.new_national_id) parts.push('National ID → ' + esc(a.new_national_id))
+      if (a.new_phone) parts.push('Phone → ' + esc(a.new_phone))
+      return `<div class="text-xs p-2 rounded-lg bg-${tone}-50 border border-${tone}-200 mb-2">
+        <span class="font-semibold text-${tone}-800 uppercase">${esc(a.status)}</span>
+        <span class="text-slate-600 ml-1">${parts.join(' · ')}</span>
+        ${a.review_notes ? `<div class="text-slate-500 mt-0.5">Note: ${esc(a.review_notes)}</div>` : ''}
+      </div>`
+    }).join('')
+  } catch (err) { box.innerHTML = '' }
 }
 window.pickAvatarFile = (input) => {
   const file = input.files?.[0]
@@ -3083,5 +3214,243 @@ function showModal(html) {
     <div class="bg-white rounded-2xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto fade-in">${html}</div></div>`
 }
 window.closeModal = () => { stopLive(); $('modal').innerHTML = '' }
+
+// ===========================================================================
+// PARITY: PROFILE AMENDMENTS (admin review dashboard)
+// ===========================================================================
+async function viewAmendments() {
+  let data
+  try { data = (await api.get('/profile-amendments?status=pending')).data }
+  catch (err) { $('content').innerHTML = `<div class="card p-6 text-red-600 text-sm">${esc(err.response?.data?.error || 'Failed to load amendment requests')}</div>`; return }
+  const list = data.amendments || []
+  $('content').innerHTML = `
+    <div class="card table-card">
+      <div class="px-4 py-3 border-b border-slate-100 text-sm text-slate-500"><i class="fas fa-inbox text-amber-600 mr-2"></i>Pending identity-change requests awaiting your review.</div>
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+          <th class="text-left px-4 py-3">Requester</th><th class="text-left px-4 py-3">Field(s)</th>
+          <th class="text-left px-4 py-3">Current</th><th class="text-left px-4 py-3">Requested</th>
+          <th class="text-left px-4 py-3">Reason</th><th class="text-left px-4 py-3">Submitted</th><th></th></tr></thead>
+        <tbody>${list.map(a => `<tr class="border-t border-slate-100 align-top">
+          <td class="px-4 py-3"><div class="font-medium">${esc(a.requester_name || '')}</div><div class="text-xs text-slate-400">${esc(roleLabel(a.requester_role || ''))}</div></td>
+          <td class="px-4 py-3 text-xs">${esc((a.field || '').replace('_', ' '))}</td>
+          <td class="px-4 py-3 text-xs text-slate-500">${a.current_national_id ? 'ID: ' + esc(a.current_national_id) + '<br>' : ''}${a.current_phone ? 'Tel: ' + esc(a.current_phone) : ''}</td>
+          <td class="px-4 py-3 text-xs">${a.new_national_id ? '<b>ID: ' + esc(a.new_national_id) + '</b><br>' : ''}${a.new_phone ? '<b>Tel: ' + esc(a.new_phone) + '</b>' : ''}</td>
+          <td class="px-4 py-3 text-xs max-w-xs">${esc(a.reason || '')}</td>
+          <td class="px-4 py-3 text-xs text-slate-400">${esc((a.created_at || '').slice(0, 16).replace('T', ' '))}</td>
+          <td class="px-4 py-3 whitespace-nowrap text-right">
+            <button onclick="decideAmendment(${a.id},'approve')" class="text-emerald-600 hover:underline text-xs mr-2">Approve</button>
+            <button onclick="decideAmendment(${a.id},'reject')" class="text-red-600 hover:underline text-xs">Reject</button>
+          </td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No pending amendment requests</td></tr>'}</tbody>
+      </table></div>`
+}
+window.decideAmendment = async (id, action) => {
+  let notes = ''
+  if (action === 'reject') {
+    notes = prompt('Reason for rejecting this request (optional):', '')
+    if (notes === null) return
+  } else {
+    if (!confirm('Approve this identity change? The new value will be applied and the user will need to sign in again.')) return
+  }
+  try { await api.post('/profile-amendments/' + id + '/decision', { action, notes }); toast(action === 'approve' ? 'Request approved' : 'Request rejected'); viewAmendments() }
+  catch (err) { toast(err.response?.data?.error || 'Failed to process request', false) }
+}
+
+// ===========================================================================
+// PARITY: AUTOMATED SYSTEM BACKUPS
+// ===========================================================================
+async function viewBackups() {
+  $('content').innerHTML = `<div id="bk_wrap"><p class="text-sm text-slate-400"><i class="fas fa-spinner fa-spin mr-1"></i>Loading backups…</p></div>`
+  await refreshBackups()
+}
+async function refreshBackups() {
+  try {
+    const { data } = await api.get('/backups')
+    const rows = data.backups || []
+    const list = rows.length ? rows.map(b => `
+      <tr class="border-b">
+        <td class="py-2 px-2 text-xs">#${b.id}</td>
+        <td class="py-2 px-2"><span class="px-2 py-0.5 rounded-full text-xs ${b.trigger_type === 'auto' ? 'bg-sky-100 text-sky-700' : 'bg-slate-100 text-slate-700'}">${esc(b.trigger_type)}</span></td>
+        <td class="py-2 px-2 text-xs">${b.record_count}</td>
+        <td class="py-2 px-2 text-xs">${(b.size_bytes/1024).toFixed(1)} KB</td>
+        <td class="py-2 px-2 text-xs">${b.status === 'success' ? '<span class="text-emerald-600">success</span>' : '<span class="text-red-600">' + esc(b.error || 'failed') + '</span>'}</td>
+        <td class="py-2 px-2 text-xs text-slate-500">${esc(String(b.created_at || '').slice(0,19))}</td>
+        <td class="py-2 px-2 text-right">${b.status === 'success' ? `<button onclick="downloadBackup(${b.id})" class="btn text-xs bg-slate-800 text-white px-2 py-1 rounded"><i class="fas fa-download mr-1"></i>JSON</button>` : ''}</td>
+      </tr>`).join('') : `<tr><td colspan="7" class="py-6 text-center text-sm text-slate-400">No backups yet.</td></tr>`
+    $('bk_wrap').innerHTML = `
+      <div class="bg-white rounded-2xl border border-slate-200 p-5 mb-4">
+        <div class="flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <h3 class="font-bold text-slate-800"><i class="fas fa-shield-halved text-teal-600 mr-2"></i>Automated System Backups</h3>
+            <p class="text-xs text-slate-500 mt-1">Regular automated snapshots of all user profiles, transactional records and system-wide data. Automatic backups run every ${data.interval_hours || 24} hours.</p>
+          </div>
+          <button id="bkNowBtn" onclick="runBackupNow()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-play mr-1"></i>Back up now</button>
+        </div>
+      </div>
+      <div class="bg-white rounded-2xl border border-slate-200 p-5 overflow-x-auto">
+        <table class="w-full text-left"><thead><tr class="text-xs text-slate-400 border-b">
+          <th class="py-2 px-2">ID</th><th class="py-2 px-2">Trigger</th><th class="py-2 px-2">Records</th><th class="py-2 px-2">Size</th><th class="py-2 px-2">Status</th><th class="py-2 px-2">Created</th><th class="py-2 px-2"></th>
+        </tr></thead><tbody>${list}</tbody></table>
+      </div>`
+  } catch (err) { $('bk_wrap').innerHTML = `<p class="text-sm text-red-500">${esc(err.response?.data?.error || 'Failed to load backups')}</p>` }
+}
+window.runBackupNow = async () => {
+  const done = btnLoading('bkNowBtn', 'Backing up…')
+  try {
+    const { data } = await api.post('/backups', {})
+    toast(`Backup created — ${data.record_count} records`)
+    await refreshBackups()
+  } catch (err) { done(); toast(err.response?.data?.error || 'Backup failed', false) }
+}
+window.downloadBackup = async (id) => {
+  try {
+    const res = await api.get(`/backups/${id}/download`, { responseType: 'blob' })
+    triggerDownload(res.data, `farmsky-backup-${id}.json`)
+    toast('Download started')
+  } catch (err) { toast('Download failed', false) }
+}
+
+// ===========================================================================
+// PARITY: BULK USER DATA UPLOAD & STANDARDIZATION
+// ===========================================================================
+let _importRows = null
+let _importBatchRows = []
+async function viewImports() {
+  $('content').innerHTML = `<div id="im_wrap"></div>`
+  await renderImportHome()
+}
+async function renderImportHome() {
+  let batches = []
+  try { const { data } = await api.get('/imports'); batches = data.batches || [] } catch (_) {}
+  const rows = batches.length ? batches.map(b => `
+    <tr class="border-b">
+      <td class="py-2 px-2 text-xs">#${b.id}</td>
+      <td class="py-2 px-2 text-xs capitalize">${esc(b.category)}</td>
+      <td class="py-2 px-2 text-xs">${esc(b.filename || '—')}</td>
+      <td class="py-2 px-2 text-xs">${b.total_rows}</td>
+      <td class="py-2 px-2 text-xs text-emerald-600">${b.valid_rows}</td>
+      <td class="py-2 px-2 text-xs text-amber-600">${b.exception_rows}</td>
+      <td class="py-2 px-2 text-xs text-sky-600">${b.dispatched_rows}</td>
+      <td class="py-2 px-2 text-xs"><span class="px-2 py-0.5 rounded-full bg-slate-100 text-slate-700">${esc(b.status)}</span></td>
+      <td class="py-2 px-2 text-right"><button onclick="openImportBatch(${b.id})" class="btn text-xs bg-slate-800 text-white px-2 py-1 rounded">Review</button></td>
+    </tr>`).join('') : `<tr><td colspan="9" class="py-6 text-center text-sm text-slate-400">No import batches yet.</td></tr>`
+  $('im_wrap').innerHTML = `
+    <div class="bg-white rounded-2xl border border-slate-200 p-5 mb-4">
+      <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-file-arrow-up text-teal-600 mr-2"></i>Upload a categorized file</h3>
+      <p class="text-xs text-slate-500 mb-3">Import Farmers, Agents or Partners from CSV/XLSX. Columns are auto-mapped to standard fields (Full Name, Phone, National ID, Location, Value Chain). Rows missing required fields are flagged for you to complete before onboarding is dispatched.</p>
+      <div class="grid gap-3 sm:grid-cols-3">
+        <select id="im_category" class="px-3 py-2 border rounded-lg text-sm">
+          <option value="farmers">Farmers</option><option value="agents">Agents</option><option value="partners">Partners</option>
+        </select>
+        <input id="im_file" type="file" accept=".csv,.xlsx,.xls" onchange="parseImportFile()" class="px-3 py-2 border rounded-lg text-sm sm:col-span-2">
+      </div>
+      <div id="im_preview" class="mt-3"></div>
+    </div>
+    <div class="bg-white rounded-2xl border border-slate-200 p-5 overflow-x-auto">
+      <h3 class="font-bold text-slate-800 mb-2 text-sm">Recent batches</h3>
+      <table class="w-full text-left"><thead><tr class="text-xs text-slate-400 border-b">
+        <th class="py-2 px-2">ID</th><th class="py-2 px-2">Category</th><th class="py-2 px-2">File</th><th class="py-2 px-2">Total</th><th class="py-2 px-2">Valid</th><th class="py-2 px-2">Exceptions</th><th class="py-2 px-2">Onboarded</th><th class="py-2 px-2">Status</th><th class="py-2 px-2"></th>
+      </tr></thead><tbody>${rows}</tbody></table>
+    </div>`
+}
+window.parseImportFile = () => {
+  const f = $('im_file').files[0]
+  if (!f) return
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    try {
+      const wb = XLSX.read(e.target.result, { type: 'array' })
+      const ws = wb.Sheets[wb.SheetNames[0]]
+      _importRows = XLSX.utils.sheet_to_json(ws, { defval: '' })
+      const n = _importRows.length
+      $('im_preview').innerHTML = n
+        ? `<div class="flex items-center justify-between bg-emerald-50 border border-emerald-200 rounded-lg p-3">
+             <span class="text-sm text-emerald-700"><i class="fas fa-check-circle mr-1"></i>${n} rows parsed from <b>${esc(f.name)}</b></span>
+             <button id="imUpBtn" onclick="uploadImport('${esc(f.name)}')" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm">Upload & validate</button>
+           </div>`
+        : `<p class="text-sm text-amber-600">No rows found in the file.</p>`
+    } catch (err) { $('im_preview').innerHTML = `<p class="text-sm text-red-500">Could not parse file. Use a valid CSV or XLSX.</p>` }
+  }
+  reader.readAsArrayBuffer(f)
+}
+window.uploadImport = async (filename) => {
+  if (!_importRows || !_importRows.length) return toast('Choose a file first', false)
+  const done = btnLoading('imUpBtn', 'Uploading…')
+  try {
+    const { data } = await api.post('/imports', { category: $('im_category').value, filename, rows: _importRows })
+    toast(`Uploaded — ${data.valid} valid, ${data.exceptions} need attention`)
+    _importRows = null
+    openImportBatch(data.batch_id)
+  } catch (err) { done(); toast(err.response?.data?.error || 'Upload failed', false) }
+}
+window.openImportBatch = async (id) => {
+  $('content').innerHTML = `<div id="im_wrap"><p class="text-sm text-slate-400"><i class="fas fa-spinner fa-spin mr-1"></i>Loading batch…</p></div>`
+  try {
+    const { data } = await api.get('/imports/' + id)
+    const b = data.batch
+    const rowsHtml = (data.rows || []).map(r => {
+      const isEx = r.status === 'exception'
+      const isDone = r.status === 'dispatched'
+      return `<tr class="border-b ${isEx ? 'bg-amber-50' : ''}">
+        <td class="py-2 px-2 text-xs">${r.row_number}</td>
+        <td class="py-2 px-2 text-xs">${esc(r.full_name || '—')}</td>
+        <td class="py-2 px-2 text-xs">${esc(r.phone || '—')}</td>
+        <td class="py-2 px-2 text-xs">${esc(r.national_id || '—')}</td>
+        <td class="py-2 px-2 text-xs">${esc(r.county || '—')}</td>
+        <td class="py-2 px-2 text-xs">${isDone ? '<span class="text-sky-600">onboarded</span>' : isEx ? '<span class="text-amber-600">' + esc(r.issues || 'exception') + '</span>' : '<span class="text-emerald-600">valid</span>'}</td>
+        <td class="py-2 px-2 text-right">${isEx ? `<button onclick="fixImportRow(${r.id})" class="btn text-xs bg-amber-500 text-white px-2 py-1 rounded">Fix</button>` : ''}</td>
+      </tr>`
+    }).join('')
+    _importBatchRows = data.rows || []
+    $('im_wrap').innerHTML = `
+      <button onclick="viewImports()" class="text-sm text-slate-500 mb-3"><i class="fas fa-arrow-left mr-1"></i>All batches</button>
+      <div class="bg-white rounded-2xl border border-slate-200 p-5 mb-4 flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <h3 class="font-bold text-slate-800 capitalize">Batch #${b.id} · ${esc(b.category)}</h3>
+          <p class="text-xs text-slate-500 mt-1">${b.total_rows} rows · <span class="text-emerald-600">${b.valid_rows} valid</span> · <span class="text-amber-600">${b.exception_rows} exceptions</span> · <span class="text-sky-600">${b.dispatched_rows} onboarded</span></p>
+        </div>
+        <button id="dispatchBtn" onclick="dispatchImport(${b.id})" ${b.valid_rows ? '' : 'disabled'} class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm ${b.valid_rows ? '' : 'opacity-50'}"><i class="fas fa-paper-plane mr-1"></i>Onboard ${b.valid_rows} valid users</button>
+      </div>
+      <div class="bg-white rounded-2xl border border-slate-200 p-5 overflow-x-auto">
+        <table class="w-full text-left"><thead><tr class="text-xs text-slate-400 border-b">
+          <th class="py-2 px-2">#</th><th class="py-2 px-2">Name</th><th class="py-2 px-2">Phone</th><th class="py-2 px-2">National ID</th><th class="py-2 px-2">County</th><th class="py-2 px-2">Status</th><th class="py-2 px-2"></th>
+        </tr></thead><tbody>${rowsHtml}</tbody></table>
+      </div>`
+  } catch (err) { $('im_wrap').innerHTML = `<p class="text-sm text-red-500">${esc(err.response?.data?.error || 'Failed to load batch')}</p>` }
+}
+window.fixImportRow = (rowId) => {
+  const r = _importBatchRows.find(x => x.id === rowId)
+  if (!r) return
+  showModal(`<h3 class="font-bold mb-1">Complete missing details</h3>
+    <p class="text-xs text-amber-600 mb-3">Issues: ${esc(r.issues || '')}</p>
+    <div class="space-y-2 text-sm">
+      <input id="fx_full_name" value="${esc(r.full_name || '')}" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
+      <input id="fx_phone" value="${esc(r.phone || '')}" placeholder="Phone" class="w-full px-3 py-2 border rounded-lg">
+      <input id="fx_national_id" value="${esc(r.national_id || '')}" placeholder="National ID" class="w-full px-3 py-2 border rounded-lg">
+      <input id="fx_county" value="${esc(r.county || '')}" placeholder="County" class="w-full px-3 py-2 border rounded-lg">
+      <input id="fx_value_chain" value="${esc(r.value_chain || '')}" placeholder="Value chain (optional)" class="w-full px-3 py-2 border rounded-lg">
+    </div>
+    <div class="flex gap-2 mt-4"><button onclick="saveImportRow(${rowId})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.saveImportRow = async (rowId) => {
+  const body = { full_name: $('fx_full_name').value, phone: $('fx_phone').value, national_id: $('fx_national_id').value, county: $('fx_county').value, value_chain: $('fx_value_chain').value }
+  try {
+    const r = _importBatchRows.find(x => x.id === rowId)
+    const { data } = await api.put('/imports/rows/' + rowId, body)
+    closeModal()
+    toast(data.status === 'valid' ? 'Row fixed — now valid' : 'Saved, still has issues: ' + (data.issues || []).join(', '))
+    openImportBatch(r.batch_id)
+  } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
+}
+window.dispatchImport = async (id) => {
+  if (!confirm('Onboard all valid users in this batch? Each will receive a temporary password and verification details by SMS.')) return
+  const done = btnLoading('dispatchBtn', 'Onboarding…')
+  try {
+    const { data } = await api.post(`/imports/${id}/dispatch`, {})
+    toast(`Onboarded ${data.created} users (${data.skipped} skipped)`)
+    openImportBatch(id)
+  } catch (err) { done(); toast(err.response?.data?.error || 'Dispatch failed', false) }
+}
+
 
 init()

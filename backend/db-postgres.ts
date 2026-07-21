@@ -24,7 +24,8 @@ const TABLES_WITH_NUMERIC_ID = new Set([
   'murabaha_contracts', 'repayments', 'invoices', 'transactions', 'approvals',
   'transunion_checks', 'id_verifications', 'audit_logs', 'tickets', 'otp_codes',
   'payment_intents', 'change_requests',
-  'merchant_keys', 'merchant_checkouts'
+  'merchant_keys', 'merchant_checkouts',
+  'system_backups', 'import_batches', 'import_rows', 'profile_amendments'
 ])
 
 function convertPlaceholders(sql: string): string {

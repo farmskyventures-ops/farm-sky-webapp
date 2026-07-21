@@ -17,6 +17,7 @@ import { sendEmail, emailConfigured } from './email'
 import { hashPassword, verifyPassword, isHashed } from './password'
 import merchantApi from './merchant-api'
 import { mintHandoffToken, verifyHandoffToken } from './cross-app'
+import { validateImageDataUrl, validateText, validateTextFields } from './upload-validation'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: SessionUser } }>()
 
@@ -540,6 +541,42 @@ async function audit(c: any, userId: number | null, action: string, entity: stri
 function genPassword(): string {
   return String(Math.floor(1000 + Math.random() * 9000))
 }
+
+// A secure, random TEMPORARY password for the multi-user onboarding flow.
+// Mixed-case + digits, avoids ambiguous characters (0/O, 1/l/I).
+function genTempPassword(len = 10): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
+  const bytes = new Uint8Array(len)
+  crypto.getRandomValues(bytes)
+  let out = ''
+  for (let i = 0; i < len; i++) out += alphabet[bytes[i] % alphabet.length]
+  return out
+}
+
+// Milliseconds a temporary password stays valid before it must be reset (3 hours).
+const TEMP_PASSWORD_TTL_MS = 3 * 60 * 60 * 1000
+
+// Stamp a freshly-created user with a temporary password + lifecycle flags and
+// SMS it to them with the mandatory "do not share / expires in 3 hours" notice.
+async function issueTempPassword(
+  c: any,
+  opts: { userId: number | bigint; phone: string; fullName?: string; hashedInto?: 'insert' }
+): Promise<{ tempPassword: string; expiresAt: number; sms: { simulated?: boolean; success?: boolean; error?: string } }> {
+  const tempPassword = genTempPassword()
+  const expiresAt = Date.now() + TEMP_PASSWORD_TTL_MS
+  const hashed = await hashPassword(tempPassword)
+  await c.env.DB.prepare(
+    `UPDATE users SET password=?, password_set=0, must_change_password=1, is_temp_password=1, temp_password_expires_at=? WHERE id=?`
+  ).bind(hashed, expiresAt, opts.userId).run()
+  const msg =
+    `Farmsky account created${opts.fullName ? ' for ' + opts.fullName : ''}. ` +
+    `Temporary password: ${tempPassword}. ` +
+    `Do not share this password. It expires within 3 hours. ` +
+    `Log in and set your own password.`
+  let sms: any = { simulated: true, success: true }
+  try { sms = await sendSms(c.env, opts.phone, msg) } catch (e: any) { sms = { success: false, error: e?.message || 'SMS failed' } }
+  return { tempPassword, expiresAt, sms }
+}
 async function createSession(c: any, user: any) {
   const token = genToken()
   const expires = Date.now() + 1000 * 60 * 60 * 12
@@ -594,8 +631,24 @@ app.post('/api/login', async (c) => {
   const check = user ? await verifyPassword(String(password), user.password) : { ok: false, legacy: false }
   if (!user || !check.ok) return c.json({ error: 'Invalid phone number or password' }, 401)
   if (user.status !== 'active') return c.json({ error: 'Account suspended' }, 403)
+  // PASSWORD LIFECYCLE: a temporary (admin/agent-issued) password that has
+  // expired can no longer be used. Tell the client to offer an admin reset.
+  if (user.is_temp_password && user.temp_password_expires_at && Number(user.temp_password_expires_at) < Date.now()) {
+    return c.json({ error: 'Your temporary password has expired. Please ask an admin to reset it.', temp_expired: true, phone: user.phone }, 403)
+  }
   if (check.legacy) {
     try { await c.env.DB.prepare(`UPDATE users SET password=? WHERE id=?`).bind(await hashPassword(String(password)), user.id).run() } catch (_) {}
+  }
+  // First-login with a temporary password: authenticate, but force an immediate
+  // password change before granting a full session / app access.
+  if (user.must_change_password) {
+    const changeToken = await createSession(c, user)
+    await audit(c, user.id, 'login', 'user', `${user.role} logged in with temporary password (must change)`)
+    return c.json({
+      token: changeToken,
+      must_change_password: true,
+      user: { id: user.id, full_name: user.full_name, phone: user.phone, role: user.role }
+    })
   }
   // Enforce time-based access windows (per-user override, else role template).
   const window = await resolveAccessWindow(c, user)
@@ -654,7 +707,9 @@ app.put('/api/me/password', requireAuth, async (c) => {
   const row = await c.env.DB.prepare(`SELECT password FROM users WHERE id=?`).bind(user.id).first<any>()
   const chk = row ? await verifyPassword(String(current_password), row.password) : { ok: false, legacy: false }
   if (!row || !chk.ok) return c.json({ error: 'Current password is incorrect' }, 400)
-  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(await hashPassword(String(new_password)), user.id).run()
+  // Clear the temporary-password lifecycle flags: once the user sets their own
+  // password it is no longer temporary / must-change / time-limited.
+  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1, must_change_password=0, is_temp_password=0, temp_password_expires_at=NULL WHERE id=?`).bind(await hashPassword(String(new_password)), user.id).run()
   await audit(c, user.id, 'update', 'profile', 'password change')
   return c.json({ ok: true })
 })
@@ -1340,6 +1395,70 @@ app.post('/api/murabaha/:id/dispatch', requireAuth, requireRole('admin', 'super_
   if (!['active', 'completed', 'awaiting_cash_balance'].includes(contract.status)) return c.json({ error: 'Only approved or paid purchases can be dispatched' }, 400)
   await c.env.DB.prepare(`UPDATE murabaha_contracts SET dispatch_status='dispatched', dispatched_at=CURRENT_TIMESTAMP, dispatched_by=? WHERE id=?`).bind(c.get('user').id, id).run()
   await audit(c, c.get('user').id, 'dispatch', 'contract', contract.contract_ref)
+  return c.json({ ok: true })
+})
+
+// ============================================================================
+// CONTRACT CONTROLS (parity) — edit / cancel a financing contract, gated by
+// the can_manage_contracts permission.
+// ============================================================================
+function canManageContracts(user: SessionUser) {
+  return ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'can_manage_contracts')
+}
+
+// Edit a contract's editable commercial fields.
+app.put('/api/murabaha/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageContracts(user)) return c.json({ error: 'You do not have permission to edit contracts.' }, 403)
+  const id = c.req.param('id')
+  const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(id).first<any>()
+  if (!contract) return c.json({ error: 'Not found' }, 404)
+  if (contract.status === 'cancelled') return c.json({ error: 'A cancelled contract cannot be edited.' }, 400)
+  const b = await c.req.json()
+  const price = b.murabaha_price !== undefined ? numberVal(b.murabaha_price, contract.murabaha_price) : contract.murabaha_price
+  const paid = numberVal(contract.amount_paid, 0)
+  const outstanding = roundMoney(Math.max(0, price - paid))
+  await c.env.DB.prepare(
+    `UPDATE murabaha_contracts SET
+       murabaha_price=?,
+       outstanding=?,
+       deposit_pct=COALESCE(?, deposit_pct),
+       deposit_amount=COALESCE(?, deposit_amount),
+       installment_amount=COALESCE(?, installment_amount),
+       payment_frequency=COALESCE(?, payment_frequency),
+       term_months=COALESCE(?, term_months),
+       terms_text=COALESCE(?, terms_text)
+     WHERE id=?`
+  ).bind(
+    price, outstanding,
+    b.deposit_pct !== undefined ? numberVal(b.deposit_pct, contract.deposit_pct) : null,
+    b.deposit_amount !== undefined ? numberVal(b.deposit_amount, contract.deposit_amount) : null,
+    b.installment_amount !== undefined ? numberVal(b.installment_amount, contract.installment_amount) : null,
+    b.payment_frequency ?? null,
+    b.term_months !== undefined ? numberVal(b.term_months, contract.term_months) : null,
+    b.terms_text ?? null,
+    id
+  ).run()
+  await audit(c, user.id, 'edit', 'contract', contract.contract_ref)
+  return c.json({ ok: true })
+})
+
+// Cancel a contract.
+app.post('/api/murabaha/:id/cancel', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageContracts(user)) return c.json({ error: 'You do not have permission to cancel contracts.' }, 403)
+  const id = c.req.param('id')
+  const { reason } = await c.req.json().catch(() => ({}))
+  const contract = await c.env.DB.prepare(`SELECT * FROM murabaha_contracts WHERE id=?`).bind(id).first<any>()
+  if (!contract) return c.json({ error: 'Not found' }, 404)
+  if (contract.status === 'cancelled') return c.json({ error: 'Contract is already cancelled.' }, 400)
+  if (contract.status === 'completed') return c.json({ error: 'A completed contract cannot be cancelled.' }, 400)
+  await c.env.DB.prepare(`UPDATE murabaha_contracts SET status='cancelled' WHERE id=?`).bind(id).run()
+  if (contract.ownership_recorded) {
+    await c.env.DB.prepare(`UPDATE products SET quantity = quantity + ? WHERE id=?`).bind(contract.quantity, contract.product_id).run()
+    await c.env.DB.prepare(`INSERT INTO stock_movements (product_id,movement_type,quantity,reference) VALUES (?, 'cancellation_return', ?, ?)`).bind(contract.product_id, contract.quantity, contract.contract_ref).run()
+  }
+  await audit(c, user.id, 'cancel', 'contract', `${contract.contract_ref}${reason ? ' — ' + String(reason).slice(0, 200) : ''}`)
   return c.json({ ok: true })
 })
 
@@ -2275,6 +2394,19 @@ app.get('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async (
   const agentFallback = await loadRoleTemplate(c, 'agent')
   return c.json({ agents: results.map((a: any) => ({ ...a, permissions: parsePermissions(a.permissions, 'agent', agentFallback) })) })
 })
+// Multi-user onboarding: request an OTP to verify a new user's phone before
+// creating their account (parity).
+app.post('/api/onboard/request-otp', requireAuth, requireRole('admin', 'super_admin', 'agent'), async (c) => {
+  const { phone } = await c.req.json()
+  const p = normalizePhone(phone || '')
+  if (!p) return c.json({ error: 'A valid phone number is required' }, 400)
+  const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
+  if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
+  const { sms, demo_otp } = await issueOtp(c, p, 'onboard')
+  if (!sms.simulated && !sms.success) return c.json({ error: sms.error || 'Failed to send OTP' }, 502)
+  return c.json({ ok: true, phone: p, message: sms.simulated ? 'Demo mode: use the code shown below.' : `Verification code sent to ${p}.`, demo_otp })
+})
+
 app.post('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const b = await c.req.json()
   const p = normalizePhone(b.phone || '')
@@ -2282,25 +2414,54 @@ app.post('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async 
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
   const provided = b.password && String(b.password).length >= 4
+  // Multi-user onboarding: unless an explicit password is set, verify the new
+  // user's phone via OTP, then issue a temporary (must-change, 3h-expiry) one.
+  if (!provided) {
+    const v = await verifyOtp(c, p, String(b.otp_code || ''), 'onboard')
+    if (!v.ok) return c.json({ error: v.error || 'Phone verification required', otp_required: true }, 400)
+  }
   const pwd = provided ? String(b.password) : genPassword()
   const perms = await permissionsForRole(c, 'agent', b.permissions || {})
-  const r = await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms)).run()
+  const creatorId = c.get('user').id
+  const r = await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId).run()
   await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
-  await audit(c, c.get('user').id, 'create', 'agent', b.full_name)
-  return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: provided })
+  await audit(c, creatorId, 'create', 'agent', b.full_name)
+  if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
+  const t = await issueTempPassword(c, { userId: r.meta.last_row_id as number, phone: p, fullName: b.full_name })
+  return c.json({ id: r.meta.last_row_id, password: t.tempPassword, password_was_set_by_admin: false, temporary: true, expires_at: t.expiresAt, sms_simulated: !!t.sms.simulated })
 })
 app.post('/api/users/:id/reset-password', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
-  const target = await c.env.DB.prepare(`SELECT id, full_name, role FROM users WHERE id=?`).bind(id).first<any>()
+  const target = await c.env.DB.prepare(`SELECT id, full_name, phone, role FROM users WHERE id=?`).bind(id).first<any>()
   if (!target) return c.json({ error: 'User not found' }, 404)
   if (target.role === 'super_admin' && Number(id) !== c.get('user').id) return c.json({ error: 'Cannot reset another Super Admin password' }, 400)
   const body = await c.req.json().catch(() => ({}))
   const provided = body?.password && String(body.password).length >= 4
-  const pwd = provided ? String(body.password) : genPassword()
-  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(await hashPassword(pwd), id).run()
+  // Admin-triggered reset. When no explicit password is supplied (the normal
+  // path — including recovering an expired temporary password) we reissue a
+  // fresh temporary password with the mandatory-change + 3h-expiry lifecycle.
+  if (provided) {
+    await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1, must_change_password=0, is_temp_password=0, temp_password_expires_at=NULL WHERE id=?`).bind(await hashPassword(String(body.password)), id).run()
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
+    await audit(c, c.get('user').id, 'reset_password', target.role, target.full_name)
+    return c.json({ ok: true, new_password: String(body.password), user: target.full_name })
+  }
   await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
-  await audit(c, c.get('user').id, 'reset_password', target.role, target.full_name)
-  return c.json({ ok: true, new_password: pwd, user: target.full_name })
+  const t = await issueTempPassword(c, { userId: id as any, phone: target.phone, fullName: target.full_name })
+  await audit(c, c.get('user').id, 'reset_password', target.role, `${target.full_name} (temporary)`)
+  return c.json({ ok: true, new_password: t.tempPassword, user: target.full_name, temporary: true, expires_at: t.expiresAt, sms_simulated: !!t.sms.simulated })
+})
+
+// Public: a user whose temporary password expired can ask an admin to reset it.
+app.post('/api/onboard/request-reset', async (c) => {
+  const { phone } = await c.req.json().catch(() => ({}))
+  const p = normalizePhone(phone || '')
+  const user = await c.env.DB.prepare(`SELECT id, full_name FROM users WHERE phone=?`).bind(p).first<any>()
+  // Do not reveal account existence; always respond ok.
+  if (user) {
+    try { await audit(c, user.id, 'reset_request', 'user', `Temp-password reset requested for ${user.full_name}`) } catch {}
+  }
+  return c.json({ ok: true, message: 'Your request has been sent. An administrator will reset your password shortly.' })
 })
 app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
@@ -2331,16 +2492,25 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first<any>()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
   const provided = b.password && String(b.password).length >= 4
+  // Multi-user onboarding: verify the new staff member's phone via OTP unless an
+  // explicit password was supplied, then issue a temporary password.
+  if (!provided) {
+    const v = await verifyOtp(c, p, String(b.otp_code || ''), 'onboard')
+    if (!v.ok) return c.json({ error: v.error || 'Phone verification required', otp_required: true }, 400)
+  }
   const pwd = provided ? String(b.password) : genPassword()
   const perms = await permissionsForRole(c, String(b.role), b.permissions || {})
   const templateRow = await c.env.DB.prepare(`SELECT label FROM role_templates WHERE role_key=?`).bind(String(b.role)).first<any>()
   const label = b.label || templateRow?.label || (String(b.role) === 'operations_finance' ? 'Operations & Finance' : String(b.role).replace(/_/g, ' '))
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
-  const r = await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null).run()
+  const creatorId = c.get('user').id
+  const r = await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
-  await audit(c, c.get('user').id, 'create', 'user', `${b.full_name} (${b.role})`)
-  return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: provided })
+  await audit(c, creatorId, 'create', 'user', `${b.full_name} (${b.role})`)
+  if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
+  const t = await issueTempPassword(c, { userId: r.meta.last_row_id as number, phone: p, fullName: b.full_name })
+  return c.json({ id: r.meta.last_row_id, password: t.tempPassword, password_was_set_by_admin: false, temporary: true, expires_at: t.expiresAt, sms_simulated: !!t.sms.simulated })
 })
 app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
@@ -2511,6 +2681,364 @@ app.post('/api/change-requests', requireAuth, async (c) => {
   await c.env.DB.prepare(`INSERT INTO change_requests (requester_id, entity_type, entity_id, requested_action, reason) VALUES (?,?,?,?,?)`).bind(user.id, entity_type, entity_id || null, requested_action, reason || '').run()
   await audit(c, user.id, 'request_admin_action', entity_type || 'entity', `${requested_action || 'request'} ${entity_id || ''}`)
   return c.json({ ok: true })
+})
+
+// ============================================================================
+// PROFILE AMENDMENT WORKFLOW (parity) — locked identity fields (National ID /
+// phone) can only change via a reviewed request.
+// ============================================================================
+function canReviewAmendments(user: SessionUser) {
+  return ['admin', 'super_admin'].includes(user.role) || hasPermission(user, 'manage_users')
+}
+
+// Submit an amendment request (any authenticated user).
+app.post('/api/profile-amendments', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json()
+  const newNid = b.new_national_id !== undefined && b.new_national_id !== null ? String(b.new_national_id).trim() : ''
+  const newPhoneRaw = b.new_phone !== undefined && b.new_phone !== null ? String(b.new_phone).trim() : ''
+  const newPhone = newPhoneRaw ? normalizePhone(newPhoneRaw) : ''
+  const reason = String(b.reason || '').trim()
+  if (!newNid && !newPhone) return c.json({ error: 'Provide a new National ID and/or a new phone number.' }, 400)
+  if (reason.length < 4) return c.json({ error: 'Please give a reason for the change (at least 4 characters).' }, 400)
+  const tv = validateTextFields({ new_national_id: newNid, reason }, [
+    { key: 'new_national_id', label: 'National ID', max: 40 },
+    { key: 'reason', label: 'Reason', max: 500 }
+  ])
+  if (!tv.ok) return c.json({ error: tv.error }, 400)
+  const open = await c.env.DB.prepare(`SELECT id FROM profile_amendments WHERE user_id=? AND status='pending'`).bind(user.id).first<any>()
+  if (open) return c.json({ error: 'You already have a pending amendment request awaiting review.' }, 400)
+  const cust = await c.env.DB.prepare(`SELECT id, national_id, mobile FROM customers WHERE user_id=?`).bind(user.id).first<any>()
+  const field = newNid && newPhone ? 'both' : (newNid ? 'national_id' : 'phone')
+  await c.env.DB.prepare(
+    `INSERT INTO profile_amendments (user_id, customer_id, field, current_national_id, current_phone, new_national_id, new_phone, reason)
+     VALUES (?,?,?,?,?,?,?,?)`
+  ).bind(user.id, cust?.id || null, field, cust?.national_id || null, cust?.mobile || user.phone || null, newNid || null, newPhone || null, reason).run()
+  await audit(c, user.id, 'request', 'profile_amendment', `${field} change requested`)
+  return c.json({ ok: true })
+})
+
+// List MY amendment requests.
+app.get('/api/profile-amendments/mine', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const { results } = await c.env.DB.prepare(`SELECT * FROM profile_amendments WHERE user_id=? ORDER BY created_at DESC`).bind(user.id).all()
+  return c.json({ amendments: results })
+})
+
+// List all amendment requests for the review dashboard (default: pending).
+app.get('/api/profile-amendments', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canReviewAmendments(user)) return c.json({ error: 'Forbidden' }, 403)
+  const status = c.req.query('status') || 'pending'
+  let q = `SELECT pa.*, u.full_name AS requester_name, u.role AS requester_role, r.full_name AS reviewer_name
+           FROM profile_amendments pa
+           JOIN users u ON u.id = pa.user_id
+           LEFT JOIN users r ON r.id = pa.reviewed_by`
+  const binds: any[] = []
+  if (status !== 'all') { q += ` WHERE pa.status=?`; binds.push(status) }
+  q += ` ORDER BY pa.created_at DESC`
+  const { results } = await c.env.DB.prepare(q).bind(...binds).all()
+  return c.json({ amendments: results })
+})
+
+// Approve / reject an amendment request.
+app.post('/api/profile-amendments/:id/decision', requireAuth, async (c) => {
+  const actor = c.get('user') as SessionUser
+  if (!canReviewAmendments(actor)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const { action, notes } = await c.req.json()
+  const amend = await c.env.DB.prepare(`SELECT * FROM profile_amendments WHERE id=?`).bind(id).first<any>()
+  if (!amend) return c.json({ error: 'Not found' }, 404)
+  if (amend.status !== 'pending') return c.json({ error: 'This request has already been reviewed.' }, 400)
+  if (action === 'approve') {
+    if (amend.new_national_id) {
+      const dup = await c.env.DB.prepare(`SELECT id FROM customers WHERE national_id=? AND user_id<>?`).bind(amend.new_national_id, amend.user_id).first<any>()
+      if (dup) return c.json({ error: 'Cannot approve: that National ID is already in use.' }, 409)
+    }
+    if (amend.new_phone) {
+      const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=? AND id<>?`).bind(amend.new_phone, amend.user_id).first<any>()
+      if (dup) return c.json({ error: 'Cannot approve: that phone number is already in use.' }, 409)
+    }
+    await withAdminContext(c, async () => {
+      if (amend.new_phone) {
+        await c.env.DB.prepare(`UPDATE users SET phone=? WHERE id=?`).bind(amend.new_phone, amend.user_id).run()
+        if (amend.customer_id) await c.env.DB.prepare(`UPDATE customers SET mobile=? WHERE id=?`).bind(amend.new_phone, amend.customer_id).run()
+      }
+      if (amend.new_national_id && amend.customer_id) {
+        await c.env.DB.prepare(`UPDATE customers SET national_id=? WHERE id=?`).bind(amend.new_national_id, amend.customer_id).run()
+      }
+    })
+    await c.env.DB.prepare(`UPDATE profile_amendments SET status='approved', reviewed_by=?, review_notes=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?`).bind(actor.id, notes || null, id).run()
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(amend.user_id).run()
+  } else if (action === 'reject') {
+    await c.env.DB.prepare(`UPDATE profile_amendments SET status='rejected', reviewed_by=?, review_notes=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?`).bind(actor.id, notes || null, id).run()
+  } else {
+    return c.json({ error: 'Action must be approve or reject.' }, 400)
+  }
+  await audit(c, actor.id, action, 'profile_amendment', String(id))
+  return c.json({ ok: true, action })
+})
+
+// ============================================================================
+// AUTOMATED SYSTEM BACKUPS (parity)
+// ============================================================================
+const AUTO_BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
+const BACKUP_DATASETS = ['users', 'customers', 'agents', 'products', 'murabaha_contracts', 'repayments', 'transactions', 'audit_logs']
+
+async function performBackup(c: any, triggerType: 'manual' | 'auto', createdBy: number | null) {
+  const snapshot: Record<string, any[]> = {}
+  let total = 0
+  await withAdminContext(c, async () => {
+    for (const ds of BACKUP_DATASETS) {
+      try {
+        const { results } = await c.env.DB.prepare(`SELECT * FROM ${ds}`).all()
+        snapshot[ds] = results || []
+        total += (results || []).length
+      } catch (_) { snapshot[ds] = [] }
+    }
+  })
+  const payload = JSON.stringify({ created_at: new Date().toISOString(), datasets: snapshot })
+  const summary = BACKUP_DATASETS.map(ds => `${ds}: ${snapshot[ds]?.length || 0}`).join(', ')
+  const res = await c.env.DB.prepare(
+    `INSERT INTO system_backups (trigger_type, summary, record_count, size_bytes, payload, status, created_by) VALUES (?,?,?,?,?, 'success', ?)`
+  ).bind(triggerType, summary, total, payload.length, payload, createdBy).run()
+  return { backup_id: res.meta?.last_row_id, record_count: total, size_bytes: payload.length }
+}
+
+async function maybeAutoBackup(c: any) {
+  try {
+    const last = await c.env.DB.prepare(`SELECT created_at FROM system_backups WHERE trigger_type='auto' ORDER BY id DESC LIMIT 1`).first<any>()
+    if (last?.created_at) {
+      const lastMs = new Date(last.created_at).getTime()
+      if (!Number.isNaN(lastMs) && Date.now() - lastMs < AUTO_BACKUP_INTERVAL_MS) return { ran: false }
+    }
+    await performBackup(c, 'auto', null)
+    return { ran: true }
+  } catch (_) { return { ran: false } }
+}
+
+app.get('/api/backups', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  await maybeAutoBackup(c)
+  const { results } = await c.env.DB.prepare(
+    `SELECT b.id, b.trigger_type, b.summary, b.record_count, b.size_bytes, b.status, b.error, b.created_at, u.full_name created_by_name
+       FROM system_backups b LEFT JOIN users u ON u.id=b.created_by
+      ORDER BY b.id DESC LIMIT 100`
+  ).all()
+  return c.json({ backups: results || [], interval_hours: AUTO_BACKUP_INTERVAL_MS / 3600000 })
+})
+
+app.post('/api/backups', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  try {
+    const out = await performBackup(c, 'manual', c.get('user').id)
+    return c.json({ ok: true, ...out })
+  } catch (e: any) {
+    return c.json({ error: e?.message || 'Backup failed' }, 500)
+  }
+})
+
+app.get('/api/backups/:id/download', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const row = await c.env.DB.prepare(`SELECT id, payload, created_at FROM system_backups WHERE id=?`).bind(c.req.param('id')).first<any>()
+  if (!row || !row.payload) return c.json({ error: 'Backup not found' }, 404)
+  await audit(c, c.get('user').id, 'backup_download', 'system', `backup #${row.id}`)
+  return new Response(row.payload, {
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Disposition': `attachment; filename="farmsky-backup-${row.id}.json"`
+    }
+  })
+})
+
+app.post('/api/backups/run-auto', async (c) => {
+  const token = c.req.header('x-admin-task-token') || ''
+  const expected = (c.env as any).ADMIN_TASK_TOKEN
+  if (expected && token === expected) {
+    const r = await maybeAutoBackup(c)
+    return c.json({ ok: true, ...r })
+  }
+  const sessionToken = getCookie(c, 'session')
+  const sess = sessionToken ? await c.env.DB.prepare(`SELECT u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at > ?`).bind(sessionToken, Date.now()).first<any>() : null
+  if (!sess || !['admin', 'super_admin'].includes(sess.role)) return c.json({ error: 'Unauthorized' }, 401)
+  const r = await maybeAutoBackup(c)
+  return c.json({ ok: true, ...r })
+})
+
+// ============================================================================
+// BULK USER DATA UPLOAD & STANDARDIZATION (parity)
+// ============================================================================
+function mapImportRow(raw: Record<string, any>): Record<string, string> {
+  const norm: Record<string, any> = {}
+  for (const [k, v] of Object.entries(raw)) {
+    norm[String(k).toLowerCase().replace(/[^a-z0-9]/g, '')] = v
+  }
+  const pick = (...keys: string[]) => {
+    for (const k of keys) { const v = norm[k]; if (v != null && String(v).trim() !== '') return String(v).trim() }
+    return ''
+  }
+  return {
+    full_name: pick('fullname', 'name', 'names', 'customername', 'farmername'),
+    phone: pick('phone', 'phonenumber', 'mobile', 'msisdn', 'tel', 'telephone', 'contact'),
+    national_id: pick('nationalid', 'idnumber', 'idno', 'id', 'nid'),
+    email: pick('email', 'emailaddress'),
+    county: pick('county', 'region'),
+    sub_county: pick('subcounty', 'subcounties'),
+    ward: pick('ward'),
+    village: pick('village', 'location'),
+    value_chain_type: pick('valuechaintype', 'vct', 'category', 'farmtype', 'partnertype'),
+    value_chain: pick('valuechain', 'vc', 'crop', 'produce', 'commodity'),
+    region: pick('region', 'county', 'area')
+  }
+}
+
+const IMPORT_REQUIRED: Record<string, string[]> = {
+  farmers: ['full_name', 'phone', 'national_id', 'county'],
+  agents: ['full_name', 'phone'],
+  partners: ['full_name', 'phone']
+}
+
+function validateImportRow(category: string, row: Record<string, string>): string[] {
+  const required = IMPORT_REQUIRED[category] || ['full_name', 'phone']
+  const issues: string[] = []
+  for (const f of required) {
+    if (!row[f] || String(row[f]).trim() === '') issues.push(`missing ${f}`)
+  }
+  if (row.phone) {
+    const p = normalizePhone(row.phone)
+    if (!p || p.length < 12) issues.push('invalid phone')
+  }
+  return issues
+}
+
+async function recomputeBatchCounts(c: any, batchId: number) {
+  const v = await c.env.DB.prepare(`SELECT COUNT(*) n FROM import_rows WHERE batch_id=? AND status='valid'`).bind(batchId).first<any>()
+  const e = await c.env.DB.prepare(`SELECT COUNT(*) n FROM import_rows WHERE batch_id=? AND status='exception'`).bind(batchId).first<any>()
+  const d = await c.env.DB.prepare(`SELECT COUNT(*) n FROM import_rows WHERE batch_id=? AND status='dispatched'`).bind(batchId).first<any>()
+  await c.env.DB.prepare(`UPDATE import_batches SET valid_rows=?, exception_rows=?, dispatched_rows=? WHERE id=?`)
+    .bind(Number(v?.n || 0), Number(e?.n || 0), Number(d?.n || 0), batchId).run()
+}
+
+app.post('/api/imports', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const { category, filename, rows } = await c.req.json()
+  const cat = String(category || '').toLowerCase()
+  if (!['farmers', 'agents', 'partners'].includes(cat)) return c.json({ error: 'category must be farmers, agents or partners' }, 400)
+  if (!Array.isArray(rows) || rows.length === 0) return c.json({ error: 'No rows to import' }, 400)
+  if (rows.length > 5000) return c.json({ error: 'Batch too large (max 5000 rows)' }, 400)
+  const creator = c.get('user').id
+  const batch = await c.env.DB.prepare(
+    `INSERT INTO import_batches (category, filename, total_rows, status, created_by) VALUES (?,?,?, 'review', ?)`
+  ).bind(cat, filename || null, rows.length, creator).run()
+  const batchId = batch.meta.last_row_id
+  let valid = 0, exceptions = 0
+  for (let i = 0; i < rows.length; i++) {
+    const mapped = mapImportRow(rows[i] || {})
+    if (mapped.phone) mapped.phone = normalizePhone(mapped.phone)
+    const issues = validateImportRow(cat, mapped)
+    const status = issues.length ? 'exception' : 'valid'
+    if (status === 'valid') valid++; else exceptions++
+    await c.env.DB.prepare(
+      `INSERT INTO import_rows (batch_id, row_number, full_name, phone, national_id, email, county, sub_county, ward, village, value_chain_type, value_chain, region, raw, status, issues)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      batchId, i + 1, mapped.full_name || null, mapped.phone || null, mapped.national_id || null, mapped.email || null,
+      mapped.county || null, mapped.sub_county || null, mapped.ward || null, mapped.village || null,
+      mapped.value_chain_type || null, mapped.value_chain || null, mapped.region || null,
+      JSON.stringify(rows[i] || {}), status, issues.join(', ') || null
+    ).run()
+  }
+  await c.env.DB.prepare(`UPDATE import_batches SET valid_rows=?, exception_rows=? WHERE id=?`).bind(valid, exceptions, batchId).run()
+  await audit(c, creator, 'import', cat, `batch #${batchId}: ${rows.length} rows (${exceptions} exceptions)`)
+  return c.json({ ok: true, batch_id: batchId, total: rows.length, valid, exceptions })
+})
+
+app.get('/api/imports', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT b.*, u.full_name created_by_name FROM import_batches b LEFT JOIN users u ON u.id=b.created_by ORDER BY b.id DESC LIMIT 100`
+  ).all()
+  return c.json({ batches: results || [] })
+})
+
+app.get('/api/imports/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const id = c.req.param('id')
+  const batch = await c.env.DB.prepare(`SELECT * FROM import_batches WHERE id=?`).bind(id).first<any>()
+  if (!batch) return c.json({ error: 'Batch not found' }, 404)
+  const { results } = await c.env.DB.prepare(`SELECT * FROM import_rows WHERE batch_id=? ORDER BY row_number`).bind(id).all()
+  return c.json({ batch, rows: results || [] })
+})
+
+app.put('/api/imports/rows/:rowId', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const rowId = c.req.param('rowId')
+  const b = await c.req.json()
+  const row = await c.env.DB.prepare(`SELECT r.*, ba.category FROM import_rows r JOIN import_batches ba ON ba.id=r.batch_id WHERE r.id=?`).bind(rowId).first<any>()
+  if (!row) return c.json({ error: 'Row not found' }, 404)
+  if (row.status === 'dispatched') return c.json({ error: 'Row already onboarded' }, 400)
+  const merged: Record<string, string> = {
+    full_name: b.full_name ?? row.full_name ?? '',
+    phone: b.phone != null ? normalizePhone(b.phone) : (row.phone || ''),
+    national_id: b.national_id ?? row.national_id ?? '',
+    email: b.email ?? row.email ?? '',
+    county: b.county ?? row.county ?? '',
+    sub_county: b.sub_county ?? row.sub_county ?? '',
+    ward: b.ward ?? row.ward ?? '',
+    village: b.village ?? row.village ?? '',
+    value_chain_type: b.value_chain_type ?? row.value_chain_type ?? '',
+    value_chain: b.value_chain ?? row.value_chain ?? '',
+    region: b.region ?? row.region ?? ''
+  }
+  const issues = validateImportRow(row.category, merged)
+  const status = issues.length ? 'exception' : 'valid'
+  await c.env.DB.prepare(
+    `UPDATE import_rows SET full_name=?, phone=?, national_id=?, email=?, county=?, sub_county=?, ward=?, village=?, value_chain_type=?, value_chain=?, region=?, status=?, issues=? WHERE id=?`
+  ).bind(merged.full_name || null, merged.phone || null, merged.national_id || null, merged.email || null,
+    merged.county || null, merged.sub_county || null, merged.ward || null, merged.village || null,
+    merged.value_chain_type || null, merged.value_chain || null, merged.region || null,
+    status, issues.join(', ') || null, rowId).run()
+  await recomputeBatchCounts(c, row.batch_id)
+  return c.json({ ok: true, status, issues })
+})
+
+app.post('/api/imports/:id/dispatch', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const id = c.req.param('id')
+  const batch = await c.env.DB.prepare(`SELECT * FROM import_batches WHERE id=?`).bind(id).first<any>()
+  if (!batch) return c.json({ error: 'Batch not found' }, 404)
+  const cat = String(batch.category)
+  const roleForCategory = cat === 'agents' ? 'agent' : cat === 'partners' ? 'partner' : 'customer'
+  const { results } = await c.env.DB.prepare(`SELECT * FROM import_rows WHERE batch_id=? AND status='valid'`).bind(id).all()
+  const rows = (results || []) as any[]
+  const creator = c.get('user').id
+  let created = 0, skipped = 0
+  const errors: string[] = []
+  for (const row of rows) {
+    const phone = normalizePhone(row.phone || '')
+    if (!phone) { skipped++; continue }
+    const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(phone).first<any>()
+    if (dup) { skipped++; errors.push(`${row.full_name || phone}: already exists`); continue }
+    try {
+      const perms = await permissionsForRole(c, roleForCategory === 'agent' ? 'agent' : roleForCategory === 'partner' ? 'partner' : 'customer', {})
+      const placeholder = await hashPassword(genPassword())
+      const ur = await c.env.DB.prepare(
+        `INSERT INTO users (full_name, phone, email, password, role, region, password_set, permissions, created_by) VALUES (?,?,?,?,?,?,0,?,?)`
+      ).bind(row.full_name, phone, row.email || null, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator).run()
+      const userId = ur.meta.last_row_id as number
+      if (roleForCategory === 'customer') {
+        await c.env.DB.prepare(
+          `INSERT INTO customers (user_id, agent_id, onboarded_by, full_name, national_id, mobile, county, sub_county, ward, village, value_chain_type, value_chain, kyc_status, status)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'pending', 'active')`
+        ).bind(userId, null, creator, row.full_name, row.national_id || null, phone, row.county || null, row.sub_county || null, row.ward || null, row.village || null, row.value_chain_type || null, row.value_chain || null).run()
+      } else if (roleForCategory === 'agent') {
+        await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(userId, row.region || row.county || null, JSON.stringify(perms)).run()
+      }
+      await issueTempPassword(c, { userId, phone, fullName: row.full_name })
+      await c.env.DB.prepare(`UPDATE import_rows SET status='dispatched', created_user_id=? WHERE id=?`).bind(userId, row.id).run()
+      created++
+    } catch (e: any) {
+      skipped++; errors.push(`${row.full_name || phone}: ${e?.message || 'failed'}`)
+    }
+  }
+  await recomputeBatchCounts(c, Number(id))
+  const remaining = await c.env.DB.prepare(`SELECT COUNT(*) n FROM import_rows WHERE batch_id=? AND status='exception'`).bind(id).first<any>()
+  const newStatus = Number(remaining?.n || 0) === 0 ? 'completed' : 'dispatched'
+  await c.env.DB.prepare(`UPDATE import_batches SET status=? WHERE id=?`).bind(newStatus, id).run()
+  await audit(c, creator, 'import_dispatch', cat, `batch #${id}: ${created} onboarded, ${skipped} skipped`)
+  return c.json({ ok: true, created, skipped, errors: errors.slice(0, 50), status: newStatus })
 })
 
 // Repayment performance
