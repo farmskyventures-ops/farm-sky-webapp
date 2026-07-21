@@ -14,6 +14,9 @@ import { buniStkPush, buniQuery, buniConfigured } from './buni'
 import paymentGateway from './payment-gateway'
 import { sendSms, smsConfigured, generateOtp } from './sms'
 import { sendEmail, emailConfigured } from './email'
+import { hashPassword, verifyPassword, isHashed } from './password'
+import merchantApi from './merchant-api'
+import { mintHandoffToken, verifyHandoffToken } from './cross-app'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: SessionUser } }>()
 
@@ -586,8 +589,14 @@ app.post('/api/login', async (c) => {
   // regardless of how the user typed the number (07.., 2547.., +2547..).
   const plus = norm ? '+' + norm : raw
   let user = await c.env.DB.prepare(`SELECT * FROM users WHERE phone = ? OR phone = ? OR phone = ?`).bind(raw, norm, plus).first<any>()
-  if (!user || user.password !== String(password)) return c.json({ error: 'Invalid phone number or password' }, 401)
+  // Phase 4: env-driven PBKDF2 verification (identical to Feed). Accepts a
+  // legacy plaintext value and re-hashes it on the next successful login.
+  const check = user ? await verifyPassword(String(password), user.password) : { ok: false, legacy: false }
+  if (!user || !check.ok) return c.json({ error: 'Invalid phone number or password' }, 401)
   if (user.status !== 'active') return c.json({ error: 'Account suspended' }, 403)
+  if (check.legacy) {
+    try { await c.env.DB.prepare(`UPDATE users SET password=? WHERE id=?`).bind(await hashPassword(String(password)), user.id).run() } catch (_) {}
+  }
   // Enforce time-based access windows (per-user override, else role template).
   const window = await resolveAccessWindow(c, user)
   const access = checkAccessWindow({ enabled: window.enabled, days: window.days, start: window.start, end: window.end })
@@ -643,8 +652,9 @@ app.put('/api/me/password', requireAuth, async (c) => {
   const { current_password, new_password } = await c.req.json()
   if (!new_password || String(new_password).length < 4) return c.json({ error: 'New password must be at least 4 characters' }, 400)
   const row = await c.env.DB.prepare(`SELECT password FROM users WHERE id=?`).bind(user.id).first<any>()
-  if (!row || row.password !== String(current_password)) return c.json({ error: 'Current password is incorrect' }, 400)
-  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(String(new_password), user.id).run()
+  const chk = row ? await verifyPassword(String(current_password), row.password) : { ok: false, legacy: false }
+  if (!row || !chk.ok) return c.json({ error: 'Current password is incorrect' }, 400)
+  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(await hashPassword(String(new_password)), user.id).run()
   await audit(c, user.id, 'update', 'profile', 'password change')
   return c.json({ ok: true })
 })
@@ -764,7 +774,7 @@ app.post('/api/signup/verify', async (c) => {
   const farmerPerms = await permissionsForRole(c, role)
   const r = await c.env.DB.prepare(
     `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?)`
-  ).bind(name, p, String(password), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
+  ).bind(name, p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
   const userId = r.meta.last_row_id
   await c.env.DB.prepare(
     `INSERT INTO customers (user_id, full_name, national_id, mobile, kyc_status) VALUES (?,?,?,?, 'pending')`
@@ -794,7 +804,7 @@ app.post('/api/reset-password/verify', async (c) => {
   if (!v.ok) return c.json({ error: v.error }, 400)
   const user = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first<any>()
   if (!user) return c.json({ error: 'Account not found' }, 404)
-  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(String(password), user.id).run()
+  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(await hashPassword(String(password)), user.id).run()
   await audit(c, user.id, 'reset_password', 'user', 'password reset via SMS OTP')
   return c.json({ ok: true, message: 'Password updated. You can now sign in.' })
 })
@@ -816,6 +826,10 @@ app.get('/api/products', requireAuth, async (c) => {
     // Storefront: only fully-authorized products are visible to buyers.
     if (shop) where.push(`finance_status = 'published'`)
     if (mine && !['admin', 'super_admin'].includes(user.role)) { where.push(`created_by = ?`); binds.push(user.id) }
+    // Phase 5 — data isolation by APP_TYPE: this app only surfaces catalog
+    // rows scoped to itself or shared ('both'). Equipment sees equipment+both.
+    const appType = String(c.env.APP_TYPE || 'equipment').toLowerCase() === 'feed' ? 'feed' : 'equipment'
+    where.push(`app_scope IN (?, 'both')`); binds.push(appType)
     if (where.length) query += ` WHERE ` + where.join(' AND ')
     query += ` ORDER BY name`
     const { results } = await c.env.DB.prepare(query).bind(...binds).all()
@@ -2073,6 +2087,137 @@ app.get('/api/buni/status', requireAuth, (c) => {
 // ----------------------------------------------------------------------------
 app.route('/api/v1/payments', paymentGateway)
 
+// ----------------------------------------------------------------------------
+// PUBLIC MERCHANT API (Phase 3) — HMAC-authenticated inventory + checkout
+// Mounted under /api  ->  /api/v1/merchant/*  and  /api/v1/checkout/*
+// ----------------------------------------------------------------------------
+app.route('/api', merchantApi)
+
+// ----------------------------------------------------------------------------
+// UNIFIED PAYMENT LEDGER (Phase 2) — Equipment admin dashboard reads this to
+// see BOTH equipment_app and feed_app transactions, filterable by category
+// (inventory_type) + origin_platform. RBAC: admin/super_admin only.
+// ----------------------------------------------------------------------------
+app.get('/api/ledger', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const invType = c.req.query('inventory_type') || ''      // 'equipment' | 'feed'
+  const origin = c.req.query('origin_platform') || ''      // 'equipment_app' | 'feed_app'
+  const status = c.req.query('status') || ''
+  const method = c.req.query('method') || ''
+  const q = c.req.query('q') || ''
+  const filters: string[] = []
+  const binds: any[] = []
+  if (invType) { filters.push('inventory_type = ?'); binds.push(invType) }
+  if (origin) { filters.push('origin_platform = ?'); binds.push(origin) }
+  if (status) { filters.push('status = ?'); binds.push(status) }
+  if (method) { filters.push('payment_method = ?'); binds.push(method) }
+  if (q) { filters.push('(transaction_ref LIKE ? OR phone LIKE ? OR description LIKE ?)'); binds.push(`%${q}%`, `%${q}%`, `%${q}%`) }
+  const where = filters.length ? 'WHERE ' + filters.join(' AND ') : ''
+  const rows = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT transaction_ref, origin_app, origin_platform, inventory_type, payment_method, phone,
+            amount, currency, status, description, created_at, completed_at
+       FROM central_transactions ${where} ORDER BY created_at DESC LIMIT 500`
+  ).bind(...binds).all<any>())
+  return c.json({ transactions: rows.results || [] })
+})
+
+// ----------------------------------------------------------------------------
+// CROSS-APP SSO HANDOFF (Phase 2) — no second login between Equipment & Feed
+// ----------------------------------------------------------------------------
+// Signed-in user requests a handoff URL to the sibling app.
+app.get('/api/cross/handoff', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const secret = c.env.CROSS_APP_HMAC_SECRET || ''
+  const siblingUrl = String(c.env.CROSS_APP_URL || '').replace(/\/+$/, '')
+  if (!secret || !siblingUrl) return c.json({ error: 'Cross-app navigation is not configured' }, 503)
+  const token = await mintHandoffToken(secret, normalizePhone(user.phone))
+  const target = String(c.req.query('target') || '')  // informational
+  return c.json({ url: `${siblingUrl}/sso?token=${encodeURIComponent(token)}`, target })
+})
+
+// Sibling app lands here: verify HMAC token, issue a local session, redirect.
+app.get('/sso', async (c) => {
+  const token = c.req.query('token') || ''
+  const secret = c.env.CROSS_APP_HMAC_SECRET || ''
+  const v = await verifyHandoffToken(secret, token)
+  const escHtml = (s: string) => String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string))
+  if (!v.ok) return c.html(`<h3>Sign-in link invalid or expired</h3><p>${escHtml(v.error || '')}</p><p><a href="/">Go to sign in</a></p>`, 401)
+  // Match the account across every stored phone format: normalized 254...,
+  // the '+'-prefixed form, and the raw value carried in the token.
+  const norm = normalizePhone(v.phone!)
+  const plus = norm.startsWith('254') ? '+' + norm : norm
+  const user = await c.env.DB.prepare(`SELECT * FROM users WHERE phone = ? OR phone = ? OR phone = ?`).bind(v.phone, norm, plus).first<any>()
+  if (!user) return c.html(`<h3>No matching account on this platform</h3><p>Please sign in normally.</p><p><a href="/">Go to sign in</a></p>`, 404)
+  if (user.status !== 'active') return c.html(`<h3>Account is not active on this platform</h3><p><a href="/">Go to sign in</a></p>`, 403)
+  await createSession(c, user)
+  await audit(c, user.id, 'login', 'user', `${user.role} signed in via cross-app SSO handoff`)
+  return c.redirect('/')
+})
+
+// Expose cross-app config to the frontend (so nav buttons show only when set).
+app.get('/api/cross/config', requireAuth, (c) => {
+  return c.json({
+    app_type: String(c.env.APP_TYPE || 'equipment'),
+    cross_app_configured: !!(c.env.CROSS_APP_HMAC_SECRET && c.env.CROSS_APP_URL),
+    cross_app_url: c.env.CROSS_APP_URL || null
+  })
+})
+
+// ----------------------------------------------------------------------------
+// HOSTED CHECKOUT PAGE (Phase 3) — where merchant buttons redirect the buyer.
+// ----------------------------------------------------------------------------
+app.get('/checkout/:ref', async (c) => {
+  const ref = c.req.param('ref')
+  const row = await c.env.DB.prepare(
+    `SELECT * FROM merchant_checkouts WHERE checkout_ref = ?`
+  ).bind(ref).first<any>()
+  if (!row) return c.html(`<h3>Checkout session not found</h3>`, 404)
+  return c.html(CHECKOUT_PAGE(row))
+})
+
+// ----------------------------------------------------------------------------
+// DASHBOARD / ANALYTICS
+
+function CHECKOUT_PAGE(row: any): string {
+  const isFinancing = row.transaction_type === 'FINANCING_REQUEST'
+  const esc = (s: any) => String(s == null ? '' : s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string))
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Farmsky Checkout</title>
+  <link href="/static/tailwind.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+  </head><body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
+  <div class="bg-white rounded-2xl shadow-xl max-w-md w-full p-8">
+    <div class="text-center mb-6"><i class="fas fa-leaf text-teal-600 text-4xl mb-2"></i>
+      <h1 class="text-xl font-bold text-slate-800">Farmsky Checkout</h1>
+      <p class="text-sm text-slate-500">${esc(row.inventory_type)} · ${isFinancing ? 'Financing Request' : 'Direct Purchase'}</p></div>
+    <div class="border rounded-xl p-4 mb-4 bg-slate-50">
+      <div class="flex justify-between mb-2"><span class="text-slate-500">Item</span><span class="font-medium">${esc(row.item_title)}</span></div>
+      <div class="flex justify-between mb-2"><span class="text-slate-500">Category</span><span>${esc(row.category || 'general')}</span></div>
+      <div class="flex justify-between mb-2"><span class="text-slate-500">Amount</span><span class="font-bold text-teal-700">KES ${Number(row.amount).toLocaleString()}</span></div>
+      ${isFinancing ? `<div class="flex justify-between"><span class="text-slate-500">Tenor</span><span>${row.financing_tenor_months} months</span></div>` : ''}
+    </div>
+    <div class="text-sm text-slate-600 mb-4">
+      <div><i class="fas fa-user mr-2 text-slate-400"></i>${esc(row.customer_full_name)}</div>
+      <div><i class="fas fa-phone mr-2 text-slate-400"></i>${esc(row.customer_phone)}</div>
+    </div>
+    <button onclick="pay()" id="payBtn" class="btn w-full bg-teal-600 hover:bg-teal-700 text-white py-3 rounded-xl font-medium">
+      <i class="fas fa-lock mr-2"></i>${isFinancing ? 'Submit Financing Request' : 'Pay Now'}</button>
+    <p class="text-xs text-slate-400 text-center mt-4">Secured by Farmsky · Ref ${esc(row.checkout_ref)}</p>
+  </div>
+  <script>
+    function pay(){
+      var b=document.getElementById('payBtn');
+      b.disabled=true; b.innerHTML='<i class="fas fa-spinner fa-spin mr-2"></i>Processing…';
+      setTimeout(function(){
+        b.innerHTML='<i class="fas fa-check mr-2"></i>Request received';
+        b.classList.remove('bg-teal-600','hover:bg-teal-700'); b.classList.add('bg-emerald-600');
+        ${row.success_callback_url ? `setTimeout(function(){ location.href=${JSON.stringify(String(row.success_callback_url))}; }, 1200);` : ''}
+      }, 1400);
+    }
+  </script></body></html>`
+}
+
+
 // Admin-only view of cross-app payment activity
 app.get('/api/v1/payments-admin/summary', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const res = await fetch(new URL('/api/v1/payments/admin/summary', c.req.url).toString())
@@ -2139,7 +2284,7 @@ app.post('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async 
   const provided = b.password && String(b.password).length >= 4
   const pwd = provided ? String(b.password) : genPassword()
   const perms = await permissionsForRole(c, 'agent', b.permissions || {})
-  const r = await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, pwd, b.region || null, provided, b.label || 'Agent', JSON.stringify(perms)).run()
+  const r = await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms)).run()
   await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
   await audit(c, c.get('user').id, 'create', 'agent', b.full_name)
   return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: provided })
@@ -2152,7 +2297,7 @@ app.post('/api/users/:id/reset-password', requireAuth, requireRole('admin', 'sup
   const body = await c.req.json().catch(() => ({}))
   const provided = body?.password && String(body.password).length >= 4
   const pwd = provided ? String(body.password) : genPassword()
-  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(pwd, id).run()
+  await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1 WHERE id=?`).bind(await hashPassword(pwd), id).run()
   await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
   await audit(c, c.get('user').id, 'reset_password', target.role, target.full_name)
   return c.json({ ok: true, new_password: pwd, user: target.full_name })
@@ -2192,7 +2337,7 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const label = b.label || templateRow?.label || (String(b.role) === 'operations_finance' ? 'Operations & Finance' : String(b.role).replace(/_/g, ' '))
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
-  const r = await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, pwd, b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null).run()
+  const r = await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
   await audit(c, c.get('user').id, 'create', 'user', `${b.full_name} (${b.role})`)
   return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: provided })
@@ -2204,7 +2349,7 @@ app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), asyn
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
   if (b.password) {
-    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=?, password=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, String(b.password), id).run()
+    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=?, password=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, await hashPassword(String(b.password)), id).run()
   } else {
     await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, id).run()
   }

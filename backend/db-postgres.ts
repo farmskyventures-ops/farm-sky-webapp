@@ -23,7 +23,8 @@ const TABLES_WITH_NUMERIC_ID = new Set([
   'users', 'agents', 'customers', 'suppliers', 'products', 'stock_movements',
   'murabaha_contracts', 'repayments', 'invoices', 'transactions', 'approvals',
   'transunion_checks', 'id_verifications', 'audit_logs', 'tickets', 'otp_codes',
-  'payment_intents', 'change_requests'
+  'payment_intents', 'change_requests',
+  'merchant_keys', 'merchant_checkouts'
 ])
 
 function convertPlaceholders(sql: string): string {

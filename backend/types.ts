@@ -10,6 +10,15 @@ export type Bindings = MpesaEnv & SmsEnv & EmailEnv & SasaPayEnv & BuniEnv & {
   TRANSUNION_API_KEY?: string
   TRANSUNION_CLIENT_ID?: string
   TRANSUNION_ENV?: string
+  // Cross-platform (Equipment <-> Feed) configuration
+  APP_TYPE?: string                 // 'equipment' | 'feed' — data-scope + payment-host context
+  PUBLIC_BASE_URL?: string          // this app's public origin (hosted checkout URLs)
+  CROSS_APP_URL?: string            // sibling app origin ('Shop Equipment'/'Shop Feeds' target)
+  CROSS_APP_HMAC_SECRET?: string    // shared secret for cross-app SSO handoff tokens
+  // Phase 4 — standardized auth hashing (must match Feed values)
+  AUTH_HASH_ITERATIONS?: string
+  AUTH_HASH_KEYLEN?: string
+  AUTH_PEPPER?: string
 }
 
 export type SessionUser = {

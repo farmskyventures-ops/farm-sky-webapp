@@ -71,7 +71,16 @@ const ENV = {
   TRANSUNION_API_URL: process.env.TRANSUNION_API_URL,
   TRANSUNION_API_KEY: process.env.TRANSUNION_API_KEY,
   TRANSUNION_CLIENT_ID: process.env.TRANSUNION_CLIENT_ID,
-  TRANSUNION_ENV: process.env.TRANSUNION_ENV
+  TRANSUNION_ENV: process.env.TRANSUNION_ENV,
+  // Cross-platform + Phase 4 auth hashing (must be added here or they are
+  // undefined at runtime because the Node server builds ENV explicitly).
+  APP_TYPE: process.env.APP_TYPE,
+  PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL,
+  CROSS_APP_URL: process.env.CROSS_APP_URL,
+  CROSS_APP_HMAC_SECRET: process.env.CROSS_APP_HMAC_SECRET,
+  AUTH_HASH_ITERATIONS: process.env.AUTH_HASH_ITERATIONS,
+  AUTH_HASH_KEYLEN: process.env.AUTH_HASH_KEYLEN,
+  AUTH_PEPPER: process.env.AUTH_PEPPER
 }
 
 const root = new Hono()

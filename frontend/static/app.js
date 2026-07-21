@@ -227,9 +227,142 @@ window.submitChangeRequest = async (entityType, entityId) => {
 // AUTH
 // ---------------------------------------------------------------------------
 async function init() {
-  try { const { data } = await api.get('/me'); state.user = data.user; renderApp() }
+  try {
+    const { data } = await api.get('/me'); state.user = data.user
+    try { const cfg = await api.get('/cross/config'); state.crossApp = cfg.data } catch (_) { state.crossApp = null }
+    renderApp()
+  }
   catch { renderLogin() }
 }
+async function shopCrossApp() {
+  try {
+    const { data } = await api.get('/cross/handoff')
+    if (data && data.url) { window.open(data.url, '_blank'); }
+    else toast('Cross-app navigation is not configured', true)
+  } catch (e) { toast('Cross-app navigation unavailable', true) }
+}
+
+// =====================================================================
+// Phase 5 — reusable multi-parameter client-side filter toolbar.
+// Any list view can render filterToolbar({...}) then, on input, call the
+// supplied re-render. rowMatchesFilters() applies keyword + select + date
+// range filters uniformly. State is kept per-view in _filterState.
+// =====================================================================
+let _filterState = {}
+function filterToolbar(viewKey, opts) {
+  // opts: { search:true, selects:[{key,label,options:[{v,t}]}], dates:true }
+  _filterState[viewKey] = _filterState[viewKey] || {}
+  const st = _filterState[viewKey]
+  const parts = []
+  if (opts.search !== false) {
+    parts.push(`<input id="flt_${viewKey}_q" value="${esc(st.q || '')}" oninput="onFilterChange('${viewKey}')" placeholder="Search…" class="px-3 py-2 border border-slate-300 rounded-lg text-sm w-48">`)
+  }
+  ;(opts.selects || []).forEach(sel => {
+    const cur = st[sel.key] || ''
+    parts.push(`<select id="flt_${viewKey}_${sel.key}" onchange="onFilterChange('${viewKey}')" class="px-3 py-2 border border-slate-300 rounded-lg text-sm">
+      <option value="">${esc(sel.label)}: All</option>
+      ${sel.options.map(o => `<option value="${esc(o.v)}" ${cur === o.v ? 'selected' : ''}>${esc(o.t)}</option>`).join('')}
+    </select>`)
+  })
+  if (opts.dates) {
+    parts.push(`<input id="flt_${viewKey}_from" type="date" value="${esc(st.from || '')}" onchange="onFilterChange('${viewKey}')" class="px-3 py-2 border border-slate-300 rounded-lg text-sm" title="From date">`)
+    parts.push(`<input id="flt_${viewKey}_to" type="date" value="${esc(st.to || '')}" onchange="onFilterChange('${viewKey}')" class="px-3 py-2 border border-slate-300 rounded-lg text-sm" title="To date">`)
+  }
+  parts.push(`<button onclick="clearFilters('${viewKey}')" class="btn px-3 py-2 bg-slate-100 rounded-lg text-sm"><i class="fas fa-xmark mr-1"></i>Clear</button>`)
+  return `<div class="flex flex-wrap items-center gap-2 mb-4">${parts.join('')}</div>`
+}
+window.onFilterChange = (viewKey) => {
+  const st = _filterState[viewKey] = _filterState[viewKey] || {}
+  const q = $('flt_' + viewKey + '_q'); if (q) st.q = q.value
+  const from = $('flt_' + viewKey + '_from'); if (from) st.from = from.value
+  const to = $('flt_' + viewKey + '_to'); if (to) st.to = to.value
+  document.querySelectorAll(`[id^="flt_${viewKey}_"]`).forEach(el => {
+    const key = el.id.replace('flt_' + viewKey + '_', '')
+    if (!['q', 'from', 'to'].includes(key)) st[key] = el.value
+  })
+  if (typeof window['_rerender_' + viewKey] === 'function') window['_rerender_' + viewKey]()
+}
+window.clearFilters = (viewKey) => { _filterState[viewKey] = {}; if (typeof window['_rerender_' + viewKey] === 'function') window['_rerender_' + viewKey]() }
+function rowMatchesFilters(viewKey, row, cfg) {
+  // cfg: { text:[fields], selects:{key:field}, date:field }
+  const st = _filterState[viewKey] || {}
+  if (st.q) {
+    const hay = (cfg.text || []).map(f => String(row[f] ?? '')).join(' ').toLowerCase()
+    if (!hay.includes(String(st.q).toLowerCase())) return false
+  }
+  for (const [key, field] of Object.entries(cfg.selects || {})) {
+    if (st[key] && String(row[field] ?? '') !== String(st[key])) return false
+  }
+  if (cfg.date && (st.from || st.to)) {
+    const d = String(row[cfg.date] || '').slice(0, 10)
+    if (st.from && d < st.from) return false
+    if (st.to && d > st.to) return false
+  }
+  return true
+}
+
+// Renders the "Shop Equipment" / "Shop Feeds" banner when configured.
+function crossAppBanner() {
+  const cfg = state.crossApp
+  if (!cfg || !cfg.cross_app_configured) return ''
+  const isFeed = String(cfg.app_type) === 'feed'
+  const label = isFeed ? 'Shop Equipment' : 'Shop Feeds'
+  const icon = isFeed ? 'fa-tractor' : 'fa-wheat-awn'
+  const blurb = isFeed ? 'Browse and finance farm equipment on Farmsky Equipment.' : 'Browse and finance animal feeds on Farmsky Feed.'
+  return `<div class="card p-4 mb-6 flex items-center justify-between bg-gradient-to-r from-teal-50 to-emerald-50 border border-teal-100">
+    <div><p class="font-semibold text-slate-800"><i class="fas ${icon} text-teal-600 mr-2"></i>${label}</p>
+      <p class="text-sm text-slate-500">${blurb} No second login required.</p></div>
+    <button onclick="shopCrossApp()" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm whitespace-nowrap"><i class="fas fa-arrow-up-right-from-square mr-1"></i>${label}</button>
+  </div>`
+}
+
+async function viewLedger() {
+  $('content').innerHTML = '<div class="text-slate-400">Loading ledger…</div>'
+  let data
+  try { const res = await api.get('/ledger'); data = res.data }
+  catch (e) { $('content').innerHTML = '<div class="card p-6 text-slate-500">Payment ledger is not available. This ledger unifies Equipment and Feed transactions and is populated once payments are processed through the central gateway.</div>'; return }
+  _ledger = data.transactions || []
+  window._rerender_ledger = () => {
+    const rows = _ledger.filter(t => rowMatchesFilters('ledger', t, {
+      text: ['transaction_ref', 'phone', 'description'],
+      selects: { inventory_type: 'inventory_type', origin_platform: 'origin_platform', status: 'status', method: 'payment_method' },
+      date: 'created_at'
+    }))
+    const total = rows.reduce((s, t) => s + (t.status === 'SUCCESS' ? Number(t.amount) : 0), 0)
+    $('ledgerBody').innerHTML = rows.map(t => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3 font-mono text-xs">${esc(t.transaction_ref)}</td>
+      <td class="px-4 py-3"><span class="px-2 py-0.5 rounded text-xs ${t.inventory_type === 'equipment' ? 'bg-blue-50 text-blue-600' : 'bg-emerald-50 text-emerald-600'}">${esc(t.inventory_type || '—')}</span></td>
+      <td class="px-4 py-3 text-xs">${esc(t.origin_platform || t.origin_app || '—')}</td>
+      <td class="px-4 py-3 uppercase text-xs">${esc(t.payment_method || '')}</td>
+      <td class="px-4 py-3">${esc(t.phone || '')}</td>
+      <td class="px-4 py-3 text-right font-semibold">${fmt(t.amount)}</td>
+      <td class="px-4 py-3">${ledgerStatusBadge(t.status)}</td>
+      <td class="px-4 py-3 text-xs text-slate-500">${esc(String(t.created_at || '').slice(0, 16))}</td>
+    </tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No matching transactions</td></tr>'
+    const cnt = $('ledgerCount'); if (cnt) cnt.textContent = `${rows.length} txn(s) · KES ${total.toLocaleString()} settled`
+  }
+  $('content').innerHTML = `
+    <div class="text-sm text-slate-500 mb-4"><i class="fas fa-book text-teal-600 mr-1"></i>Unified across Equipment &amp; Feed · <span id="ledgerCount"></span></div>
+    ${filterToolbar('ledger', { search: true, dates: true, selects: [
+      { key: 'inventory_type', label: 'Category', options: [{ v: 'equipment', t: 'Equipment' }, { v: 'feed', t: 'Feed' }] },
+      { key: 'origin_platform', label: 'Origin', options: [{ v: 'equipment_app', t: 'Equipment App' }, { v: 'feed_app', t: 'Feed App' }] },
+      { key: 'status', label: 'Status', options: [{ v: 'SUCCESS', t: 'Success' }, { v: 'PENDING', t: 'Pending' }, { v: 'FAILED', t: 'Failed' }] },
+      { key: 'method', label: 'Method', options: [{ v: 'mpesa', t: 'M-Pesa' }, { v: 'sasapay', t: 'SasaPay' }, { v: 'buni', t: 'Buni' }] }
+    ] })}
+    <div class="card table-card"><table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+        <th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Category</th><th class="text-left px-4 py-3">Origin</th>
+        <th class="text-left px-4 py-3">Method</th><th class="text-left px-4 py-3">Phone</th><th class="text-right px-4 py-3">Amount</th>
+        <th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Created</th></tr></thead>
+      <tbody id="ledgerBody"></tbody>
+    </table></div>`
+  window._rerender_ledger()
+}
+function ledgerStatusBadge(s) {
+  const m = { SUCCESS: 'bg-emerald-50 text-emerald-600', PENDING: 'bg-amber-50 text-amber-600', FAILED: 'bg-red-50 text-red-600', EXPIRED: 'bg-slate-100 text-slate-500' }
+  return `<span class="px-2 py-0.5 rounded text-xs ${m[s] || 'bg-slate-100 text-slate-500'}">${esc(s || 'PENDING')}</span>`
+}
+
 let _authTab = 'signin'
 let _smsLive = false
 async function renderLogin(tab) {
@@ -475,6 +608,7 @@ function navItems() {
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
     wallets,
+    { k: 'ledger', i: 'fa-book', t: 'Payment Ledger' },
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
     { k: 'settings', i: 'fa-sliders', t: 'Financing Settings' },
     { k: 'exports', i: 'fa-database', t: 'Data Export' }])
@@ -539,9 +673,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', ledger: 'Unified Payment Ledger' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, ledger: viewLedger }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -560,7 +694,7 @@ async function viewDashboard() {
   const { data } = await api.get('/dashboard')
   if (data.role === 'customer') {
     let next = data.next_payment ? `<div class="card p-5"><p class="text-xs text-slate-500 uppercase">Next Payment</p><p class="text-2xl font-bold mt-1">${fmt(data.next_payment.amount_due - data.next_payment.amount_paid)}</p><p class="text-sm text-slate-500">Due ${data.next_payment.due_date}</p></div>` : '<div class="card p-5"><p class="text-slate-500">No upcoming payments</p></div>'
-    $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+    $('content').innerHTML = `${crossAppBanner()}<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
       ${statCard('fa-file-signature', 'Active Purchases', data.active_contracts, 'bg-teal-50 text-teal-600')}
       ${statCard('fa-money-bill-wave', 'Total Outstanding', fmt(data.total_outstanding), 'bg-amber-50 text-amber-600')}
       ${statCard('fa-circle-check', 'Completed', data.completed_contracts, 'bg-emerald-50 text-emerald-600')}
@@ -571,7 +705,7 @@ async function viewDashboard() {
       <button onclick="go('contracts')" class="btn bg-slate-100 px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-list mr-1"></i>My Purchases</button>
     </div>`
   } else if (data.role === 'agent') {
-    $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+    $('content').innerHTML = `${crossAppBanner()}<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
       ${statCard('fa-users', 'Farmers Added', data.customers_onboarded, 'bg-teal-50 text-teal-600')}
       ${statCard('fa-file-signature', 'Active Contracts', data.active_contracts, 'bg-blue-50 text-blue-600')}
       ${statCard('fa-clock', 'Pending Approvals', data.pending_approvals, 'bg-amber-50 text-amber-600')}
@@ -583,7 +717,7 @@ async function viewDashboard() {
     </div>
     <div class="card p-6"><button onclick="go('onboard')" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add New Farmer</button></div>`
   } else {
-    $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+    $('content').innerHTML = `${crossAppBanner()}<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
       ${statCard('fa-chart-line', 'Total Sales', fmt(data.total_sales), 'bg-teal-50 text-teal-600')}
       ${statCard('fa-hand-holding-dollar', 'Equipment Financed', fmt(data.equipment_financed), 'bg-blue-50 text-blue-600')}
       ${statCard('fa-money-bill', 'Cash Sales', fmt(data.cash_sales), 'bg-emerald-50 text-emerald-600')}
