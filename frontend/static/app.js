@@ -71,7 +71,68 @@ const payLabel = (t, model) => {
     : (String(t || '').charAt(0).toUpperCase() + String(t || '').slice(1))
 }
 
+// ---------------------------------------------------------------------------
+// PRODUCT TAXONOMY
+//   Three storefront sections (marketplaces). Each has a hierarchical category
+//   tree. Admins/inventory managers can also TYPE IN new categories on the fly
+//   (dynamic creation) — the trees below are only sensible defaults surfaced as
+//   suggestions in a <datalist>, never a hard drop-down.
+// ---------------------------------------------------------------------------
+const TAXONOMY = {
+  equipment: {
+    key: 'equipment', label: 'Shop by Equipment', icon: 'fa-tractor',
+    categories: {
+      'Farm Implements': ['Soil Cultivation (plows & harrows)', 'Planting (seed drills & planters)', 'Crop Protection (sprayers)', 'Harvesting (combine harvesters & threshers)'],
+      'Tractors & Power': ['Tractors', 'Power Tillers', 'Engines & Motors'],
+      'Irrigation': ['Pumps', 'Drip Kits', 'Sprinklers'],
+      'Post-Harvest': ['Dryers', 'Storage', 'Milling & Processing'],
+      'Livestock Equipment': ['Milking Machines', 'Feeders & Drinkers', 'Incubators']
+    }
+  },
+  feeds: {
+    key: 'feeds', label: 'Shop by Feeds', icon: 'fa-wheat-awn',
+    categories: {
+      'Cattle Feed': ['Dairy Meal', 'Calf Pellets', 'Mineral Licks'],
+      'Poultry Feed': ['Chick Mash', 'Growers Mash', 'Layers Mash'],
+      'Pig Feed': ['Sow & Weaner', 'Finisher'],
+      'Fish Feed': ['Fingerling Feed', 'Grower Feed'],
+      'Supplements': ['Vitamins', 'Minerals', 'Additives']
+    }
+  },
+  inputs: {
+    key: 'inputs', label: 'Shop by Inputs', icon: 'fa-seedling',
+    categories: {
+      'Seeds': ['Cereal Seeds', 'Vegetable Seeds', 'Legume Seeds'],
+      'Fertilizers': ['Planting Fertilizer', 'Top Dressing', 'Foliar Feeds'],
+      'Crop Protection': ['Herbicides', 'Pesticides', 'Fungicides'],
+      'Soil Health': ['Lime', 'Organic Manure', 'Biofertilizers']
+    }
+  }
+}
+const MARKETPLACE_LABELS = { equipment: 'Equipment', feeds: 'Feeds', inputs: 'Inputs' }
+// Origin/source platform badges (permanent tag of where a product was created).
+const SOURCE_LABELS = { equipment: 'Equipment', feed: 'Feeds App', mazao: 'Mazao App', merchant: 'Merchant' }
+function marketplaceOf(p) {
+  const m = String(p && p.marketplace || '').toLowerCase()
+  if (['equipment', 'feeds', 'inputs'].includes(m)) return m
+  // Fall back to legacy product_type for un-migrated rows.
+  const t = String(p && p.product_type || '').toLowerCase()
+  return ['feed', 'feeds'].includes(t) ? 'feeds' : ['input', 'inputs', 'mazao'].includes(t) ? 'inputs' : 'equipment'
+}
+function categorySuggestions(marketplace) {
+  const tree = TAXONOMY[marketplace] || TAXONOMY.equipment
+  return Object.keys(tree.categories)
+}
+function subcategorySuggestions(marketplace, category) {
+  const tree = TAXONOMY[marketplace] || TAXONOMY.equipment
+  return tree.categories[category] || Array.from(new Set(Object.values(tree.categories).flat()))
+}
+
 let _products = [], _agents = [], _users = [], _customers = [], _walletUsers = []
+// Shop UI state: active marketplace section, category filter, and the cross-
+// marketplace cart (Farmer / Offtaker only).
+let _shopFilter = { marketplace: 'equipment', category: '', subcategory: '' }
+let _cart = []
 let _permMeta = { permissions: [], roles: [] }
 function getRoleTemplate(role) {
   return (_permMeta.roles || []).find((r) => r.role_key === role)
@@ -780,7 +841,9 @@ async function viewDashboard() {
     <div class="card p-6"><h3 class="font-bold mb-2"><i class="fas fa-store text-teal-600 mr-2"></i>Quick Actions</h3>
       <button onclick="go('shop')" class="btn brand-bg text-white px-5 py-2.5 rounded-lg text-sm mr-2"><i class="fas fa-cart-plus mr-1"></i>Buy Equipment</button>
       <button onclick="go('contracts')" class="btn bg-slate-100 px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-list mr-1"></i>My Purchases</button>
-    </div>`
+    </div>
+    <div id="quickCheckout" class="mt-6"></div>`
+    renderQuickCheckout()
   } else if (data.role === 'agent') {
     $('content').innerHTML = `${crossAppBanner()}<div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
       ${statCard('fa-users', 'Farmers Added', data.customers_onboarded, 'bg-teal-50 text-teal-600')}
@@ -810,6 +873,36 @@ async function viewDashboard() {
   }
 }
 
+// Quick Checkout Cards: the empty layout area under the main action buttons is
+// filled with direct product cards. Clicking a card takes the shopper straight
+// to the single-item checkout (buyModal) without navigating to the full shop.
+async function renderQuickCheckout() {
+  const el = $('quickCheckout'); if (!el) return
+  try {
+    const { data } = await api.get('/products?shop=1')
+    _products = data.products || []
+    const items = _products.filter(p => Number(p.quantity) > 0).slice(0, 6)
+    if (!items.length) { el.innerHTML = ''; return }
+    const cards = items.map(p => `
+      <div class="card overflow-hidden fade-in flex flex-col cursor-pointer hover:shadow-lg transition-shadow" onclick="buyModal(${p.id})">
+        ${prodImg(p, 'w-full h-32')}
+        <div class="p-3 flex flex-col flex-1">
+          <h4 class="font-semibold text-sm text-slate-800 truncate">${esc(p.name)}</h4>
+          <p class="text-[11px] text-slate-400 mb-2 truncate">${esc(p.category || '')}${p.subcategory ? ' › ' + esc(p.subcategory) : ''}</p>
+          <div class="mt-auto flex items-center justify-between">
+            <div><span class="text-[10px] text-slate-400 block">Cash</span><span class="font-bold text-emerald-600 text-sm">${fmt(p.cash_price)}</span></div>
+            <span class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-bolt mr-1"></i>Checkout</span>
+          </div>
+        </div>
+      </div>`).join('')
+    el.innerHTML = `<div class="flex items-center justify-between mb-3">
+        <h3 class="font-bold text-slate-800"><i class="fas fa-bolt text-amber-500 mr-2"></i>Quick Checkout</h3>
+        <button onclick="go('shop')" class="text-teal-600 text-sm hover:underline">Browse all <i class="fas fa-arrow-right text-xs ml-1"></i></button>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">${cards}</div>`
+  } catch (err) { el.innerHTML = '' }
+}
+
 // ---------------------------------------------------------------------------
 // SHOP (customer buy flow)
 // ---------------------------------------------------------------------------
@@ -818,27 +911,120 @@ function prodImg(p, cls) {
     ? `<img src="${esc(p.image)}" alt="${esc(p.name)}" class="${cls} object-cover">`
     : `<div class="${cls} flex items-center justify-center bg-gradient-to-br from-teal-50 to-emerald-100 text-teal-400"><i class="fas fa-box-open text-3xl"></i></div>`
 }
+// Only Farmer (customer) and Offtaker accounts may build a cross-marketplace cart.
+function canUseCart() { return ['customer', 'offtaker'].includes(state.user.role) }
+window.toggleShopMenu = (open) => {
+  const d = $('shopDrawer'), o = $('shopDrawerOverlay')
+  if (!d) return
+  const show = open === undefined ? d.classList.contains('-translate-x-full') : open
+  d.classList.toggle('-translate-x-full', !show)
+  if (o) o.classList.toggle('hidden', !show)
+}
+window.shopSelect = (marketplace, category = '', subcategory = '') => {
+  _shopFilter = { marketplace, category, subcategory }
+  toggleShopMenu(false)
+  renderShopGrid()
+}
+function shopDrawerHtml() {
+  const sections = Object.values(TAXONOMY).map(sec => {
+    const cats = Object.entries(sec.categories).map(([cat, subs]) => `
+      <details class="border-b border-white/10">
+        <summary class="cursor-pointer px-4 py-2.5 text-sm hover:bg-white/10 flex items-center justify-between">
+          <span onclick="event.preventDefault();shopSelect('${sec.key}','${esc(cat).replace(/'/g,"\\'")}')">${esc(cat)}</span>
+          <i class="fas fa-chevron-down text-[10px] opacity-60"></i>
+        </summary>
+        <div class="pb-1">
+          ${subs.map(s => `<div class="px-6 py-1.5 text-xs text-teal-100 hover:bg-white/10 cursor-pointer" onclick="shopSelect('${sec.key}','${esc(cat).replace(/'/g,"\\'")}','${esc(s).replace(/'/g,"\\'")}')">${esc(s)}</div>`).join('')}
+        </div>
+      </details>`).join('')
+    return `<div class="mb-1">
+      <div class="px-4 py-2.5 font-semibold text-sm bg-white/10 flex items-center gap-2 cursor-pointer" onclick="shopSelect('${sec.key}')"><i class="fas ${sec.icon}"></i>${sec.label}</div>
+      ${cats}
+    </div>`
+  }).join('')
+  return `
+    <div id="shopDrawerOverlay" class="app-overlay hidden" onclick="toggleShopMenu(false)"></div>
+    <aside id="shopDrawer" class="fixed top-0 left-0 z-40 h-full w-72 max-w-[85%] brand-bg text-white overflow-y-auto shadow-2xl transform -translate-x-full transition-transform duration-200">
+      <div class="p-4 border-b border-white/10 flex items-center justify-between">
+        <span class="font-bold"><i class="fas fa-bars mr-2"></i>Browse Categories</span>
+        <button onclick="toggleShopMenu(false)" class="text-white/80 hover:text-white"><i class="fas fa-times"></i></button>
+      </div>
+      ${sections}
+    </aside>`
+}
 async function viewShop() {
   const { data } = await api.get('/products?shop=1')
   _products = data.products
-  $('content').innerHTML = `<div class="grid grid-cols-1 md:grid-cols-3 gap-5">
-    ${data.products.map(p => `
-      <div class="card overflow-hidden fade-in flex flex-col">
-        <div class="cursor-pointer" onclick="productDetail(${p.id})">${prodImg(p, 'w-full h-44')}</div>
-        <div class="p-4 flex flex-col flex-1">
-          <div class="flex justify-between items-start"><h3 class="font-bold text-slate-800">${esc(p.name)}</h3>${badge(p.stock_status)}</div>
-          <p class="text-xs text-slate-500 mb-3">${esc(p.category)} · ${p.quantity} ${esc(p.unit)} in stock</p>
-          <div class="space-y-1 text-sm mt-auto">
-            <div class="flex justify-between"><span class="text-slate-500">Cash Price</span><span class="font-semibold text-emerald-600">${fmt(p.cash_price)}</span></div>
-            <div class="flex justify-between"><span class="text-slate-500">Pay Later Price <span class="text-[10px] text-slate-400">(Murabaha Financing)</span></span><span class="font-semibold text-blue-600">${fmt(p.credit_price)}</span></div>
-          </div>
-          <div class="flex gap-2 mt-4">
-            <button onclick="productDetail(${p.id})" class="btn flex-1 bg-slate-100 hover:bg-slate-200 py-2 rounded-lg text-sm"><i class="fas fa-circle-info mr-1"></i>Details</button>
-            <button onclick="buyModal(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-cart-plus mr-1"></i>Buy</button>
-          </div>
+  $('content').innerHTML = `${shopDrawerHtml()}
+    <div class="flex items-center gap-3 mb-4 flex-wrap">
+      <button onclick="toggleShopMenu(true)" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-bars mr-2"></i>Menu</button>
+      <div class="flex gap-2">
+        ${Object.values(TAXONOMY).map(s => `<button onclick="shopSelect('${s.key}')" class="btn px-3 py-2 rounded-lg text-sm ${_shopFilter.marketplace === s.key ? 'brand-bg text-white' : 'bg-slate-100 hover:bg-slate-200'}"><i class="fas ${s.icon} mr-1"></i>${MARKETPLACE_LABELS[s.key]}</button>`).join('')}
+      </div>
+      ${canUseCart() ? `<button onclick="openCart()" class="btn ml-auto bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-lg text-sm relative"><i class="fas fa-shopping-cart mr-1"></i>Cart <span id="cartCount" class="badge bg-teal-600 text-white ml-1">${_cart.length}</span></button>` : ''}
+    </div>
+    <div id="shopBreadcrumb" class="text-sm text-slate-500 mb-3"></div>
+    <div id="shopGrid"></div>`
+  renderShopGrid()
+}
+function renderShopGrid() {
+  const f = _shopFilter
+  let items = _products.filter(p => marketplaceOf(p) === f.marketplace)
+  if (f.category) items = items.filter(p => String(p.category || '') === f.category)
+  if (f.subcategory) items = items.filter(p => String(p.subcategory || '') === f.subcategory)
+  const crumb = [MARKETPLACE_LABELS[f.marketplace] || 'Equipment', f.category, f.subcategory].filter(Boolean).join(' › ')
+  setHTML('shopBreadcrumb', `<i class="fas fa-location-dot text-teal-600 mr-1"></i>${esc(crumb)} · ${items.length} item(s)${(f.category || f.subcategory) ? ` · <button onclick="shopSelect('${f.marketplace}')" class="text-teal-600 hover:underline">clear filter</button>` : ''}`)
+  const grid = items.map(p => `
+    <div class="card overflow-hidden fade-in flex flex-col">
+      <div class="cursor-pointer" onclick="productDetail(${p.id})">${prodImg(p, 'w-full h-44')}</div>
+      <div class="p-4 flex flex-col flex-1">
+        <div class="flex justify-between items-start"><h3 class="font-bold text-slate-800">${esc(p.name)}</h3>${badge(p.stock_status)}</div>
+        <p class="text-xs text-slate-500 mb-3">${esc(p.category || '')}${p.subcategory ? ' › ' + esc(p.subcategory) : ''} · ${p.quantity} ${esc(p.unit)} in stock</p>
+        <div class="space-y-1 text-sm mt-auto">
+          <div class="flex justify-between"><span class="text-slate-500">Cash Price</span><span class="font-semibold text-emerald-600">${fmt(p.cash_price)}</span></div>
+          <div class="flex justify-between"><span class="text-slate-500">Pay Later Price</span><span class="font-semibold text-blue-600">${fmt(p.credit_price)}</span></div>
         </div>
-      </div>`).join('')}
-  </div>`
+        <div class="flex gap-2 mt-4">
+          <button onclick="productDetail(${p.id})" class="btn flex-1 bg-slate-100 hover:bg-slate-200 py-2 rounded-lg text-sm"><i class="fas fa-circle-info mr-1"></i>Details</button>
+          ${canUseCart() ? `<button onclick="addToCart(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn bg-slate-100 hover:bg-slate-200 py-2 px-3 rounded-lg text-sm disabled:opacity-40" title="Add to cart"><i class="fas fa-cart-plus"></i></button>` : ''}
+          <button onclick="buyModal(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-bolt mr-1"></i>Buy</button>
+        </div>
+      </div>
+    </div>`).join('') || '<div class="col-span-full text-center py-12 text-slate-400">No products in this category yet.</div>'
+  setHTML('shopGrid', `<div class="grid grid-cols-1 md:grid-cols-3 gap-5">${grid}</div>`)
+}
+// ---- Cross-marketplace cart (Farmer / Offtaker only) ----
+window.addToCart = (id) => {
+  if (!canUseCart()) return toast('Cart is available to Farmer and Offtaker accounts only.', false)
+  const p = _products.find(x => x.id === id); if (!p) return
+  const existing = _cart.find(x => x.id === id)
+  if (existing) existing.qty += 1; else _cart.push({ id, name: p.name, cash_price: p.cash_price, marketplace: marketplaceOf(p), qty: 1 })
+  const cc = $('cartCount'); if (cc) cc.textContent = _cart.length
+  toast(`${p.name} added to cart`)
+}
+window.removeFromCart = (id) => { _cart = _cart.filter(x => x.id !== id); openCart() }
+window.openCart = () => {
+  if (!_cart.length) return showModal(`<h3 class="font-bold mb-3"><i class="fas fa-shopping-cart mr-2"></i>Your Cart</h3><p class="text-slate-400 text-sm mb-4">Your cart is empty. Add items from any marketplace section.</p><button onclick="closeModal()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Close</button>`)
+  const total = _cart.reduce((s, x) => s + Number(x.cash_price) * x.qty, 0)
+  const rows = _cart.map(x => `<div class="flex items-center justify-between py-2 border-b border-slate-100">
+    <div><div class="font-medium text-sm">${esc(x.name)}</div><div class="text-[11px] text-slate-400">${MARKETPLACE_LABELS[x.marketplace] || 'Equipment'} · x${x.qty}</div></div>
+    <div class="flex items-center gap-3"><span class="font-semibold text-sm">${fmt(x.cash_price * x.qty)}</span><button onclick="removeFromCart(${x.id})" class="text-red-500 text-xs hover:underline">remove</button></div>
+  </div>`).join('')
+  showModal(`<h3 class="font-bold mb-3"><i class="fas fa-shopping-cart mr-2"></i>Your Cart <span class="text-xs text-slate-400">(items from any marketplace)</span></h3>
+    ${rows}
+    <div class="flex justify-between font-bold mt-3"><span>Estimated cash total</span><span>${fmt(total)}</span></div>
+    <div class="flex gap-2 mt-4">
+      <button onclick="checkoutCart()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-cash-register mr-1"></i>Checkout items</button>
+      <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
+    </div>`)
+}
+window.checkoutCart = () => {
+  // Sequential per-item checkout using the existing single-item buy flow so each
+  // item's cash/financing terms + KYC gating still apply individually.
+  const first = _cart[0]
+  if (!first) return closeModal()
+  toast('Checkout each item to confirm its payment terms.')
+  buyModal(first.id)
 }
 window.productDetail = (id) => {
   const p = _products.find(x => x.id === id)
@@ -849,7 +1035,7 @@ window.productDetail = (id) => {
     <p class="text-sm text-slate-500 mb-4"><i class="fas fa-tag mr-1"></i>${esc(p.category)} · SKU ${esc(p.sku)}</p>
     <div class="responsive-grid cols-2 text-sm">
       <div class="bg-emerald-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Cash Price</p><b class="text-emerald-700 text-lg">${fmt(p.cash_price)}</b></div>
-      <div class="bg-blue-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Pay Later Price <span class="text-[10px] text-slate-400">(Murabaha Financing)</span></p><b class="text-blue-700 text-lg">${fmt(p.credit_price)}</b></div>
+      <div class="bg-blue-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Pay Later Price</p><b class="text-blue-700 text-lg">${fmt(p.credit_price)}</b></div>
       <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">In Stock</p><b>${p.quantity} ${esc(p.unit)}</b></div>
       <div class="bg-slate-50 p-3 rounded-lg"><p class="text-xs text-slate-500">Pay Later Markup</p><b>${p.credit_markup_pct}%</b></div>
     </div>
@@ -1384,11 +1570,22 @@ function productForm(prefix, p = {}) {
       </div>
     </div>
     <input type="hidden" id="${prefix}_img" value="${esc(p.image || '')}">
+    <input type="hidden" id="${prefix}_source" value="${esc(p.source_platform || (p.__source_platform || 'equipment'))}">
     <div class="responsive-grid cols-2 text-sm">
-      <div><label class="field-label">Equipment SKU</label><input id="${prefix}_sku" value="${esc(p.sku || '')}" placeholder="SKU" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Equipment name</label><input id="${prefix}_name" value="${esc(p.name || '')}" placeholder="Equipment name" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Inventory category</label><input id="${prefix}_cat" value="${esc(p.category || 'Equipment')}" placeholder="Category" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Marketplace section</label><select id="${prefix}_market" onchange="onMarketplaceChange('${prefix}')" class="px-3 py-2 border rounded-lg">
+        ${['equipment','feeds','inputs'].map(m => `<option value="${m}" ${marketplaceOf(p) === m ? 'selected' : ''}>${MARKETPLACE_LABELS[m]}</option>`).join('')}
+      </select></div>
+      <div><label class="field-label">SKU (must be unique)</label><input id="${prefix}_sku" value="${esc(p.sku || '')}" placeholder="SKU" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Product name</label><input id="${prefix}_name" value="${esc(p.name || '')}" placeholder="Product name" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Stock unit</label><input id="${prefix}_unit" value="${esc(p.unit || 'unit')}" placeholder="Unit" class="px-3 py-2 border rounded-lg"></div>
+      <div><label class="field-label">Category <span class="text-[10px] text-slate-400">(type to create)</span></label>
+        <input id="${prefix}_cat" list="${prefix}_cat_list" value="${esc(p.category || '')}" placeholder="Choose or type a new category" class="px-3 py-2 border rounded-lg" oninput="onCategoryChange('${prefix}')">
+        <datalist id="${prefix}_cat_list">${categorySuggestions(marketplaceOf(p)).map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+      </div>
+      <div><label class="field-label">Sub-category <span class="text-[10px] text-slate-400">(type to create)</span></label>
+        <input id="${prefix}_subcat" list="${prefix}_subcat_list" value="${esc(p.subcategory || '')}" placeholder="Choose or type a new sub-category" class="px-3 py-2 border rounded-lg">
+        <datalist id="${prefix}_subcat_list">${subcategorySuggestions(marketplaceOf(p), p.category).map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+      </div>
       <div style="grid-column:1 / -1"><label class="field-label">Equipment description</label><textarea id="${prefix}_desc" placeholder="Equipment details / description" class="px-3 py-2 border rounded-lg min-h-24">${esc(p.description || '')}</textarea></div>
       <div><label class="field-label">Buying cost</label><input id="${prefix}_buy" type="number" value="${Number(p.buying_price || 0)}" placeholder="Buying price" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Quantity in stock</label><input id="${prefix}_qty" type="number" value="${Number(p.quantity || 0)}" placeholder="Quantity" class="px-3 py-2 border rounded-lg"></div>
@@ -1437,14 +1634,33 @@ function productForm(prefix, p = {}) {
       </div>
     </div>`
 }
+// Dynamic category cascade: when the marketplace changes, refresh the category
+// suggestions; when the category changes, refresh sub-category suggestions.
+// Both fields remain free-text so admins can TYPE IN brand-new categories.
+window.onMarketplaceChange = (prefix) => {
+  const m = $(prefix + '_market')?.value || 'equipment'
+  const catList = $(prefix + '_cat_list')
+  if (catList) catList.innerHTML = categorySuggestions(m).map(c => `<option value="${esc(c)}">`).join('')
+  onCategoryChange(prefix)
+}
+window.onCategoryChange = (prefix) => {
+  const m = $(prefix + '_market')?.value || 'equipment'
+  const cat = $(prefix + '_cat')?.value || ''
+  const subList = $(prefix + '_subcat_list')
+  if (subList) subList.innerHTML = subcategorySuggestions(m, cat).map(c => `<option value="${esc(c)}">`).join('')
+}
 function productPayload(prefix) {
   const mode = $(prefix + '_mode').value
+  const marketplace = ($(prefix + '_market') && $(prefix + '_market').value) || 'equipment'
   return {
     sku: $(prefix + '_sku').value,
     name: $(prefix + '_name').value,
+    marketplace,
     category: $(prefix + '_cat').value,
+    subcategory: ($(prefix + '_subcat') && $(prefix + '_subcat').value) || null,
+    source_platform: ($(prefix + '_source') && $(prefix + '_source').value) || 'equipment',
     description: $(prefix + '_desc').value,
-    product_type: 'equipment',
+    product_type: marketplace === 'feeds' ? 'feed' : marketplace === 'inputs' ? 'input' : 'equipment',
     unit: $(prefix + '_unit').value,
     buying_price: Number($(prefix + '_buy').value || 0),
     quantity: Number($(prefix + '_qty').value || 0),
@@ -1474,40 +1690,70 @@ function financeStatusBadge(s) {
   const label = { published: 'Live', pending_finance: 'Pending finance', draft: 'Draft' }[s] || s || 'Live'
   return `<span class="badge ${map[s] || 'bg-slate-100 text-slate-600'}">${esc(label)}</span>`
 }
+// Active admin-inventory tab: equipments | feeds | inputs | merchants
+let _invTab = 'equipments'
+window.setInvTab = (tab) => { _invTab = tab; viewInventory() }
+function invRow(p, canInv, canFin, isDelete) {
+  return `<tr class="border-t border-slate-100">
+    <td class="px-4 py-2">${prodImg(p, 'w-10 h-10 rounded-lg')}</td>
+    <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || '—')}${p.subcategory ? ' › ' + esc(p.subcategory) : ''}</div></td>
+    <td class="px-4 py-3"><span class="badge bg-slate-100 text-slate-600">${esc(SOURCE_LABELS[p.source_platform] || 'Equipment')}</span></td>
+    <td class="px-4 py-3">${financeStatusBadge(p.finance_status)}</td>
+    <td class="px-4 py-3">${esc((p.payment_option_mode || 'both').replace('_', ' '))}</td>
+    <td class="px-4 py-3 text-right">${p.quantity} ${esc(p.unit)}</td>
+    <td class="px-4 py-3 whitespace-nowrap text-right">
+      ${(canInv || canFin) ? `<button onclick="editProductModal(${p.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>` : ''}
+      ${canInv ? `<button onclick="restockModal(${p.id},'${esc(p.name)}')" class="text-slate-500 hover:underline text-xs mr-2">Restock</button>` : ''}
+      ${p.finance_status === 'pending_finance' && canFin ? `<button onclick="financeModal(${p.id})" class="text-amber-600 hover:underline text-xs mr-2"><i class="fas fa-hand-holding-dollar mr-1"></i>Set finance</button>` : ''}
+      ${isDelete ? `<button onclick="deleteProduct(${p.id},'${esc(p.name)}')" class="text-red-600 hover:underline text-xs">Delete</button>` : ''}
+    </td></tr>`
+}
 async function viewInventory() {
-  // Instruction 5 Query 3 — "My Inventory Control Grid". Agents (base inventory
-  // users) see only records they created (?mine=1); admins see the full catalog.
+  // Agents (base inventory users) see only records they created (?mine=1);
+  // admins see the full catalog across all marketplaces.
   const isAdmin = ['admin', 'super_admin'].includes(state.user.role)
   const { data } = await api.get('/products' + (isAdmin ? '' : '?mine=1'))
   _products = data.products
   const canInv = data.can_manage_inventory
   const canFin = data.can_manage_finance_settings
   const isDelete = isAdmin
-  const addBtn = canInv
-    ? `<button onclick="addProductModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Add inventory</button>`
-    : `<span class="text-xs text-slate-400">Read-only view · you are not authorized to add inventory</span>`
+
+  // Four admin sections. The first three are products sourced DIRECTLY from each
+  // marketplace app (source_platform equipment/feed/mazao). "Merchants Marketplace"
+  // aggregates listings synced from connected merchant systems (source=merchant),
+  // themselves categorised by marketplace.
+  const tabs = [
+    { k: 'equipments', t: 'Equipments', i: 'fa-tractor', match: (p) => p.source_platform === 'equipment' },
+    { k: 'feeds', t: 'Feeds', i: 'fa-wheat-awn', match: (p) => p.source_platform === 'feed' },
+    { k: 'inputs', t: 'Inputs', i: 'fa-seedling', match: (p) => p.source_platform === 'mazao' },
+    { k: 'merchants', t: 'Merchants Marketplace', i: 'fa-store', match: (p) => p.source_platform === 'merchant' }
+  ]
+  const active = tabs.find(t => t.k === _invTab) || tabs[0]
+  const rows = _products.filter(active.match)
+
+  // Destination buttons (Marketplace Selection): inventory managers list into any
+  // marketplace using dedicated buttons. Merchant tab lists as source=merchant.
+  const destButtons = canInv ? (active.k === 'merchants'
+    ? `<button onclick="addProductModal('equipment','merchant')" class="btn bg-slate-100 hover:bg-slate-200 px-3 py-2 rounded-lg text-xs"><i class="fas fa-plus mr-1"></i>Merchant · Equipment</button>
+       <button onclick="addProductModal('feeds','merchant')" class="btn bg-slate-100 hover:bg-slate-200 px-3 py-2 rounded-lg text-xs"><i class="fas fa-plus mr-1"></i>Merchant · Feeds</button>
+       <button onclick="addProductModal('inputs','merchant')" class="btn bg-slate-100 hover:bg-slate-200 px-3 py-2 rounded-lg text-xs"><i class="fas fa-plus mr-1"></i>Merchant · Inputs</button>`
+    : `<button onclick="addProductModal('${active.k === 'equipments' ? 'equipment' : active.k}','${active.k === 'equipments' ? 'equipment' : active.k === 'feeds' ? 'feed' : 'mazao'}')" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Add inventory</button>`)
+    : `<span class="text-xs text-slate-400">Read-only view · not authorized to add inventory</span>`
+
+  const tabBar = tabs.map(t => {
+    const n = _products.filter(t.match).length
+    return `<button onclick="setInvTab('${t.k}')" class="btn px-4 py-2 rounded-lg text-sm ${_invTab === t.k ? 'brand-bg text-white' : 'bg-slate-100 hover:bg-slate-200'}"><i class="fas ${t.i} mr-1"></i>${t.t} <span class="ml-1 text-xs opacity-70">(${n})</span></button>`
+  }).join('')
+
   $('content').innerHTML = `
-  <div class="flex items-center justify-between mb-4">
-    <div class="text-sm text-slate-500">${isAdmin ? 'Full equipment catalog' : 'Equipment you have listed'} · ${data.products.length} item(s)</div>
-    <div class="action-bar">${addBtn}</div>
+  <div class="flex flex-wrap gap-2 mb-4">${tabBar}</div>
+  <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+    <div class="text-sm text-slate-500"><i class="fas ${active.i} text-teal-600 mr-1"></i>${active.t} · ${rows.length} item(s)</div>
+    <div class="action-bar flex flex-wrap gap-2">${destButtons}</div>
   </div>
   <div class="card table-card"><table class="w-full text-sm">
-    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Equipment</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Payment Options</th><th class="text-left px-4 py-3">Financing</th><th class="text-right px-4 py-3">Cash Dep.</th><th class="text-right px-4 py-3">Fin. Dep.</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
-    <tbody>${data.products.map(p => `<tr class="border-t border-slate-100">
-      <td class="px-4 py-2">${prodImg(p, 'w-10 h-10 rounded-lg')}</td>
-      <td class="px-4 py-3"><div class="font-medium">${esc(p.name)}</div><div class="text-xs text-slate-500">${esc(p.sku)} · ${esc(p.category || 'Equipment')}</div></td>
-      <td class="px-4 py-3">${financeStatusBadge(p.finance_status)}</td>
-      <td class="px-4 py-3">${esc((p.payment_option_mode || 'both').replace('_', ' '))}</td>
-      <td class="px-4 py-3">${esc(p.financing_model === 'paygo' ? 'PAYGO' : 'Interest financing')}<div class="text-xs text-slate-400">${Number(p.financing_interest_pct || 0)}% · ${esc(p.financing_frequency || 'monthly')}</div></td>
-      <td class="px-4 py-3 text-right">${Number(p.cash_deposit_pct ?? 100)}%</td>
-      <td class="px-4 py-3 text-right">${Number(p.financing_deposit_pct ?? 10)}%</td>
-      <td class="px-4 py-3 text-right">${p.quantity} ${esc(p.unit)}</td>
-      <td class="px-4 py-3 whitespace-nowrap text-right">
-        ${(canInv || canFin) ? `<button onclick="editProductModal(${p.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>` : ''}
-        ${canInv ? `<button onclick="restockModal(${p.id},'${esc(p.name)}')" class="text-slate-500 hover:underline text-xs mr-2">Restock</button>` : ''}
-        ${p.finance_status === 'pending_finance' && canFin ? `<button onclick="financeModal(${p.id})" class="text-amber-600 hover:underline text-xs mr-2"><i class="fas fa-hand-holding-dollar mr-1"></i>Set finance</button>` : ''}
-        ${isDelete ? `<button onclick="deleteProduct(${p.id},'${esc(p.name)}')" class="text-red-600 hover:underline text-xs">Delete</button>` : ''}
-      </td></tr>`).join('') || '<tr><td colspan="9" class="text-center py-8 text-slate-400">No inventory records</td></tr>'}</tbody>
+    <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Image</th><th class="text-left px-4 py-3">Product</th><th class="text-left px-4 py-3">Source</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Payment</th><th class="text-right px-4 py-3">Qty</th><th></th></tr></thead>
+    <tbody>${rows.map(p => invRow(p, canInv, canFin, isDelete)).join('') || `<tr><td colspan="7" class="text-center py-8 text-slate-400">No products in ${esc(active.t)} yet</td></tr>`}</tbody>
   </table></div>`
 }
 window.pickImage = (input, targetId, previewId) => {
@@ -1528,13 +1774,19 @@ window.pickImage = (input, targetId, previewId) => {
   }
   reader.readAsDataURL(file)
 }
-window.addProductModal = () => {
-  showModal(`<h3 class="font-bold mb-3">Add Equipment</h3>${productForm('np')}<div class="flex gap-2 mt-4"><button onclick="doAddProduct()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+// Open the "Add product" modal, optionally pre-targeting a marketplace section
+// and a source platform (e.g. the Merchant Marketplace destination button lists
+// items tagged source_platform='merchant').
+window.addProductModal = (marketplace = 'equipment', source = 'equipment') => {
+  const seed = { marketplace, __source_platform: source }
+  const dest = MARKETPLACE_LABELS[marketplace] || 'Equipment'
+  const srcNote = source === 'merchant' ? ' · Merchant Marketplace' : ''
+  showModal(`<h3 class="font-bold mb-3">Add product to ${esc(dest)}${srcNote}</h3>${productForm('np', seed)}<div class="flex gap-2 mt-4"><button onclick="doAddProduct()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
 }
 window.doAddProduct = async () => {
   try {
     await api.post('/products', productPayload('np'))
-    closeModal(); toast('Equipment added'); viewInventory()
+    closeModal(); toast('Product added'); viewInventory()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 window.editProductModal = (id) => {
@@ -2925,16 +3177,7 @@ function productPicker(cfg, ns, canEdit) {
       <label class="field-label text-left">Apply to products</label>
       <p class="text-[11px] text-slate-500 mb-2 text-left">Tick the inventory products this applies to. Leave all unticked to apply to <b>every</b> product.</p>
       <div class="max-h-48 overflow-y-auto border border-slate-200 rounded-lg p-3 bg-slate-50 text-left flex flex-col items-start">${options}</div>
-      ${canEdit ? `<button type="button" onclick="toggleQuickProduct('${ns}')" class="btn mt-3 bg-slate-800 text-white px-4 py-2 rounded-lg text-xs"><i class="fas fa-plus mr-1"></i>Add new product to inventory</button>` : ''}
-      <div id="quickProduct_${ns}" class="hidden mt-3 border border-dashed border-slate-300 rounded-lg p-3 bg-white">
-        <div class="grid grid-cols-2 gap-3">
-          <div><label class="field-label">SKU</label><input id="qp_sku_${ns}" class="w-full px-3 py-2 border rounded-lg text-sm" placeholder="e.g. EQ-045"></div>
-          <div><label class="field-label">Name</label><input id="qp_name_${ns}" class="w-full px-3 py-2 border rounded-lg text-sm" placeholder="Product name"></div>
-          <div><label class="field-label">Category</label><input id="qp_cat_${ns}" class="w-full px-3 py-2 border rounded-lg text-sm" placeholder="Equipment" value="Equipment"></div>
-          <div><label class="field-label">Buying Price (KES)</label><input id="qp_price_${ns}" type="number" min="0" class="w-full px-3 py-2 border rounded-lg text-sm" placeholder="0"></div>
-        </div>
-        <button type="button" onclick="createQuickProduct('${ns}')" class="btn mt-3 brand-bg text-white px-4 py-2 rounded-lg text-xs"><i class="fas fa-check mr-1"></i>Create &amp; select</button>
-      </div>
+      ${canEdit ? `<button type="button" onclick="addProductFromSettings('${ns}')" class="btn mt-3 bg-slate-800 text-white px-4 py-2 rounded-lg text-xs"><i class="fas fa-plus mr-1"></i>Add new product to inventory</button>` : ''}
     </div>`
 }
 window.togglePicked = (ns, id, checked) => {
@@ -2943,18 +3186,28 @@ window.togglePicked = (ns, id, checked) => {
   if (checked) set.add(Number(id)); else set.delete(Number(id))
   cfg.product_ids = Array.from(set)
 }
-window.toggleQuickProduct = (ns) => { const el = $('quickProduct_' + ns); if (el) el.classList.toggle('hidden') }
-window.createQuickProduct = async (ns) => {
-  const sku = ($('qp_sku_' + ns) || {}).value, name = ($('qp_name_' + ns) || {}).value
-  if (!sku || !name) return toast('SKU and name are required', false)
-  const body = { sku: sku.trim(), name: name.trim(), category: ($('qp_cat_' + ns) || {}).value || 'Equipment', buying_price: Number(($('qp_price_' + ns) || {}).value || 0) }
+// Unified Upload Flow: "Add new product to inventory" in the Financing & Markup
+// Settings section opens the EXACT same modal/form/steps as "Add inventory" in
+// the main Inventory section. On save, the new product is pushed into the local
+// inventory cache and auto-selected in the builder that opened it.
+window.addProductFromSettings = (ns) => {
+  const seed = { marketplace: 'equipment', __source_platform: 'equipment' }
+  showModal(`<h3 class="font-bold mb-3">Add product to inventory</h3>${productForm('np', seed)}<div class="flex gap-2 mt-4"><button onclick="doAddProductFromSettings('${ns}')" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+}
+window.doAddProductFromSettings = async (ns) => {
   try {
-    const res = await api.post('/settings/quick-product', body)
-    const prod = res.data.product
-    _inventory.push(prod)
-    const cfg = ns === 'fee' ? _feeCfg : _mkCfg
-    cfg.product_ids = Array.from(new Set([...(cfg.product_ids || []).map(Number), Number(prod.id)]))
-    toast('Product added to inventory')
+    const res = await api.post('/products', productPayload('np'))
+    const prod = res.data.product || res.data
+    // Keep the settings picker in sync so the new item is immediately selectable.
+    if (prod && prod.id != null) {
+      if (!_inventory.some(x => Number(x.id) === Number(prod.id))) _inventory.push(prod)
+      const cfg = ns === 'fee' ? _feeCfg : _mkCfg
+      cfg.product_ids = Array.from(new Set([...(cfg.product_ids || []).map(Number), Number(prod.id)]))
+    } else {
+      // Endpoint returned only { id, ... } — refresh inventory to pick up full record.
+      try { const inv = await api.get('/products'); _inventory = inv.data.products || inv.data || _inventory } catch (e) {}
+    }
+    closeModal(); toast('Product added to inventory')
     if (ns === 'fee') renderFeeBuilder(); else renderMarkupBuilder()
   } catch (err) { toast(err.response?.data?.error || 'Failed to add product', false) }
 }

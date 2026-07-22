@@ -211,6 +211,37 @@ function isSafeDataUrlOrHttp(value: any): boolean {
     return false
   }
 }
+// Agreement documents may be an image (jpg/png/webp/gif) OR a PDF, uploaded as a
+// data: URL, or a plain https URL to an already-hosted file. Same 8 MB cap and
+// magic-byte sniff as images, but PDFs are additionally accepted here (they are
+// NOT allowed for images/avatars). This blocks executables, HTML/SVG-with-script
+// and other malicious payloads from being stored and served back later.
+const ALLOWED_DOC_MIME = [...ALLOWED_IMAGE_MIME, 'application/pdf']
+const MAX_DOC_BYTES = 8 * 1024 * 1024 // 8 MB per document
+function isSafeDocDataUrlOrHttp(value: any): boolean {
+  if (typeof value !== 'string' || !value) return false
+  const s = value.trim()
+  if (/^https:\/\/[^\s"'<>]+$/i.test(s)) return true
+  const m = /^data:([a-z0-9.+/-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(s)
+  if (!m) return false
+  const mime = m[1].toLowerCase()
+  if (!ALLOWED_DOC_MIME.includes(mime)) return false
+  const b64 = m[2].replace(/\s+/g, '')
+  const approxBytes = Math.floor((b64.length * 3) / 4)
+  if (approxBytes <= 0 || approxBytes > MAX_DOC_BYTES) return false
+  try {
+    const head = atob(b64.slice(0, 32))
+    const bytes = Array.from(head).map((ch) => ch.charCodeAt(0))
+    const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff
+    const isPng = bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47
+    const isGif = bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46
+    const isWebp = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
+    const isPdf = bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 // %PDF
+    return isJpeg || isPng || isGif || isWebp || isPdf
+  } catch (_) {
+    return false
+  }
+}
 // Sanitize a short free-text field: trim, cap length, strip control chars.
 // (SQL injection itself is already prevented everywhere by parameterised
 // prepared statements — this is defense-in-depth against stored junk / XSS.)
@@ -219,6 +250,11 @@ function cleanText(value: any, maxLen = 200): string | null {
   const s = String(value).replace(/[\u0000-\u001F\u007F]/g, '').trim()
   return s ? s.slice(0, maxLen) : null
 }
+// Permanent source-platform (origin) options. The Equipment app is the MAIN app;
+// a product it creates is tagged with the destination the lister chose (equipment
+// storefront, or a merchant marketplace). Secondary apps (feed/mazao) tag their
+// own key. Whitelisted so a bad/injected value can never leak in.
+const VALID_SOURCE_PLATFORMS = ['equipment', 'feed', 'mazao', 'merchant']
 // ---- App settings (key/value JSON store) ----
 async function getSetting<T = any>(c: any, key: string, fallback: T): Promise<T> {
   try {
@@ -345,12 +381,23 @@ function normalizeProductPayload(b: any) {
   const cashPrice = numberVal(b.cash_price, roundMoney(buying * (1 + cashMarkup / 100)))
   const creditPrice = numberVal(b.credit_price, roundMoney(buying * (1 + creditMarkup / 100)))
   const paymentMode = b.payment_option_mode || (boolInt(b.cash_enabled, true) && boolInt(b.financing_enabled, true) ? 'both' : boolInt(b.cash_enabled, true) ? 'cash' : 'financing')
+  // Storefront section (marketplace) + permanent source tag. `marketplace` is the
+  // shopping section a product shows under (equipment | feeds | inputs); it is
+  // derived from an explicit value, else from product_type, else equipment.
+  const marketplaceRaw = String(b.marketplace || '').trim().toLowerCase()
+  const ptypeRaw = String(b.product_type || '').trim().toLowerCase()
+  const marketplace = ['equipment', 'feeds', 'inputs'].includes(marketplaceRaw)
+    ? marketplaceRaw
+    : (['feed', 'feeds'].includes(ptypeRaw) ? 'feeds' : ['input', 'inputs', 'mazao'].includes(ptypeRaw) ? 'inputs' : 'equipment')
+  const productType = marketplace === 'feeds' ? 'feed' : marketplace === 'inputs' ? 'input' : 'equipment'
   return {
     sku: String(b.sku || '').trim(),
     name: String(b.name || '').trim(),
-    category: String(b.category || 'Equipment').trim(),
-    description: b.description || null,
-    product_type: b.product_type || 'equipment',
+    category: cleanText(b.category, 120) || (marketplace === 'feeds' ? 'Feeds' : marketplace === 'inputs' ? 'Inputs' : 'Equipment'),
+    subcategory: cleanText(b.subcategory, 120),
+    marketplace,
+    description: cleanText(b.description, 4000),
+    product_type: productType,
     supplier_id: b.supplier_id || null,
     buying_price: buying,
     cash_markup_pct: cashMarkup,
@@ -874,10 +921,18 @@ app.get('/api/products', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
   const mine = c.req.query('mine') === '1'
   const shop = c.req.query('shop') === '1'
+  const marketplaceFilter = String(c.req.query('marketplace') || '').trim().toLowerCase()
+  const sourceFilter = String(c.req.query('source') || '').trim().toLowerCase()
+  // Isolation floor: the Equipment app is the MAIN app and sees the whole
+  // catalogue. Any OTHER app (feed / mazao), identified by APP_MARKETPLACE, may
+  // only ever read rows tagged with its own source_platform — it can never query
+  // the broader database. Defence-in-depth alongside RLS.
+  const appMarketplace = String((c.env as any).APP_MARKETPLACE || 'equipment').toLowerCase()
   const rows = await withAdminContext(c, async () => {
     let query = `SELECT * FROM products`
     const binds: any[] = []
     const where: string[] = []
+    if (appMarketplace !== 'equipment') { where.push(`source_platform = ?`); binds.push(appMarketplace) }
     // Storefront: only fully-authorized products are visible to buyers.
     if (shop) where.push(`finance_status = 'published'`)
     if (mine && !['admin', 'super_admin'].includes(user.role)) { where.push(`created_by = ?`); binds.push(user.id) }
@@ -885,6 +940,9 @@ app.get('/api/products', requireAuth, async (c) => {
     // rows scoped to itself or shared ('both'). Equipment sees equipment+both.
     const appType = String(c.env.APP_TYPE || 'equipment').toLowerCase() === 'feed' ? 'feed' : 'equipment'
     where.push(`app_scope IN (?, 'both')`); binds.push(appType)
+    // Storefront marketplace + product-origin filters (taxonomy / admin panel tabs).
+    if (['equipment', 'feeds', 'inputs'].includes(marketplaceFilter)) { where.push(`marketplace = ?`); binds.push(marketplaceFilter) }
+    if (VALID_SOURCE_PLATFORMS.includes(sourceFilter)) { where.push(`source_platform = ?`); binds.push(sourceFilter) }
     if (where.length) query += ` WHERE ` + where.join(' AND ')
     query += ` ORDER BY name`
     const { results } = await c.env.DB.prepare(query).bind(...binds).all()
@@ -902,8 +960,35 @@ app.get('/api/products', requireAuth, async (c) => {
 app.post('/api/products', requireAuth, requirePermission('can_manage_inventory'), async (c) => {
   const user = c.get('user') as SessionUser
   const canFinance = hasPermission(user, 'can_manage_finance_settings')
-  const p = normalizeProductPayload(await c.req.json())
+  let raw: any
+  try { raw = await c.req.json() } catch (_) { return c.json({ error: 'Invalid request body' }, 400) }
+  const p = normalizeProductPayload(raw)
   if (!p.sku || !p.name) return c.json({ error: 'SKU and name are required' }, 400)
+  // Numeric sanity — never let NaN / negatives reach the NOT NULL money columns.
+  if (!(p.buying_price >= 0) || !(p.cash_price >= 0) || !(p.credit_price >= 0)) {
+    return c.json({ error: 'Prices must be valid non-negative numbers.' }, 400)
+  }
+  // Validate any UPLOADED agreement documents / image before we touch the DB.
+  // (image is validated by isSafeDataUrlOrHttp; docs may also be PDFs.)
+  if (p.image && !isSafeDataUrlOrHttp(p.image)) {
+    return c.json({ error: 'Product image must be a JPEG, PNG, WebP or GIF under 8 MB.' }, 400)
+  }
+  for (const [field, label] of [['cash_terms_doc_url', 'Cash agreement'], ['financing_terms_doc_url', 'Financing agreement']] as const) {
+    const v = (p as any)[field]
+    if (v && !isSafeDocDataUrlOrHttp(v)) {
+      return c.json({ error: `${label} document must be a PDF or image under 8 MB.` }, 400)
+    }
+  }
+  // Permanent source tag: default to this app (equipment); allow an explicit,
+  // whitelisted override so inventory managers can list into a merchant/feed/
+  // mazao marketplace from the admin destination buttons.
+  const sourcePlatform = VALID_SOURCE_PLATFORMS.includes(String(raw?.source_platform || '').toLowerCase())
+    ? String(raw.source_platform).toLowerCase()
+    : 'equipment'
+  // Reject a duplicate SKU up front with a clear 409 instead of a raw 500 from
+  // the UNIQUE(sku) constraint (this was the reported crash on product upload).
+  const dup = await c.env.DB.prepare(`SELECT id FROM products WHERE sku = ?`).bind(p.sku).first<any>()
+  if (dup) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
   // Enforce the split at the app layer too (defence-in-depth alongside the RLS trigger).
   let financeStatus = 'published'
   if (!canFinance) {
@@ -917,18 +1002,25 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
     financeStatus = 'pending_finance'
   }
   const financeSetBy = canFinance ? user.id : null
-  const r = await c.env.DB.prepare(
-    `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code,created_by,finance_status,finance_set_by)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(
-    p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
-    p.cash_price, p.credit_price, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
-    p.payment_option_mode, p.financing_model, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
-    p.financing_term_max_months, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-    p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code, user.id, financeStatus, financeSetBy
-  ).run()
-  await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus})`)
-  return c.json({ id: r.meta.last_row_id, finance_status: financeStatus })
+  try {
+    const r = await c.env.DB.prepare(
+      `INSERT INTO products (sku,name,category,subcategory,marketplace,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code,created_by,finance_status,finance_set_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      p.sku, p.name, p.category, p.subcategory, p.marketplace, sourcePlatform, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
+      p.cash_price, p.credit_price, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
+      p.payment_option_mode, p.financing_model, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
+      p.financing_term_max_months, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
+      p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code, user.id, financeStatus, financeSetBy
+    ).run()
+    await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus}, ${p.marketplace}/${sourcePlatform})`)
+    return c.json({ id: r.meta.last_row_id, finance_status: financeStatus, marketplace: p.marketplace, source_platform: sourcePlatform })
+  } catch (err: any) {
+    const msg = String(err?.message || err)
+    console.error('Product create failed:', msg)
+    if (/unique|duplicate/i.test(msg)) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
+    return c.json({ error: 'Could not save the product. Please check the fields and try again.' }, 500)
+  }
 })
 // Editing core/cash details needs can_manage_inventory. Editing finance columns
 // needs can_manage_finance_settings — if the editor lacks it, the existing
@@ -940,15 +1032,31 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
   const canFinance = hasPermission(user, 'can_manage_finance_settings')
   const existing = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(id).first<any>())
   if (!existing) return c.json({ error: 'Not found' }, 404)
-  const p = normalizeProductPayload(await c.req.json())
-  // Choose which columns the editor is allowed to change.
+  let rawEdit: any
+  try { rawEdit = await c.req.json() } catch (_) { return c.json({ error: 'Invalid request body' }, 400) }
+  const p = normalizeProductPayload(rawEdit)
+  // Validate uploaded image / agreement documents before touching the DB.
+  if (canInv) {
+    if (p.image && !isSafeDataUrlOrHttp(p.image)) return c.json({ error: 'Product image must be a JPEG, PNG, WebP or GIF under 8 MB.' }, 400)
+    if (p.cash_terms_doc_url && !isSafeDocDataUrlOrHttp(p.cash_terms_doc_url)) return c.json({ error: 'Cash agreement document must be a PDF or image under 8 MB.' }, 400)
+    // A changed SKU must remain unique.
+    if (p.sku && p.sku !== existing.sku) {
+      const dup = await c.env.DB.prepare(`SELECT id FROM products WHERE sku = ? AND id <> ?`).bind(p.sku, id).first<any>()
+      if (dup) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
+    }
+  }
+  if (canFinance && p.financing_terms_doc_url && !isSafeDocDataUrlOrHttp(p.financing_terms_doc_url)) {
+    return c.json({ error: 'Financing agreement document must be a PDF or image under 8 MB.' }, 400)
+  }
+  // Choose which columns the editor is allowed to change. (source_platform is the
+  // PERMANENT origin tag and is never editable.)
   const coreCols = canInv ? {
-    sku: p.sku, name: p.name, category: p.category, description: p.description, product_type: p.product_type,
+    sku: p.sku, name: p.name, category: p.category, subcategory: p.subcategory, marketplace: p.marketplace, description: p.description, product_type: p.product_type,
     buying_price: p.buying_price, cash_markup_pct: p.cash_markup_pct, cash_price: p.cash_price,
     quantity: p.quantity, unit: p.unit, reorder_threshold: p.reorder_threshold, image: p.image || existing.image,
     cash_enabled: p.cash_enabled, cash_deposit_pct: p.cash_deposit_pct, cash_terms_text: p.cash_terms_text, cash_terms_doc_url: p.cash_terms_doc_url
   } : {
-    sku: existing.sku, name: existing.name, category: existing.category, description: existing.description, product_type: existing.product_type,
+    sku: existing.sku, name: existing.name, category: existing.category, subcategory: existing.subcategory, marketplace: existing.marketplace, description: existing.description, product_type: existing.product_type,
     buying_price: existing.buying_price, cash_markup_pct: existing.cash_markup_pct, cash_price: existing.cash_price,
     quantity: existing.quantity, unit: existing.unit, reorder_threshold: existing.reorder_threshold, image: existing.image,
     cash_enabled: existing.cash_enabled, cash_deposit_pct: existing.cash_deposit_pct, cash_terms_text: existing.cash_terms_text, cash_terms_doc_url: existing.cash_terms_doc_url
@@ -968,15 +1076,22 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
     transunion_product_code: existing.transunion_product_code,
     payment_option_mode: existing.payment_option_mode, finance_status: existing.finance_status, finance_set_by: existing.finance_set_by
   }
-  await c.env.DB.prepare(
-    `UPDATE products SET sku=?, name=?, category=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, transunion_product_code=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
-  ).bind(
-    coreCols.sku, coreCols.name, coreCols.category, coreCols.description, coreCols.product_type, coreCols.buying_price, coreCols.cash_markup_pct, finCols.credit_markup_pct,
-    coreCols.cash_price, finCols.credit_price, coreCols.quantity, coreCols.unit, coreCols.reorder_threshold, coreCols.image || null, coreCols.cash_enabled, finCols.financing_enabled,
-    finCols.payment_option_mode, finCols.financing_model, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
-    finCols.financing_term_max_months, coreCols.cash_deposit_pct, finCols.financing_deposit_pct, coreCols.cash_terms_text, finCols.financing_terms_text,
-    coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, finCols.transunion_product_code, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
-  ).run()
+  try {
+    await c.env.DB.prepare(
+      `UPDATE products SET sku=?, name=?, category=?, subcategory=?, marketplace=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, transunion_product_code=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
+    ).bind(
+      coreCols.sku, coreCols.name, coreCols.category, coreCols.subcategory, coreCols.marketplace, coreCols.description, coreCols.product_type, coreCols.buying_price, coreCols.cash_markup_pct, finCols.credit_markup_pct,
+      coreCols.cash_price, finCols.credit_price, coreCols.quantity, coreCols.unit, coreCols.reorder_threshold, coreCols.image || null, coreCols.cash_enabled, finCols.financing_enabled,
+      finCols.payment_option_mode, finCols.financing_model, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
+      finCols.financing_term_max_months, coreCols.cash_deposit_pct, finCols.financing_deposit_pct, coreCols.cash_terms_text, finCols.financing_terms_text,
+      coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, finCols.transunion_product_code, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
+    ).run()
+  } catch (err: any) {
+    const msg = String(err?.message || err)
+    console.error('Product update failed:', msg)
+    if (/unique|duplicate/i.test(msg)) return c.json({ error: `A product with SKU "${coreCols.sku}" already exists. Use a unique SKU.` }, 409)
+    return c.json({ error: 'Could not update the product. Please check the fields and try again.' }, 500)
+  }
   await audit(c, user.id, 'update', 'product', `${coreCols.name}${canFinance ? '' : ' (core only)'}`)
   return c.json({ ok: true })
 })
@@ -2653,24 +2768,35 @@ app.post('/api/settings/quick-product', requireAuth, async (c) => {
   const allowed = user.role === 'admin' || user.role === 'super_admin' ||
     hasPermission(user, 'manage_processing_fees') || hasPermission(user, 'manage_markup_pct')
   if (!allowed) return c.json({ error: 'Forbidden' }, 403)
-  const p = normalizeProductPayload(await c.req.json())
+  let raw: any
+  try { raw = await c.req.json() } catch (_) { return c.json({ error: 'Invalid request body' }, 400) }
+  const p = normalizeProductPayload(raw)
   if (!p.sku || !p.name) return c.json({ error: 'SKU and name are required' }, 400)
+  if (!(p.buying_price >= 0) || !(p.cash_price >= 0) || !(p.credit_price >= 0)) return c.json({ error: 'Prices must be valid non-negative numbers.' }, 400)
+  if (p.image && !isSafeDataUrlOrHttp(p.image)) return c.json({ error: 'Product image must be a JPEG, PNG, WebP or GIF under 8 MB.' }, 400)
+  if (p.cash_terms_doc_url && !isSafeDocDataUrlOrHttp(p.cash_terms_doc_url)) return c.json({ error: 'Cash agreement document must be a PDF or image under 8 MB.' }, 400)
+  if (p.financing_terms_doc_url && !isSafeDocDataUrlOrHttp(p.financing_terms_doc_url)) return c.json({ error: 'Financing agreement document must be a PDF or image under 8 MB.' }, 400)
+  const sourcePlatform = VALID_SOURCE_PLATFORMS.includes(String(raw?.source_platform || '').toLowerCase()) ? String(raw.source_platform).toLowerCase() : 'equipment'
+  const dup = await c.env.DB.prepare(`SELECT id FROM products WHERE sku = ?`).bind(p.sku).first<any>()
+  if (dup) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,subcategory,marketplace,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code,created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
-      p.sku, p.name, p.category, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
+      p.sku, p.name, p.category, p.subcategory, p.marketplace, sourcePlatform, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
       p.cash_price, p.credit_price, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
       p.payment_option_mode, p.financing_model, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
       p.financing_term_max_months, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-      p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code
+      p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code, user.id
     ).run()
-    await audit(c, user.id, 'create', 'product', `${p.name} (via settings builder)`)
-    return c.json({ id: r.meta.last_row_id, product: { id: r.meta.last_row_id, sku: p.sku, name: p.name, category: p.category, quantity: p.quantity } })
+    await audit(c, user.id, 'create', 'product', `${p.name} (via settings builder, ${p.marketplace}/${sourcePlatform})`)
+    return c.json({ id: r.meta.last_row_id, product: { id: r.meta.last_row_id, sku: p.sku, name: p.name, category: p.category, marketplace: p.marketplace, quantity: p.quantity } })
   } catch (err: any) {
-    if (/unique|duplicate/i.test(String(err?.message || ''))) return c.json({ error: 'A product with this SKU already exists' }, 400)
-    return c.json({ error: 'Failed to create product' }, 500)
+    const msg = String(err?.message || err)
+    console.error('Quick product create failed:', msg)
+    if (/unique|duplicate/i.test(msg)) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
+    return c.json({ error: 'Could not save the product. Please check the fields and try again.' }, 500)
   }
 })
 
