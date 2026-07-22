@@ -2715,7 +2715,7 @@ async function viewProfile() {
         <div class="flex gap-2 mt-4"><button onclick="saveFarmerProfile()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save My Details</button></div>
       </div>` : `
       <div class="card p-6">
-        <p class="text-sm text-slate-500"><i class="fas fa-circle-info text-teal-600 mr-2"></i>As a <b>${esc(roleLabel(u.role))}</b>, you can update your profile picture and password here. Your account details are managed by an administrator.</p>
+        <p class="text-sm text-slate-500"><i class="fas fa-circle-info text-teal-600 mr-2"></i>As a <b>${esc(roleLabel(u.role))}</b>, update your profile picture and password here.</p>
       </div>`}
 
       <!-- FEATURE 4: Amendment request for locked identity fields -->
