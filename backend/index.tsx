@@ -2459,7 +2459,25 @@ app.get('/api/cross/handoff', requireAuth, async (c) => {
   // Email + name are carried so email-keyed apps (Score) can resolve/create
   // the account without a second login.
   const token = await mintHandoffToken(secret, normalizePhone(user.phone), { email: user.email, name: user.full_name })
-  return c.json({ url: `${siblingUrl}/sso?token=${encodeURIComponent(token)}`, target })
+  // Optional deep-link: `dest` tells the destination app which view to open
+  // after SSO (e.g. dest=api-access lands the lender on the Score console's
+  // API Access tab). Kept as an allow-listed slug to avoid open-redirect abuse.
+  const destRaw = String(c.req.query('dest') || '').trim()
+  const dest = /^[a-z0-9-]{1,32}$/.test(destRaw) ? destRaw : ''
+  const qs = `token=${encodeURIComponent(token)}` + (dest ? `&dest=${encodeURIComponent(dest)}` : '')
+  return c.json({ url: `${siblingUrl}/sso?${qs}`, target, dest: dest || null })
+})
+
+// Lender opts in to consuming the Farmsky APIs from the Equipment platform.
+// Records the opt-in (best-effort audit) before the SSO handoff to Score,
+// where the lender enables and manages API access. Lender-tier only.
+app.post('/api/cross/use-apis', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (user.role !== 'lender') return c.json({ error: 'Only Lender-tier accounts can consume the APIs' }, 403)
+  try {
+    await audit(c, user.id, 'update', 'user', 'lender opted in to Use APIs (Farmsky Score API consumption)')
+  } catch (_) { /* audit is best-effort; never block the handoff */ }
+  return c.json({ ok: true })
 })
 
 // Sibling app lands here: verify HMAC token, issue a local session, redirect.

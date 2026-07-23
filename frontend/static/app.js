@@ -344,6 +344,28 @@ window.openScore = async () => {
   } catch (e) { toast('Score is currently unavailable', true) }
 }
 
+// "Use APIs" — shown to Lender-tier users so they can enable and begin
+// consuming the Farmsky Score verification & credit APIs. Enabling the feature
+// records the opt-in and hands the lender off (SSO, no re-login) to the Score
+// console's API Access area where they manage keys and call the /v3 APIs.
+function useApisButton() {
+  const cfg = state.crossApp
+  if (!cfg || !cfg.score_configured) return ''
+  if (!state.user || state.user.role !== 'lender') return ''   // Lender tier only
+  return `<button onclick="openUseApis()" title="Enable and begin consuming the Farmsky APIs"
+    class="btn inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg text-sm whitespace-nowrap">
+    <i class="fas fa-plug"></i><span class="hidden sm:inline">Use APIs</span></button>`
+}
+window.openUseApis = async () => {
+  try {
+    // Record the opt-in on the Equipment side, then hand off to Score.
+    try { await api.post('/cross/use-apis', {}) } catch (e) { /* non-fatal */ }
+    const { data } = await api.get('/cross/handoff?target=score&dest=api-access')
+    if (data && data.url) { window.open(data.url, '_blank'); }
+    else toast('API access is not configured', true)
+  } catch (e) { toast('Unable to start API access right now', true) }
+}
+
 // =====================================================================
 // Phase 5 — reusable multi-parameter client-side filter toolbar.
 // Any list view can render filterToolbar({...}) then, on input, call the
@@ -820,6 +842,7 @@ function renderApp() {
           </div>
         </div>
         <div class="flex items-center gap-3">
+          ${useApisButton()}
           ${scoreHeaderButton()}
           <div class="text-sm text-slate-500 hidden md:block"><i class="fas fa-tractor text-teal-600 mr-1"></i>Cash, PAYGO & Equipment Financing</div>
         </div>
@@ -2735,6 +2758,20 @@ async function viewUsers() {
     : ''
   $('content').innerHTML = `
     <div class="action-bar">${accessButton}<button onclick="addUserModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Create User</button></div>
+    <div class="card p-4 mb-4 border-l-4 border-emerald-500 bg-emerald-50/60">
+      <div class="flex items-start gap-3">
+        <i class="fas fa-plug text-emerald-600 mt-1"></i>
+        <div class="text-sm text-slate-700">
+          <div class="font-semibold text-slate-800 mb-1">API Access &amp; the "Use APIs" action</div>
+          <p class="mb-1"><strong>Lender-tier</strong> accounts see a <span class="text-emerald-700 font-medium">Use APIs</span> button in the top bar. It lets a lender opt in to consuming the Farmsky Score verification &amp; credit APIs and hands them off (single sign-on, no re-login) to the Score console's <em>API Access</em> area, where they enable the feature, manage keys, and request Production access.</p>
+          <ul class="list-disc pl-5 space-y-0.5 text-slate-600">
+            <li><strong>Who can use it:</strong> only users whose role is <em>Lender</em>. Other roles never see the button and are blocked server-side (403).</li>
+            <li><strong>Permission control:</strong> the opt-in is recorded in the audit log; API enablement, sandbox/production mode, and pricing tier are governed on the Score side and approved by a Farmsky Super-Admin.</li>
+            <li><strong>Manual vs. public lenders:</strong> lenders added here in Equipment and lenders who self-register on Score receive identical features, permissions, and dashboards.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
     <div class="card table-card"><table class="w-full text-sm">
       <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Name</th><th class="text-left px-4 py-3">Label</th><th class="text-left px-4 py-3">Role</th><th class="text-left px-4 py-3">Phone</th><th class="text-left px-4 py-3">Permissions</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
       <tbody>${data.users.map(u => `<tr class="border-t border-slate-100">
