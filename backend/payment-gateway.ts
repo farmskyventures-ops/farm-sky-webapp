@@ -130,7 +130,25 @@ async function logCallback(c: any, txRef: string | null, method: string, provide
   } catch (_) {}
 }
 
+// Keep a Score subscription's billing state in sync with its ledger
+// transaction. Called whenever a transaction settles. Best-effort.
+async function syncScoreSubscription(c: any, tx: any) {
+  if (!tx || tx.origin_app !== 'score') return
+  const status = tx.status === 'SUCCESS' ? 'active' : tx.status === 'FAILED' || tx.status === 'EXPIRED' ? 'past_due' : 'pending'
+  const periodDays = 30
+  try {
+    await c.env.DB.prepare(
+      `UPDATE score_subscriptions
+          SET status=?, current_period_end = CASE WHEN ?='active' THEN CURRENT_TIMESTAMP + (? || ' days')::interval ELSE current_period_end END,
+              updated_at=CURRENT_TIMESTAMP
+        WHERE transaction_ref=?`
+    ).bind(status, status, String(periodDays), tx.transaction_ref).run()
+  } catch (_) { /* non-Postgres or table absent — ignore */ }
+}
+
 async function notifyOriginApp(c: any, client: any, tx: any) {
+  // Sync Score subscription state on settlement regardless of callback_url.
+  await syncScoreSubscription(c, tx)
   if (!client?.callback_url) return
   try {
     const body = JSON.stringify({
@@ -283,6 +301,28 @@ gateway.post('/initiate', async (c) => {
     transaction_ref, idempotencyKey, client_key, marketplaceId, origin_reference, method,
     providerResult.checkout_request_id || null, phone, amount, 'KES', desc, initiated_by_user, ip
   ).run()
+
+  // Subscription payments originating from score.farmsky.africa are tracked
+  // in their own dedicated table so Score's billing state lives separately
+  // from the shared transaction ledger. Triggered when the initiate call is
+  // from the 'score' client and carries a subscription context.
+  if (client_key === 'score' && (body.subscription || body.plan)) {
+    const sub = body.subscription || {}
+    const plan = String(sub.plan || body.plan || 'subscription').slice(0, 60)
+    const cycle = String(sub.billing_cycle || body.billing_cycle || 'monthly').slice(0, 20)
+    const scoreRef = String(sub.reference || body.subscription_reference || origin_reference || transaction_ref).slice(0, 120)
+    const orgRef = sub.org_ref ? String(sub.org_ref).slice(0, 120) : null
+    try {
+      await c.env.DB.prepare(
+        `INSERT INTO score_subscriptions (score_org_ref, score_reference, plan, billing_cycle, amount, currency, phone, status, transaction_ref)
+         VALUES (?,?,?,?,?,?,?, 'pending', ?)
+         ON CONFLICT (score_reference) DO UPDATE
+           SET plan=EXCLUDED.plan, billing_cycle=EXCLUDED.billing_cycle, amount=EXCLUDED.amount,
+               phone=EXCLUDED.phone, status='pending', transaction_ref=EXCLUDED.transaction_ref,
+               updated_at=CURRENT_TIMESTAMP`
+      ).bind(orgRef, scoreRef, plan, cycle, amount, 'KES', phone, transaction_ref).run()
+    } catch (_) { /* subscription tracking is best-effort; the charge still proceeds */ }
+  }
 
   return c.json({
     success: true,

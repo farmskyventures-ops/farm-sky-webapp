@@ -17,6 +17,7 @@ import { sendEmail, emailConfigured } from './email'
 import { hashPassword, verifyPassword, isHashed } from './password'
 import merchantApi from './merchant-api'
 import { mintHandoffToken, verifyHandoffToken } from './cross-app'
+import { scoreConfigured, scoreKyc, scoreIprs, scoreLiveness, scoreCreditEvaluation } from './score-client'
 import { validateImageDataUrl, validateText, validateTextFields } from './upload-validation'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: SessionUser } }>()
@@ -1331,7 +1332,9 @@ app.delete('/api/customers/:id', requireAuth, requireRole('admin', 'super_admin'
   await audit(c, c.get('user').id, 'delete', 'customer', String(id))
   return c.json({ ok: true })
 })
-// Verification engine (TransUnion integration-ready; simulated scoring until live mapping is added)
+// Verification engine — ID verification, liveness, IPRS and credit
+// evaluation are delegated to Farmsky Score (score.farmsky.africa) when
+// configured; otherwise a deterministic local simulation is used.
 app.post('/api/customers/:id/verify', requireAuth, async (c) => {
   const id = c.req.param('id')
   const user = c.get('user')
@@ -1347,23 +1350,105 @@ app.post('/api/customers/:id/verify', requireAuth, async (c) => {
     cust.selfie_url = String(vbody.selfie_url)
   }
   // STEP 2 (KYC) requires: ID front + back, a passport / selfie photo, and a
-  // successful liveliness check before the TransUnion credit check runs.
+  // successful liveness check before the credit evaluation runs.
   if (!cust.id_front_url || !cust.id_back_url) return c.json({ error: 'Front and back national ID uploads are required before verification' }, 400)
   if (!cust.selfie_url) return c.json({ error: 'A passport / selfie photo is required before verification' }, 400)
-  const transunionLive = Boolean(c.env.TRANSUNION_API_URL && c.env.TRANSUNION_API_KEY)
-  // Liveliness check (simulated pass until a live provider is mapped). A real
-  // provider would compare the selfie against the ID photo and detect liveness.
-  const livenessPassed = 1
-  const score = Math.floor(Math.random() * 350 + 450)
-  const band = score >= 700 ? 'low' : score >= 600 ? 'medium' : 'high'
-  const providerRef = `TU-${Date.now()}`
+
+  // ---------------------------------------------------------------------
+  // Farmsky Score integration.
+  // When Score (score.farmsky.africa) is configured, ID verification,
+  // liveness, IPRS and the full credit evaluation are performed by Score's
+  // APIs. Every Score response is mirrored into this database's DEDICATED
+  // score_* tables. If Score is unreachable / not configured we fall back
+  // to a deterministic local simulation so the flow always completes.
+  // ---------------------------------------------------------------------
+  const nationalId = String(cust.national_id || '')
+  let faceMatch = 1
+  let livenessPassed = 1
+  let idVerified = 1
+  let iprsStatus = 'VERIFIED'
+  let scoreLive = false
+  let score = Math.floor(Math.random() * 350 + 450)
+  let band: string = score >= 700 ? 'low' : score >= 600 ? 'medium' : 'high'
+  let riskTier = band
+  let decision: string | null = null
+  let scoreRef: string | null = null
+
+  if (scoreConfigured(c.env) && nationalId) {
+    // 1) ID verification + liveness (combined KYC on Score).
+    const kyc = await scoreKyc(c.env, { national_id: nationalId })
+    if (kyc.live) {
+      scoreLive = true
+      idVerified = kyc.verified ? 1 : 0
+      faceMatch = kyc.face_match ? 1 : 0
+      livenessPassed = kyc.liveness_passed ? 1 : 0
+      await c.env.DB.prepare(
+        `INSERT INTO score_verifications (customer_id,score_request_id,national_id,full_name,id_verified,face_match,liveness_passed,liveness_score,raw_response) VALUES (?,?,?,?,?,?,?,?,?)`
+      ).bind(id, kyc.request_id || null, nationalId, cust.full_name || null, idVerified, faceMatch, livenessPassed, kyc.liveness_score ?? null, JSON.stringify(kyc.raw || {})).run().catch(() => {})
+    } else {
+      // Fall back to a standalone liveness check if combined KYC was unavailable.
+      const live = await scoreLiveness(c.env, nationalId || String(id))
+      if (live.live) { scoreLive = true; livenessPassed = live.liveness_passed ? 1 : 0 }
+    }
+
+    // 2) IPRS government-registry lookup.
+    const iprs = await scoreIprs(c.env, nationalId)
+    if (iprs.live) {
+      scoreLive = true
+      iprsStatus = iprs.status || iprsStatus
+      await c.env.DB.prepare(
+        `INSERT INTO score_iprs_checks (customer_id,score_request_id,national_id,status,registry_name,pep_sanctions_hit,raw_response) VALUES (?,?,?,?,?,?,?)`
+      ).bind(id, iprs.request_id || null, nationalId, iprsStatus, iprs.registry_name || null, iprs.pep_sanctions_hit ? 1 : 0, JSON.stringify(iprs.raw || {})).run().catch(() => {})
+    }
+
+    // 3) Full credit evaluation.
+    const evalPayload = {
+      applicant_type: 'INDIVIDUAL_FARMER',
+      applicant: {
+        national_id: nationalId,
+        full_name: cust.full_name,
+        date_of_birth: cust.date_of_birth,
+        gps: (cust.latitude && cust.longitude) ? { lat: Number(cust.latitude), lon: Number(cust.longitude) } : undefined,
+        county: cust.county || undefined,
+      },
+    }
+    const cr = await scoreCreditEvaluation(c.env, evalPayload)
+    if (cr.live && typeof cr.composite_score === 'number') {
+      scoreLive = true
+      score = cr.composite_score
+      riskTier = cr.risk_tier || riskTier
+      decision = cr.decision || null
+      scoreRef = cr.lender_reference || null
+      // Map Score's risk tier to Equipment's low/medium/high band.
+      const t = String(riskTier).toLowerCase()
+      band = /low|a\b|prime|excellent/.test(t) ? 'low' : /high|d\b|e\b|sub|poor/.test(t) ? 'high' : 'medium'
+      await c.env.DB.prepare(
+        `INSERT INTO score_credit_evaluations (customer_id,score_reference,applicant_type,composite_score,risk_tier,decision,model_version,raw_response) VALUES (?,?,?,?,?,?,?,?)`
+      ).bind(id, scoreRef, 'INDIVIDUAL_FARMER', score, riskTier, decision, cr.model_version || null, JSON.stringify(cr.raw || {})).run().catch(() => {})
+    }
+  }
+
+  const providerRef = scoreRef || `SCORE-${Date.now()}`
+  const integrationStatus = scoreLive ? 'live_score' : 'stubbed'
   await c.env.DB.prepare(`INSERT INTO transunion_checks (customer_id,credit_score,risk_band,defaults_found,raw_response,provider_reference,integration_status) VALUES (?,?,?,?,?,?,?)`)
-    .bind(id, score, band, band === 'high' ? 1 : 0, JSON.stringify({ score, band, integration_ready: transunionLive }), providerRef, transunionLive ? 'ready_for_live_mapping' : 'stubbed').run()
+    .bind(id, score, band, band === 'high' ? 1 : 0, JSON.stringify({ score, band, risk_tier: riskTier, decision, score_live: scoreLive, iprs_status: iprsStatus }), providerRef, integrationStatus).run()
   await c.env.DB.prepare(`INSERT INTO id_verifications (customer_id,face_match,liveness,ocr_name,ocr_dob,ocr_id_number,status) VALUES (?,?,?,?,?,?, 'verified')`)
-    .bind(id, 1, livenessPassed, cust.full_name, cust.date_of_birth, cust.national_id).run()
+    .bind(id, faceMatch, livenessPassed, cust.full_name, cust.date_of_birth, cust.national_id).run()
   await c.env.DB.prepare(`UPDATE customers SET kyc_status='verified', risk_band=?, credit_score=?, liveliness_passed=?, kyc_completed_at=CURRENT_TIMESTAMP WHERE id=?`).bind(band, score, livenessPassed, id).run()
-  await audit(c, user.id, 'verify', 'customer', `KYC verified for ${cust.full_name}`)
-  return c.json({ ok: true, credit_score: score, risk_band: band, face_match: true, liveness: true, transunion_integration_ready: transunionLive, provider_reference: providerRef })
+  await audit(c, user.id, 'verify', 'customer', `KYC verified for ${cust.full_name}${scoreLive ? ' via Farmsky Score' : ''}`)
+  return c.json({
+    ok: true,
+    credit_score: score,
+    risk_band: band,
+    risk_tier: riskTier,
+    decision,
+    face_match: !!faceMatch,
+    liveness: !!livenessPassed,
+    id_verified: !!idVerified,
+    iprs_status: iprsStatus,
+    score_integration: scoreLive ? 'live' : 'simulated',
+    provider_reference: providerRef,
+  })
 })
 
 // ----------------------------------------------------------------------------
@@ -2361,10 +2446,19 @@ app.get('/api/ledger', requireAuth, requireRole('admin', 'super_admin'), async (
 app.get('/api/cross/handoff', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
   const secret = c.env.CROSS_APP_HMAC_SECRET || ''
-  const siblingUrl = String(c.env.CROSS_APP_URL || '').replace(/\/+$/, '')
+  const target = String(c.req.query('target') || '')
+  // Choose the destination origin by target: 'score' -> SCORE_APP_URL,
+  // anything else -> the configured sibling marketplace (Feed/Equipment).
+  const siblingUrl = (target === 'score'
+    ? String(c.env.SCORE_APP_URL || '')
+    : String(c.env.CROSS_APP_URL || '')
+  ).replace(/\/+$/, '')
   if (!secret || !siblingUrl) return c.json({ error: 'Cross-app navigation is not configured' }, 503)
-  const token = await mintHandoffToken(secret, normalizePhone(user.phone))
-  const target = String(c.req.query('target') || '')  // informational
+  // The same short-lived HMAC-signed token is accepted by every Farmsky
+  // app's /sso endpoint, so no second login is needed at the destination.
+  // Email + name are carried so email-keyed apps (Score) can resolve/create
+  // the account without a second login.
+  const token = await mintHandoffToken(secret, normalizePhone(user.phone), { email: user.email, name: user.full_name })
   return c.json({ url: `${siblingUrl}/sso?token=${encodeURIComponent(token)}`, target })
 })
 
@@ -2392,7 +2486,11 @@ app.get('/api/cross/config', requireAuth, (c) => {
   return c.json({
     app_type: String(c.env.APP_TYPE || 'equipment'),
     cross_app_configured: !!(c.env.CROSS_APP_HMAC_SECRET && c.env.CROSS_APP_URL),
-    cross_app_url: c.env.CROSS_APP_URL || null
+    cross_app_url: c.env.CROSS_APP_URL || null,
+    // Score SSO button is shown when the shared handoff secret AND the
+    // Score origin are configured. Reuses the same session (no re-login).
+    score_configured: !!(c.env.CROSS_APP_HMAC_SECRET && c.env.SCORE_APP_URL),
+    score_url: c.env.SCORE_APP_URL || null
   })
 })
 

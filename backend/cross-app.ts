@@ -30,16 +30,22 @@ function unb64url(s: string): string {
   return atob(s)
 }
 
-/** Mint a signed handoff token for the given phone. */
-export async function mintHandoffToken(secret: string, phone: string): Promise<string> {
-  const payload = JSON.stringify({ phone, ts: Date.now(), nonce: crypto.randomUUID() })
+/** Mint a signed handoff token for the given phone (+ optional identity). */
+export async function mintHandoffToken(secret: string, phone: string, extra?: { email?: string | null; name?: string | null }): Promise<string> {
+  const payload = JSON.stringify({
+    phone,
+    email: extra?.email || undefined,   // carried so email-keyed apps (Score) can resolve the user
+    name: extra?.name || undefined,
+    ts: Date.now(),
+    nonce: crypto.randomUUID(),
+  })
   const body = b64url(payload)
   const sig = await hmacSha256Hex(secret, body)
   return `${body}.${sig}`
 }
 
-/** Verify a handoff token; returns the phone if valid & fresh. */
-export async function verifyHandoffToken(secret: string, token: string): Promise<{ ok: boolean; phone?: string; error?: string }> {
+/** Verify a handoff token; returns the phone (+ email/name) if valid & fresh. */
+export async function verifyHandoffToken(secret: string, token: string): Promise<{ ok: boolean; phone?: string; email?: string; name?: string; error?: string }> {
   if (!secret) return { ok: false, error: 'Cross-app SSO not configured' }
   const [body, sig] = String(token || '').split('.')
   if (!body || !sig) return { ok: false, error: 'Malformed token' }
@@ -52,5 +58,5 @@ export async function verifyHandoffToken(secret: string, token: string): Promise
   try { payload = JSON.parse(unb64url(body)) } catch { return { ok: false, error: 'Bad payload' } }
   if (!payload.phone || !payload.ts) return { ok: false, error: 'Incomplete token' }
   if (Math.abs(Date.now() - Number(payload.ts)) > HANDOFF_TTL_MS) return { ok: false, error: 'Token expired' }
-  return { ok: true, phone: String(payload.phone) }
+  return { ok: true, phone: String(payload.phone), email: payload.email ? String(payload.email) : undefined, name: payload.name ? String(payload.name) : undefined }
 }

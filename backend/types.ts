@@ -15,6 +15,11 @@ export type Bindings = MpesaEnv & SmsEnv & EmailEnv & SasaPayEnv & BuniEnv & {
   PUBLIC_BASE_URL?: string          // this app's public origin (hosted checkout URLs)
   CROSS_APP_URL?: string            // sibling app origin ('Shop Equipment'/'Shop Feeds' target)
   CROSS_APP_HMAC_SECRET?: string    // shared secret for cross-app SSO handoff tokens
+  // score.farmsky.africa — SSO handoff target + API consumption
+  SCORE_APP_URL?: string            // score.farmsky.africa origin (SSO "Open Score" button)
+  SCORE_API_URL?: string            // score API base (e.g. https://score.farmsky.africa)
+  SCORE_API_CLIENT?: string         // Score API client id issued to Equipment
+  SCORE_API_SECRET?: string         // Score API secret (paired with the client id)
   // Phase 4 — standardized auth hashing (must match Feed values)
   AUTH_HASH_ITERATIONS?: string
   AUTH_HASH_KEYLEN?: string
