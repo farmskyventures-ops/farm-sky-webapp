@@ -77,6 +77,24 @@ npm run db:seed
 npx wrangler pages dev dist --d1=webapp-production --local --port 3000
 ```
 
+## Farmsky Score integration — "Use APIs" (Lender tier)
+Lenders on the Equipment platform can enable and begin consuming the Farmsky
+Score verification & credit APIs directly:
+
+- **"Use APIs" button** — shown in the top bar **only** to users whose role is
+  `lender` (and only when `SCORE_APP_URL` + `CROSS_APP_HMAC_SECRET` are set).
+  Clicking it records the lender's opt-in (`POST /api/cross/use-apis`, lender-only,
+  audited) then performs a single sign-on handoff to the Score console's
+  **API Access** tab (`GET /api/cross/handoff?target=score&dest=api-access`) — no
+  second login.
+- **Feature parity** — lenders added manually here in Equipment and lenders who
+  self-register on Score receive identical features, permissions, and dashboards.
+- **Permission controls** — API enablement, sandbox/production mode, and pricing
+  tier are governed on the Score side and approved by a Farmsky **Super-Admin**.
+  The **User Accounts & Access** view documents this inline.
+- **Cross-app config** — `GET /api/cross/config` returns `score_configured` /
+  `score_url` so the UI only shows the button when Score is wired up.
+
 ## Deploy
 See **[AWS_DEPLOYMENT.md](./AWS_DEPLOYMENT.md)** for:
 - AWS EC2 (recommended easy path) — Nginx + free HTTPS
