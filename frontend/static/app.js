@@ -352,7 +352,9 @@ function useApisButton() {
   const cfg = state.crossApp
   if (!cfg || !cfg.score_configured) return ''
   if (!state.user || state.user.role !== 'lender') return ''   // Lender tier only
-  return `<button onclick="openUseApis()" title="Enable and begin consuming the Farmsky APIs"
+  // Opens the dedicated API Access dashboard view (which has full details plus
+  // the SSO "Use APIs" action). Kept in the topbar for quick access on any page.
+  return `<button onclick="go('api_access')" title="Enable and begin consuming the Farmsky APIs"
     class="btn inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg text-sm whitespace-nowrap">
     <i class="fas fa-plug"></i><span class="hidden sm:inline">Use APIs</span></button>`
 }
@@ -782,6 +784,7 @@ function navItems() {
     { k: 'contracts', i: 'fa-file-signature', t: 'Purchases' },
     { k: 'agents', i: 'fa-user-tie', t: 'Agents' },
     { k: 'users', i: 'fa-user-gear', t: 'User Accounts' },
+    { k: 'api_management', i: 'fa-plug', t: 'API Management' },
     wallets,
     { k: 'ledger', i: 'fa-book', t: 'Payment Ledger' },
     { k: 'repayments', i: 'fa-money-bill-wave', t: 'Repayments' },
@@ -811,7 +814,10 @@ function navItems() {
   // Lender / Investor / M&E / Partner: read-only dashboard + relevant views.
   if (['lender', 'investor', 'mne', 'partner'].includes(r)) return withAccount([...common,
     ...(canDo('view_credit_purchases') ? [{ k: 'contracts', i: 'fa-file-signature', t: 'Financed Portfolio' }] : []),
-    ...(canDo('view_farmers') ? [{ k: 'customers', i: 'fa-users', t: 'Farmers' }] : [])])
+    ...(canDo('view_farmers') ? [{ k: 'customers', i: 'fa-users', t: 'Farmers' }] : []),
+    // Lender-tier accounts get a dedicated API Access view (Task 5): enable and
+    // begin consuming the Farmsky Score verification & credit APIs.
+    ...(r === 'lender' ? [{ k: 'api_access', i: 'fa-plug', t: 'API Access' }] : [])])
   return withAccount(common)
 }
 function renderApp() {
@@ -855,9 +861,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', ledger: 'Unified Payment Ledger', amendments: 'Pending Profile Amendments', imports: 'Bulk User Data Upload', backups: 'Automated System Backups' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', ledger: 'Unified Payment Ledger', amendments: 'Pending Profile Amendments', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', api_access: 'API Access', api_management: 'API Management' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, ledger: viewLedger, amendments: viewAmendments, imports: viewImports, backups: viewBackups }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, ledger: viewLedger, amendments: viewAmendments, imports: viewImports, backups: viewBackups, api_access: viewApiAccess, api_management: viewApiManagement }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -2788,6 +2794,119 @@ async function viewUsers() {
           <button onclick="deleteUser(${u.id},'${esc(u.full_name)}','users')" class="text-red-600 hover:underline text-xs">Delete</button>
         </td></tr>`).join('')}</tbody>
     </table></div>`
+}
+
+// ---------------------------------------------------------------------------
+// API ACCESS (Lender-facing) — Task 5 dashboard view.
+// A dedicated place on the lender dashboard to enable and begin consuming the
+// Farmsky Score verification & credit APIs, and to hand off (SSO) to the Score
+// console's API Access area to manage keys / request Production access.
+// ---------------------------------------------------------------------------
+async function viewApiAccess() {
+  const cfg = state.crossApp
+  const configured = !!(cfg && cfg.score_configured)
+  $('content').innerHTML = `
+    <div class="max-w-3xl">
+      <div class="card p-6 mb-4">
+        <div class="flex items-start gap-4">
+          <div class="w-12 h-12 rounded-xl bg-emerald-100 flex items-center justify-center text-emerald-600 text-xl"><i class="fas fa-plug"></i></div>
+          <div class="flex-1">
+            <h2 class="text-lg font-bold text-slate-800">Farmsky Score APIs</h2>
+            <p class="text-sm text-slate-600 mt-1">As a <strong>Lender</strong>, you can consume Farmsky's identity verification, credit scoring and workflow APIs directly. Enabling this hands you off (no second login) to the Score console's <strong>API Access</strong> area, where you generate keys, run in Sandbox, and request Production access.</p>
+          </div>
+        </div>
+        <div class="mt-5 flex flex-wrap gap-3">
+          ${configured
+            ? `<button onclick="openUseApis()" class="btn inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-plug"></i>Use APIs — Enable &amp; Open Console</button>`
+            : `<div class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3"><i class="fas fa-triangle-exclamation mr-1"></i>API access is not yet configured for this platform. Please contact your Farmsky administrator.</div>`}
+        </div>
+      </div>
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+        <div class="card p-4"><div class="text-emerald-600 text-lg mb-1"><i class="fas fa-id-card-clip"></i></div><div class="font-semibold text-slate-800 text-sm">Identity &amp; KYB</div><div class="text-xs text-slate-500 mt-1">Verify farmers &amp; businesses via GovChecks.</div></div>
+        <div class="card p-4"><div class="text-emerald-600 text-lg mb-1"><i class="fas fa-chart-line"></i></div><div class="font-semibold text-slate-800 text-sm">Credit Scoring</div><div class="text-xs text-slate-500 mt-1">Bureau + alternative-data credit signals.</div></div>
+        <div class="card p-4"><div class="text-emerald-600 text-lg mb-1"><i class="fas fa-diagram-project"></i></div><div class="font-semibold text-slate-800 text-sm">Workflows</div><div class="text-xs text-slate-500 mt-1">Chain checks into automated decisions.</div></div>
+      </div>
+      <div class="card p-5">
+        <h3 class="font-semibold text-slate-800 mb-2 text-sm">How it works</h3>
+        <ol class="list-decimal pl-5 space-y-1 text-sm text-slate-600">
+          <li>Click <strong>Use APIs</strong>. We record your opt-in and open the Score console via secure single sign-on.</li>
+          <li>In the console's <strong>API Access</strong> tab, toggle the APIs on to generate your Sandbox keys.</li>
+          <li>Test freely in Sandbox, then <strong>request Production</strong> access — a Farmsky Super-Admin reviews and approves it.</li>
+          <li>Your pricing tier &amp; rate limits are shown in the console and managed by Farmsky.</li>
+        </ol>
+        <p class="text-xs text-slate-400 mt-3">Lenders added by an Admin here and lenders who self-register on Score receive identical API features and permissions.</p>
+      </div>
+    </div>`
+}
+
+// ---------------------------------------------------------------------------
+// API MANAGEMENT (Admin-facing) — surfaces the API-consumption feature inside
+// the Equipment admin portal: which lenders can consume APIs, and a secure
+// hand-off (SSO) into the Score Super-Admin portal to configure pricing tiers,
+// approve Production-access requests, and manage global API settings.
+// ---------------------------------------------------------------------------
+async function viewApiManagement() {
+  const cfg = state.crossApp
+  const configured = !!(cfg && cfg.score_configured)
+  let lenders = []
+  try {
+    const { data } = await api.get('/users')
+    lenders = (data.users || []).filter(u => u.role === 'lender')
+  } catch (_) { lenders = [] }
+  const rows = lenders.length
+    ? lenders.map(u => `<tr class="border-t border-slate-100">
+        <td class="px-4 py-3 font-medium">${esc(u.full_name)}</td>
+        <td class="px-4 py-3">${esc(u.phone || '—')}</td>
+        <td class="px-4 py-3">${esc(u.email || '—')}</td>
+        <td class="px-4 py-3">${badge(u.status)}</td>
+        <td class="px-4 py-3 text-right">
+          <button onclick="go('users')" class="text-teal-600 hover:underline text-xs">Manage user</button>
+        </td></tr>`).join('')
+    : `<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400 text-sm">No lender accounts yet. Add one from <button onclick="go('users')" class="text-teal-600 hover:underline">User Accounts</button>.</td></tr>`
+  $('content').innerHTML = `
+    <div class="card p-6 mb-4">
+      <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div>
+          <h2 class="text-lg font-bold text-slate-800"><i class="fas fa-plug text-emerald-600 mr-2"></i>Farmsky Score — API Management</h2>
+          <p class="text-sm text-slate-600 mt-1">Govern platform API consumption: pricing tiers &amp; rates, Production-access approvals, and global settings. These controls live in the Score Super-Admin portal; open it below via secure single sign-on.</p>
+        </div>
+        <div class="flex flex-wrap gap-3">
+          ${configured
+            ? `<button onclick="openScoreSuperAdmin()" class="btn inline-flex items-center gap-2 bg-slate-800 hover:bg-slate-900 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-crown"></i>Open Super-Admin Portal</button>
+               <button onclick="openScore()" class="btn inline-flex items-center gap-2 bg-teal-600 hover:bg-teal-700 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-up-right-from-square"></i>Open Score Console</button>`
+            : `<div class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3"><i class="fas fa-triangle-exclamation mr-1"></i>Score is not configured. Set SCORE_APP_URL &amp; CROSS_APP_HMAC_SECRET.</div>`}
+        </div>
+      </div>
+    </div>
+    <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
+      <div class="card p-4"><div class="text-slate-500 text-xs uppercase tracking-wide">Lenders on platform</div><div class="text-2xl font-bold text-slate-800 mt-1">${lenders.length}</div></div>
+      <div class="card p-4"><div class="text-slate-500 text-xs uppercase tracking-wide">Pricing tiers</div><div class="text-2xl font-bold text-slate-800 mt-1">Managed in Score</div></div>
+      <div class="card p-4"><div class="text-slate-500 text-xs uppercase tracking-wide">Production approvals</div><div class="text-2xl font-bold text-slate-800 mt-1">In Super-Admin</div></div>
+    </div>
+    <div class="card p-5 mb-4">
+      <h3 class="font-semibold text-slate-800 mb-2 text-sm">What you can manage in the Super-Admin portal</h3>
+      <ul class="list-disc pl-5 space-y-1 text-sm text-slate-600">
+        <li><strong>Pricing tiers &amp; rates</strong> — monthly fee, per-check price, included checks, production eligibility.</li>
+        <li><strong>Production access</strong> — approve or deny requests to move a lender from Sandbox to Production.</li>
+        <li><strong>Global settings</strong> — OTP channel, public lender sign-up, default tier and platform controls.</li>
+        <li><strong>Per-lender API access</strong> — enable/disable APIs and assign a tier for any organization.</li>
+      </ul>
+    </div>
+    <div class="card table-card">
+      <div class="px-4 py-3 border-b border-slate-100 font-semibold text-slate-700 text-sm">Lender accounts (API-eligible)</div>
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Name</th><th class="text-left px-4 py-3">Phone</th><th class="text-left px-4 py-3">Email</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`
+}
+// Admin hand-off straight to the Score Super-Admin portal (dest=superadmin).
+window.openScoreSuperAdmin = async () => {
+  try {
+    const { data } = await api.get('/cross/handoff?target=score&dest=superadmin')
+    if (data && data.url) window.open(data.url, '_blank')
+    else toast('Score Super-Admin portal is not configured', true)
+  } catch (e) { toast('Unable to open the Super-Admin portal right now', true) }
 }
 window.openAccessManager = async (editRoleKey = '') => {
   await ensurePermissionMeta()

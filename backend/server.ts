@@ -77,6 +77,11 @@ const ENV = {
   APP_TYPE: process.env.APP_TYPE,
   PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL,
   CROSS_APP_URL: process.env.CROSS_APP_URL,
+  // Farmsky Score origin for the "Use APIs" / API Management SSO hand-off.
+  // Without this the Node server left it undefined at runtime, so
+  // score_configured was always false and the lender "Use APIs" button + admin
+  // API Management SSO never appeared even when SCORE_APP_URL was set on Render.
+  SCORE_APP_URL: process.env.SCORE_APP_URL,
   CROSS_APP_HMAC_SECRET: process.env.CROSS_APP_HMAC_SECRET,
   AUTH_HASH_ITERATIONS: process.env.AUTH_HASH_ITERATIONS,
   AUTH_HASH_KEYLEN: process.env.AUTH_HASH_KEYLEN,
