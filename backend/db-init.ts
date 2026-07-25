@@ -12,11 +12,72 @@ const SERIAL_TABLES = [
 ]
 
 function splitStatements(sql: string): string[] {
-  const stripped = sql.replace(/^\s*--.*$/gm, '')
-  return stripped
-    .split(/;\s*(?:\n|$)/g)
-    .map((statement) => statement.trim())
-    .filter(Boolean)
+  // Split on statement-terminating semicolons, but DO NOT split inside:
+  //   * dollar-quoted blocks ($$ ... $$ / $tag$ ... $tag$, used by PL/pgSQL
+  //     DO blocks & functions) — a naive split on ";\n" shreds a DO block;
+  //   * single-quoted string literals;
+  //   * SQL line comments (-- ... EOL) which may themselves contain quotes or
+  //     semicolons (e.g. "-- e.g. 'equipment', 'feed'").
+  // This scanner strips comments AND is dollar-quote / quote aware in one pass.
+  const out: string[] = []
+  let cur = ''
+  let i = 0
+  let inSingle = false
+  let dollarTag: string | null = null
+
+  while (i < sql.length) {
+    const ch = sql[i]
+
+    if (dollarTag) {
+      if (sql.startsWith(dollarTag, i)) {
+        cur += dollarTag
+        i += dollarTag.length
+        dollarTag = null
+        continue
+      }
+      cur += ch
+      i++
+      continue
+    }
+
+    if (inSingle) {
+      cur += ch
+      if (ch === "'") {
+        if (sql[i + 1] === "'") { cur += "'"; i += 2; continue }
+        inSingle = false
+      }
+      i++
+      continue
+    }
+
+    // Line comment: skip from `--` to end of line (drop it entirely).
+    if (ch === '-' && sql[i + 1] === '-') {
+      const nl = sql.indexOf('\n', i)
+      if (nl === -1) { i = sql.length } else { cur += '\n'; i = nl + 1 }
+      continue
+    }
+
+    // Start of a dollar-quoted block.
+    if (ch === '$') {
+      const m = /^\$[A-Za-z0-9_]*\$/.exec(sql.slice(i))
+      if (m) { dollarTag = m[0]; cur += dollarTag; i += dollarTag.length; continue }
+    }
+
+    if (ch === "'") { inSingle = true; cur += ch; i++; continue }
+
+    if (ch === ';') {
+      out.push(cur)
+      cur = ''
+      i++
+      continue
+    }
+
+    cur += ch
+    i++
+  }
+  if (cur.trim()) out.push(cur)
+
+  return out.map((statement) => statement.trim()).filter(Boolean)
 }
 
 function transformStatement(originalStatement: string): { sql: string; conflict: boolean } {

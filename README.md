@@ -111,6 +111,26 @@ Set these so the Equipment ⇄ Score handoff works with **no second login**:
 > the `organizations`/`users` tables the `/sso` handoff writes to). Verify Score
 > health at `GET https://score.farmsky.africa/v3/health` → `otp_deliverable: true`.
 
+## Database migrations (auto-apply on boot)
+On startup the Node server runs every `migrations/*.sql` through
+`backend/db-init.ts` (SQLite dialect → PostgreSQL, idempotent). Notes for
+production databases that were created by an **older schema**:
+
+- **`0007_widen_epoch_columns.sql` is self-healing.** `expires_at` on
+  `sessions` / `otp_codes` is stored as an epoch-millisecond **BIGINT**. If a
+  legacy database created those columns as `TIMESTAMP`/`TIMESTAMPTZ`, a direct
+  cast is impossible and Postgres aborted the whole init with:
+  `cannot cast type timestamp with time zone to bigint` →
+  `Database initialization failed`. The migration now inspects each column and
+  converts a timestamp to epoch-millis (`EXTRACT(EPOCH …)*1000`, dropping the
+  timestamp default first), widens an integer straight to BIGINT, and skips a
+  column that is already BIGINT. It is conditional + idempotent.
+- The migration runner's statement splitter is **dollar-quote / quote / comment
+  aware**, so PL/pgSQL `DO $$ … $$` blocks (like the one above) are executed as a
+  single statement instead of being shredded at their internal semicolons.
+
+A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines.
+
 ## Deploy
 See **[AWS_DEPLOYMENT.md](./AWS_DEPLOYMENT.md)** for:
 - AWS EC2 (recommended easy path) — Nginx + free HTTPS
