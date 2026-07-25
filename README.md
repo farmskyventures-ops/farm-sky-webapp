@@ -111,6 +111,29 @@ Set these so the Equipment ⇄ Score handoff works with **no second login**:
 > the `organizations`/`users` tables the `/sso` handoff writes to). Verify Score
 > health at `GET https://score.farmsky.africa/v3/health` → `otp_deliverable: true`.
 
+### ⚠️ Sharing this database with the Score app — Score must set `DB_SCHEMA=score`
+Equipment is the **central database host**: the Score app can point at the **same**
+PostgreSQL instance. Both apps independently define same-named tables (`users`,
+`organizations`, `sessions`, `otp_codes`, …) but with **incompatible column
+types** — Equipment uses `integer`/`bigint` ids and epoch-millisecond
+`expires_at`; Score uses `uuid` ids and `timestamptz`. If both wrote to the same
+`public` schema they would collide (this caused Score's login/sign-up 500s:
+`operator does not exist: uuid = integer` and `invalid input syntax for type bigint`).
+
+**Resolution — Score isolates itself into a dedicated `score` PostgreSQL schema**
+by setting **`DB_SCHEMA=score`** on the *Score* service (its connections use
+`search_path=score,public`). Equipment needs **no change**: it continues to own and
+use the `public` schema exactly as before, and Score never reads, alters, or drops
+Equipment's `public.*` tables. Equipment's own `0021_score_platform.sql`
+`score_`-prefixed integration tables (subscriptions/verifications) are unaffected —
+they remain in Equipment's `public` schema and are distinct from Score's internal
+`score.*` schema.
+
+> **No action required on the Equipment service** for this — just ensure the Score
+> service has `DB_SCHEMA=score` set (see the Score app's README → "Sharing ONE
+> database with the Equipment app"). Equipment's default `public` search_path is
+> correct and unchanged.
+
 ## Database migrations (auto-apply on boot)
 On startup the Node server runs every `migrations/*.sql` through
 `backend/db-init.ts` (SQLite dialect → PostgreSQL, idempotent). Notes for
