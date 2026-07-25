@@ -94,6 +94,22 @@ Score verification & credit APIs directly:
   The **User Accounts & Access** view documents this inline.
 - **Cross-app config** — `GET /api/cross/config` returns `score_configured` /
   `score_url` so the UI only shows the button when Score is wired up.
+- **Dashboard views** — lenders get an **API Access** sidebar view (feature cards +
+  a visible "Use APIs" action), and admins/super-admins get an **API Management**
+  view that lists lender accounts and single-sign-on into the Score **Super-Admin**
+  portal (`dest=superadmin`) or a lender's console.
+
+### Required env for seamless Score alignment
+Set these so the Equipment ⇄ Score handoff works with **no second login**:
+
+| Variable | Where | Value |
+|---|---|---|
+| `CROSS_APP_HMAC_SECRET` | **Both** Equipment *and* Score services | The **same** random secret on both — Score's `/sso` verifies the handoff token with it. A mismatch shows *"sign-in link could not be verified"*. |
+| `SCORE_APP_URL` | Equipment service | `https://score.farmsky.africa` — without it `score_configured` is `false` and the buttons never appear. |
+
+> The Score side must also be migrated/deployed (its `0000_repair` migration builds
+> the `organizations`/`users` tables the `/sso` handoff writes to). Verify Score
+> health at `GET https://score.farmsky.africa/v3/health` → `otp_deliverable: true`.
 
 ## Deploy
 See **[AWS_DEPLOYMENT.md](./AWS_DEPLOYMENT.md)** for:
