@@ -96,13 +96,20 @@ function transformStatement(originalStatement: string): { sql: string; conflict:
   return { sql, conflict }
 }
 
-async function execStatement(pool: Pool, statement: string, allowConflict: boolean) {
+// Result of trying a single statement:
+//   'ok'      — executed (or benignly idempotent, e.g. duplicate column)
+//   'skipped' — failed with a NON-fatal error; logged and stepped over so the
+//               rest of the file (later CREATE TABLEs etc.) can still run.
+type StatementResult = 'ok' | 'skipped'
+
+async function execStatement(pool: Pool, statement: string, allowConflict: boolean): Promise<StatementResult> {
   try {
     let sql = statement
     if (allowConflict && /^insert\s+into/i.test(sql) && !/on\s+conflict/i.test(sql)) {
       sql += ' ON CONFLICT DO NOTHING'
     }
     await pool.query(sql)
+    return 'ok'
   } catch (error: any) {
     const code = error?.code || ''
     const message = String(error?.message || '')
@@ -110,18 +117,31 @@ async function execStatement(pool: Pool, statement: string, allowConflict: boole
     // 42701 duplicate column, 42P07 duplicate table/index, 23505 unique violation
     // (handled by ON CONFLICT), 42809 wrong object type for DROP VIEW/TABLE on
     // an object of a different kind, 42P06 duplicate schema.
-    if (['42701', '42P07', '23505', '42809', '42P06'].includes(code)) return
-    if (/already exists|duplicate column|is not a|wrong (object )?type/i.test(message)) return
-    throw error
+    if (['42701', '42P07', '23505', '42809', '42P06'].includes(code)) return 'ok'
+    if (/already exists|duplicate column|is not a|wrong (object )?type/i.test(message)) return 'ok'
+    // Any OTHER error must NOT abort the rest of the file. On the shared central
+    // DB a single incompatible statement (e.g. a FK whose referenced table was
+    // created by a sibling app with a different id type) used to throw here and
+    // prevent every subsequent CREATE TABLE in the SAME file from running —
+    // leaving core tables (products, agents, customers, ...) missing and causing
+    // downstream "relation does not exist" failures. Log and step over instead;
+    // migrations are idempotent, so the schema converges on the next deploy.
+    console.error(
+      `  · statement skipped (${code || 'no-code'}): ${message} :: ${statement.slice(0, 120).replace(/\s+/g, ' ')}`
+    )
+    return 'skipped'
   }
 }
 
 async function applySqlFile(pool: Pool, file: string) {
   const rawSql = readFileSync(file, 'utf8')
+  let skipped = 0
   for (const statement of splitStatements(rawSql)) {
     const { sql, conflict } = transformStatement(statement)
-    await execStatement(pool, sql, conflict)
+    const result = await execStatement(pool, sql, conflict)
+    if (result === 'skipped') skipped++
   }
+  return { skipped }
 }
 
 async function tableExists(pool: Pool, tableName: string): Promise<boolean> {
@@ -151,27 +171,32 @@ export async function initializeDatabase(pool: Pool, projectRoot: string) {
   const migrationsDir = join(projectRoot, 'migrations')
   if (existsSync(migrationsDir)) {
     const files = readdirSync(migrationsDir).filter((file) => file.endsWith('.sql')).sort()
-    // Apply migrations in order. A single file failing must NOT abort the whole
-    // chain: on the shared central DB a legacy quirk in one file previously
-    // aborted 0008 and prevented every later migration (incl. the boolean
-    // normalization) from ever running. All our DDL is idempotent, so we log
-    // the offending file and keep going; remaining migrations still converge
-    // the schema. Failures are collected and surfaced after the loop.
+    // Apply migrations in order. Resilience is now enforced at TWO levels:
+    //   1. Statement level (applySqlFile/execStatement): a single incompatible
+    //      statement is logged and skipped so the REST of the same file (later
+    //      CREATE TABLEs etc.) still runs — this prevents the "one bad FK aborts
+    //      the whole file, leaving core tables missing" class of failure.
+    //   2. File level (here): a file that throws unexpectedly must NOT abort the
+    //      whole chain. All our DDL is idempotent, so we log and keep going;
+    //      remaining migrations still converge the schema.
     const failures: Array<{ file: string; message: string }> = []
+    let skippedTotal = 0
     for (const file of files) {
       try {
-        await applySqlFile(pool, join(migrationsDir, file))
+        const { skipped } = await applySqlFile(pool, join(migrationsDir, file))
+        skippedTotal += skipped
+        if (skipped) console.warn(`Migration ${file}: ${skipped} statement(s) skipped (see logs).`)
       } catch (error: any) {
         const message = String(error?.message || error)
         console.error(`Migration ${file} error (continuing):`, message)
         failures.push({ file, message })
       }
     }
-    if (failures.length) {
+    if (failures.length || skippedTotal) {
       console.warn(
-        `Database initialization completed with ${failures.length} migration file(s) reporting errors: ` +
-        failures.map((f) => f.file).join(', ') +
-        '. The app still boots; idempotent DDL will retry on the next deploy.'
+        `Database initialization completed with ${failures.length} file-level error(s) and ` +
+        `${skippedTotal} skipped statement(s). The app still boots; idempotent DDL retries on next deploy.` +
+        (failures.length ? ` Files: ${failures.map((f) => f.file).join(', ')}` : '')
       )
     }
   }

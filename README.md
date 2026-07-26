@@ -151,8 +151,29 @@ production databases that were created by an **older schema**:
 - The migration runner's statement splitter is **dollar-quote / quote / comment
   aware**, so PL/pgSQL `DO $$ … $$` blocks (like the one above) are executed as a
   single statement instead of being shredded at their internal semicolons.
+- **`0023_ensure_users_columns.sql` is defensive & self-healing.** On the shared
+  central DB a sibling app (Score) also has a `users` table. If a sibling created
+  a `public.users` **before** Equipment's `0001` ran, `0001`'s
+  `CREATE TABLE IF NOT EXISTS users` silently did nothing, so the Equipment
+  `password` column (and others) never existed — producing
+  `column "password" of relation "users" does not exist` (42703) on login/user
+  management. `0023` runs LAST and idempotently `ADD COLUMN IF NOT EXISTS` for the
+  **full set** of columns the app writes to `users` (`password`, `password_set`,
+  `must_change_password`, `is_temp_password`, `temp_password_expires_at`,
+  `created_by`, `label`, `permissions`, `avatar_url`, `schedule_enabled`,
+  `access_days`, `access_start`, `access_end`), converging the schema no matter
+  who created the table or in what order.
+- **The runner is now resilient at the STATEMENT level, not just the file level.**
+  Previously a single incompatible statement in a file (e.g. a foreign key whose
+  referenced table was created by a sibling app with a different id type) threw
+  and aborted every **subsequent** `CREATE TABLE` in the *same* file, leaving core
+  tables (`products`, `agents`, `customers`, …) missing → downstream
+  `relation … does not exist` errors. `backend/db-init.ts` now logs and **skips**
+  the offending statement so the rest of the file still runs; all DDL is
+  idempotent so the schema converges on the next deploy.
 
-A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines.
+A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines
+(occasional `statement skipped` warnings on a shared DB are expected and benign).
 
 ## Deploy
 See **[AWS_DEPLOYMENT.md](./AWS_DEPLOYMENT.md)** for:
