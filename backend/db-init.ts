@@ -91,8 +91,35 @@ function transformStatement(originalStatement: string): { sql: string; conflict:
   sql = sql.replace(/\bAUTOINCREMENT\b/gi, '')
   sql = sql.replace(/\bDATETIME\b/gi, 'TIMESTAMP')
   sql = sql.replace(/\bREAL\b/gi, 'DOUBLE PRECISION')
+  // --------------------------------------------------------------------
+  // STRIP cross-type foreign keys to `users` inside CREATE TABLE bodies.
+  //
+  // WHY: Equipment shares ONE central Postgres DB with sibling apps (Score).
+  // When a sibling created `public.users` FIRST with a UUID primary key, an
+  // Equipment table declaring `user_id INTEGER ... REFERENCES users(id)` can
+  // NEVER satisfy the FK — Postgres rejects the whole CREATE TABLE with
+  //   "foreign key constraint ... cannot be implemented" (42804)
+  // and the resilient runner then SKIPS the entire table. That is exactly how
+  // `customers` / `agents` / `change_requests` went missing in production,
+  // producing "relation \"customers\" does not exist" (42P01) during signup.
+  //
+  // The FK to users adds no real integrity guarantee on a multi-app shared DB
+  // (ids may be integer OR uuid), so we drop these inline FK clauses. The
+  // columns themselves are kept and widened to TEXT by migration 0025 so they
+  // work regardless of how users.id is typed. Only strips FKs that REFERENCE
+  // users — all other FKs are preserved.
+  if (/^\s*create\s+table/i.test(sql)) {
+    // Inline column constraint: `... REFERENCES users(id) ...` (rare, no leading FOREIGN KEY)
+    // Table-level constraint: `FOREIGN KEY (col) REFERENCES users(id)` possibly with trailing comma.
+    sql = sql
+      // table-level FOREIGN KEY (...) REFERENCES users(id) [ON ...][,]
+      .replace(/,?\s*FOREIGN\s+KEY\s*\([^)]*\)\s*REFERENCES\s+users\s*\([^)]*\)(\s+ON\s+(DELETE|UPDATE)\s+\w+)*/gi, '')
+      // inline column-level REFERENCES users(id) (keep the column, drop the ref)
+      .replace(/\bREFERENCES\s+users\s*\([^)]*\)(\s+ON\s+(DELETE|UPDATE)\s+\w+)*/gi, '')
+  }
   // Trim trailing commas accidentally left by transformations
   sql = sql.replace(/,\s*\)/g, '\n)')
+  sql = sql.replace(/,\s*,/g, ',')
   return { sql, conflict }
 }
 

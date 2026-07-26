@@ -171,6 +171,33 @@ production databases that were created by an **older schema**:
   `relation … does not exist` errors. `backend/db-init.ts` now logs and **skips**
   the offending statement so the rest of the file still runs; all DDL is
   idempotent so the schema converges on the next deploy.
+- **`0024_sessions_user_id_text.sql` + `0025_userref_columns_text.sql` make every
+  *user-id* column type-agnostic.** On the shared central DB, Score's `users`
+  table uses a **UUID** primary key, while Equipment declared its user-reference
+  columns as `INTEGER`. Two failures resulted:
+  1. `createSession()` inserted the (UUID) `users.id` into `sessions.user_id`
+     (INTEGER) → `invalid input syntax for type integer: "90ebd36d-…"` (**22P02**)
+     at `createSession`, breaking **signup, OTP verification, login and password
+     reset** — every path that mints a session.
+  2. Tables whose columns carried `… INTEGER … REFERENCES users(id)`
+     (`customers`, `agents`, `change_requests`) could not satisfy a cross-type FK,
+     so Postgres rejected the whole `CREATE TABLE` (42804) and the resilient
+     runner **skipped the entire table** → `relation "customers" does not exist`
+     (42P01) during signup.
+
+  The fix is in two parts: `backend/db-init.ts` now **strips inline
+  `REFERENCES users(id)` foreign keys** from `CREATE TABLE` bodies (the FK adds no
+  real integrity guarantee across apps on a shared DB), so those tables always
+  create; and `0024`/`0025` idempotently widen `sessions.user_id`,
+  `audit_logs.user_id`, `customers.user_id`, `customers.agent_id`,
+  `agents.user_id` and `change_requests.requester_id` to **TEXT** (only when not
+  already text/varchar), so they losslessly hold an integer-as-string **or** a
+  UUID string. The session read path joins with `CAST(u.id AS TEXT) = s.user_id`
+  and all session INSERT/DELETE bind params are cast `CAST(? AS TEXT)`, so auth
+  works whether `users.id` is INTEGER (Equipment's own schema) or UUID (shared
+  central DB). Verified end-to-end against a reproduced UUID-users database:
+  signup → OTP → login → session read → logout → password-reset all succeed with
+  **zero** 22P02 / `does not exist` errors.
 
 A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines
 (occasional `statement skipped` warnings on a shared DB are expected and benign).

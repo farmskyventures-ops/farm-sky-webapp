@@ -507,7 +507,7 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
   const row = await c.env.DB.prepare(
     `SELECT u.id, u.full_name, u.phone, u.email, u.avatar_url, u.role, u.region, u.label, u.permissions, u.status,
             u.schedule_enabled, u.access_days, u.access_start, u.access_end, s.expires_at
-     FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?`
+     FROM sessions s JOIN users u ON CAST(u.id AS TEXT) = s.user_id WHERE s.token = ?`
   ).bind(token).first<any>()
   if (!row) return null
   if (Number(row.expires_at) < Date.now()) return null
@@ -628,7 +628,10 @@ async function issueTempPassword(
 async function createSession(c: any, user: any) {
   const token = genToken()
   const expires = Date.now() + 1000 * 60 * 60 * 12
-  await c.env.DB.prepare(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?,?,?)`).bind(token, user.id, expires).run()
+  // user_id is TEXT (migration 0024) so it holds either Equipment's INTEGER id
+  // or a UUID id from a shared/central users table. Bind the id as a string and
+  // cast the placeholder to TEXT so the INSERT never hits a 22P02 type error.
+  await c.env.DB.prepare(`INSERT INTO sessions (token, user_id, expires_at) VALUES (?, CAST(? AS TEXT), ?)`).bind(token, String(user.id), expires).run()
   // Issue 7: mark the session cookie Secure when served over HTTPS so it is
   // never transmitted over a plaintext channel in production.
   const isHttps = (c.req.header('x-forwarded-proto') || '').includes('https') || new URL(c.req.url).protocol === 'https:'
@@ -1310,7 +1313,7 @@ app.put('/api/customers/:id/status', requireAuth, requireRole('admin', 'super_ad
   await c.env.DB.prepare(`UPDATE customers SET status=? WHERE id=?`).bind(status, id).run()
   if (cust.user_id) {
     await c.env.DB.prepare(`UPDATE users SET status=? WHERE id=?`).bind(status, cust.user_id).run()
-    if (status === 'suspended') await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(cust.user_id).run()
+    if (status === 'suspended') await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(cust.user_id).run()
   }
   await audit(c, c.get('user').id, status === 'active' ? 'activate' : 'deactivate', 'customer', String(id))
   return c.json({ ok: true })
@@ -1326,7 +1329,7 @@ app.delete('/api/customers/:id', requireAuth, requireRole('admin', 'super_admin'
   await c.env.DB.prepare(`DELETE FROM id_verifications WHERE customer_id=?`).bind(id).run()
   await c.env.DB.prepare(`DELETE FROM customers WHERE id=?`).bind(id).run()
   if (cust.user_id) {
-    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(cust.user_id).run()
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(cust.user_id).run()
     await c.env.DB.prepare(`DELETE FROM users WHERE id=? AND role='customer'`).bind(cust.user_id).run()
   }
   await audit(c, c.get('user').id, 'delete', 'customer', String(id))
@@ -2683,11 +2686,11 @@ app.post('/api/users/:id/reset-password', requireAuth, requireRole('admin', 'sup
   // fresh temporary password with the mandatory-change + 3h-expiry lifecycle.
   if (provided) {
     await c.env.DB.prepare(`UPDATE users SET password=?, password_set=1, must_change_password=0, is_temp_password=0, temp_password_expires_at=NULL WHERE id=?`).bind(await hashPassword(String(body.password)), id).run()
-    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(id).run()
     await audit(c, c.get('user').id, 'reset_password', target.role, target.full_name)
     return c.json({ ok: true, new_password: String(body.password), user: target.full_name })
   }
-  await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
+  await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(id).run()
   const t = await issueTempPassword(c, { userId: id as any, phone: target.phone, fullName: target.full_name })
   await audit(c, c.get('user').id, 'reset_password', target.role, `${target.full_name} (temporary)`)
   return c.json({ ok: true, new_password: t.tempPassword, user: target.full_name, temporary: true, expires_at: t.expiresAt, sms_simulated: !!t.sms.simulated })
@@ -2777,7 +2780,7 @@ app.put('/api/users/:id/status', requireAuth, requireRole('admin', 'super_admin'
   const { status } = await c.req.json()
   if (Number(id) === c.get('user').id) return c.json({ error: 'You cannot change your own status' }, 400)
   await c.env.DB.prepare(`UPDATE users SET status=? WHERE id=?`).bind(status, id).run()
-  if (status === 'suspended') await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
+  if (status === 'suspended') await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(id).run()
   await audit(c, c.get('user').id, status === 'active' ? 'activate' : 'deactivate', 'user', String(id))
   return c.json({ ok: true })
 })
@@ -2786,7 +2789,7 @@ app.delete('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), a
   if (Number(id) === c.get('user').id) return c.json({ error: 'You cannot delete your own account' }, 400)
   const u = await c.env.DB.prepare(`SELECT role FROM users WHERE id=?`).bind(id).first<any>()
   if (u?.role === 'super_admin') return c.json({ error: 'Cannot delete a Super Admin account' }, 400)
-  await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(id).run()
+  await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(id).run()
   await c.env.DB.prepare(`DELETE FROM agents WHERE user_id=?`).bind(id).run()
   await c.env.DB.prepare(`DELETE FROM users WHERE id=?`).bind(id).run()
   await audit(c, c.get('user').id, 'delete', 'user', String(id))
@@ -3021,7 +3024,7 @@ app.post('/api/profile-amendments/:id/decision', requireAuth, async (c) => {
       }
     })
     await c.env.DB.prepare(`UPDATE profile_amendments SET status='approved', reviewed_by=?, review_notes=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?`).bind(actor.id, notes || null, id).run()
-    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id=?`).bind(amend.user_id).run()
+    await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(amend.user_id).run()
   } else if (action === 'reject') {
     await c.env.DB.prepare(`UPDATE profile_amendments SET status='rejected', reviewed_by=?, review_notes=?, reviewed_at=CURRENT_TIMESTAMP WHERE id=?`).bind(actor.id, notes || null, id).run()
   } else {
