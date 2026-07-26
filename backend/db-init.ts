@@ -151,13 +151,28 @@ export async function initializeDatabase(pool: Pool, projectRoot: string) {
   const migrationsDir = join(projectRoot, 'migrations')
   if (existsSync(migrationsDir)) {
     const files = readdirSync(migrationsDir).filter((file) => file.endsWith('.sql')).sort()
+    // Apply migrations in order. A single file failing must NOT abort the whole
+    // chain: on the shared central DB a legacy quirk in one file previously
+    // aborted 0008 and prevented every later migration (incl. the boolean
+    // normalization) from ever running. All our DDL is idempotent, so we log
+    // the offending file and keep going; remaining migrations still converge
+    // the schema. Failures are collected and surfaced after the loop.
+    const failures: Array<{ file: string; message: string }> = []
     for (const file of files) {
       try {
         await applySqlFile(pool, join(migrationsDir, file))
       } catch (error: any) {
-        console.error(`Migration ${file} error:`, error.message)
-        throw error
+        const message = String(error?.message || error)
+        console.error(`Migration ${file} error (continuing):`, message)
+        failures.push({ file, message })
       }
+    }
+    if (failures.length) {
+      console.warn(
+        `Database initialization completed with ${failures.length} migration file(s) reporting errors: ` +
+        failures.map((f) => f.file).join(', ') +
+        '. The app still boots; idempotent DDL will retry on the next deploy.'
+      )
     }
   }
   if (!hasUsers) {
