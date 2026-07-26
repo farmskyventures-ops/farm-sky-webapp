@@ -2458,7 +2458,17 @@ app.get('/api/cross/handoff', requireAuth, async (c) => {
   // app's /sso endpoint, so no second login is needed at the destination.
   // Email + name are carried so email-keyed apps (Score) can resolve/create
   // the account without a second login.
-  const token = await mintHandoffToken(secret, normalizePhone(user.phone), { email: user.email, name: user.full_name })
+  // The Equipment Admin Portal is the SINGLE source of truth for Super-Admin
+  // status. Carry the originating role + a super_admin assertion so the
+  // destination app (Score) grants the SAME Super-Admin access with the SAME
+  // credentials — no second login and no separate Super-Admin config there.
+  const isSuper = user.role === 'super_admin'
+  const token = await mintHandoffToken(secret, normalizePhone(user.phone), {
+    email: user.email,
+    name: user.full_name,
+    role: user.role,
+    super_admin: isSuper,
+  })
   // Optional deep-link: `dest` tells the destination app which view to open
   // after SSO (e.g. dest=api-access lands the lender on the Score console's
   // API Access tab). Kept as an allow-listed slug to avoid open-redirect abuse.
