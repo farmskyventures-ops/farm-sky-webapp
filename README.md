@@ -199,6 +199,45 @@ production databases that were created by an **older schema**:
   signup → OTP → login → session read → logout → password-reset all succeed with
   **zero** 22P02 / `does not exist` errors.
 
+- **`0026_all_userref_columns_text.sql` + `0027_ensure_superadmin.sql` finish the
+  job for the *legacy* Equipment features on the shared UUID DB.** `0024`/`0025`
+  only widened a hand-picked set of columns, so several legacy modules still
+  broke on a UUID `users.id`:
+  - **Inventory** — `products.finance_set_by` (INTEGER) rejected a UUID on
+    product create (**22P02**).
+  - **Wallet / payouts / withdrawals** — `wallets.user_id`, `wallet_ledger.user_id`,
+    `earning_rules.user_id`, `payout_batches.issued_by`, `payout_accounts.user_id`,
+    `wallet_withdrawals.user_id/recipient_user_id` and every `*_by`/`*_user_id`
+    audit column were INTEGER.
+  - **Murabaha** — `murabaha_contracts.agent_id/created_by` were INTEGER.
+
+  `0026` runs a **dynamic PL/pgSQL loop** that widens *every* `public` column whose
+  name matches a user-reference pattern (`user_id`, `agent_id`, `requester_id`,
+  `reviewer_id`, `recipient_user_id`, `created_user_id`, `initiated_by_user`, or
+  `LIKE '%_by'`) and is still integer/bigint/smallint, to **TEXT** — with an
+  EXCLUDE set that protects genuinely non-user id columns (`supplier_id`,
+  `customer_id`, `contract_id`, `product_id`, `wallet_id`, `batch_id`, `row_id`,
+  `checkout_id`, `intent_id`, `ticket_id`, `transaction_id`, `repayment_id`,
+  `approval_id`, `key_id`, `backup_id`, `amendment_id`, `rule_id`, `account_id`,
+  `payout_account_id`). It is idempotent (only converts non-text columns) and
+  catches new user-ref columns automatically on future deploys. In tandem,
+  `backend/index.tsx` now (a) returns `getSessionUser().id` as a **String**, (b)
+  casts all `users.id` JOINs `CAST(u.id AS TEXT) = <textcol>` (12 sites), and (c)
+  reads `b.user_id` from request bodies as a **string** (no more `Number(b.user_id)`
+  → `NaN` on UUIDs) across the wallet/earning-rule/payout/direct-pay handlers.
+
+  `0027` idempotently guarantees an **active `super_admin`** exists with the
+  canonical phone **`254702875711`** (login: `0702875711` / `1224`), id-type-agnostic
+  (it never references `users.id`, matching on role/phone and letting the table's
+  own PK default generate the id) so it seeds correctly whether `users.id` is
+  INTEGER or UUID. Verified end-to-end against a reproduced UUID-users database:
+  RBAC (users/agents/permissions/role-templates/change-requests), inventory
+  (product CRUD/stock/finance), **wallet (create/assign, earning rules, ledger,
+  payouts single + all-agents, direct-pay, analytics, withdrawals)**, payments
+  (M-Pesa/SasaPay/Buni STK push + settlement), murabaha (quote/apply/decision),
+  customers/KYC, imports, backups, profile-amendments and the Score SSO handoff
+  (super-admin assertion) all execute with **zero** 22P02 runtime errors.
+
 A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines
 (occasional `statement skipped` warnings on a shared DB are expected and benign).
 

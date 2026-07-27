@@ -518,7 +518,13 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
   if (!access.allowed) return null
   const fallback = await loadRoleTemplate(c, row.role)
   return {
-    id: row.id,
+    // Always expose the user id as a STRING. All user-reference columns
+    // (created_by, agent_id, wallet.user_id, …) are now TEXT (migrations
+    // 0024-0026) so they work whether users.id is INTEGER or UUID. Binding a
+    // JS number against a TEXT column would raise `operator does not exist:
+    // text = integer` on an integer-keyed DB; stringifying here makes every
+    // downstream `WHERE <textcol> = ?` bind text=text on both DB shapes.
+    id: row.id == null ? row.id : String(row.id),
     full_name: row.full_name,
     phone: row.phone,
     email: row.email || null,
@@ -580,10 +586,10 @@ function requirePermission(...perms: string[]) {
     await next()
   }
 }
-async function audit(c: any, userId: number | null, action: string, entity: string, detail: string) {
+async function audit(c: any, userId: string | number | null, action: string, entity: string, detail: string) {
   try {
     await c.env.DB.prepare(`INSERT INTO audit_logs (user_id, action, entity, detail) VALUES (?,?,?,?)`)
-      .bind(userId, action, entity, detail).run()
+      .bind(userId == null ? null : String(userId), action, entity, detail).run()
   } catch (_) {}
 }
 function genPassword(): string {
@@ -608,14 +614,14 @@ const TEMP_PASSWORD_TTL_MS = 3 * 60 * 60 * 1000
 // SMS it to them with the mandatory "do not share / expires in 3 hours" notice.
 async function issueTempPassword(
   c: any,
-  opts: { userId: number | bigint; phone: string; fullName?: string; hashedInto?: 'insert' }
+  opts: { userId: number | bigint | string; phone: string; fullName?: string; hashedInto?: 'insert' }
 ): Promise<{ tempPassword: string; expiresAt: number; sms: { simulated?: boolean; success?: boolean; error?: string } }> {
   const tempPassword = genTempPassword()
   const expiresAt = Date.now() + TEMP_PASSWORD_TTL_MS
   const hashed = await hashPassword(tempPassword)
   await c.env.DB.prepare(
     `UPDATE users SET password=?, password_set=0, must_change_password=1, is_temp_password=1, temp_password_expires_at=? WHERE id=?`
-  ).bind(hashed, expiresAt, opts.userId).run()
+  ).bind(hashed, expiresAt, String(opts.userId)).run()
   const msg =
     `Farmsky account created${opts.fullName ? ' for ' + opts.fullName : ''}. ` +
     `Temporary password: ${tempPassword}. ` +
@@ -1123,7 +1129,7 @@ app.get('/api/products/finance-queue', requireAuth, requirePermission('can_manag
   const rows = await withAdminContext(c, async () => {
     const { results } = await c.env.DB.prepare(
       `SELECT p.*, u.full_name AS created_by_name
-         FROM products p LEFT JOIN users u ON u.id = p.created_by
+         FROM products p LEFT JOIN users u ON CAST(u.id AS TEXT) = p.created_by
         WHERE p.finance_status = 'pending_finance'
         ORDER BY p.created_at DESC`
     ).all()
@@ -1175,7 +1181,7 @@ app.get('/api/products/finance-audit', requireAuth, requirePermission('can_manag
               u.full_name AS created_by_name,
               (CASE WHEN p.credit_markup_pct IS NULL OR p.credit_markup_pct = 0 THEN 1 ELSE 0 END) AS missing_markup,
               (CASE WHEN p.financing_terms_text IS NULL OR p.financing_terms_text = '' THEN 1 ELSE 0 END) AS missing_agreement
-         FROM products p LEFT JOIN users u ON u.id = p.created_by
+         FROM products p LEFT JOIN users u ON CAST(u.id AS TEXT) = p.created_by
         WHERE p.finance_status <> 'published'
         ORDER BY p.created_at ASC`
     ).all()
@@ -2631,8 +2637,8 @@ app.get('/api/dashboard', requireAuth, async (c) => {
 app.get('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT u.id, u.full_name, u.phone, u.email, u.region, u.label, u.permissions, u.status,
-     (SELECT COUNT(*) FROM customers WHERE agent_id=u.id) customers,
-     (SELECT COUNT(*) FROM murabaha_contracts WHERE agent_id=u.id AND status='active') active
+     (SELECT COUNT(*) FROM customers WHERE agent_id=CAST(u.id AS TEXT)) customers,
+     (SELECT COUNT(*) FROM murabaha_contracts WHERE agent_id=CAST(u.id AS TEXT) AND status='active') active
      FROM users u WHERE u.role='agent'`
   ).all()
   const agentFallback = await loadRoleTemplate(c, 'agent')
@@ -2678,7 +2684,7 @@ app.post('/api/users/:id/reset-password', requireAuth, requireRole('admin', 'sup
   const id = c.req.param('id')
   const target = await c.env.DB.prepare(`SELECT id, full_name, phone, role FROM users WHERE id=?`).bind(id).first<any>()
   if (!target) return c.json({ error: 'User not found' }, 404)
-  if (target.role === 'super_admin' && Number(id) !== c.get('user').id) return c.json({ error: 'Cannot reset another Super Admin password' }, 400)
+  if (target.role === 'super_admin' && String(id) !== String(c.get('user').id)) return c.json({ error: 'Cannot reset another Super Admin password' }, 400)
   const body = await c.req.json().catch(() => ({}))
   const provided = body?.password && String(body.password).length >= 4
   // Admin-triggered reset. When no explicit password is supplied (the normal
@@ -2778,7 +2784,7 @@ app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), asyn
 app.put('/api/users/:id/status', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
   const { status } = await c.req.json()
-  if (Number(id) === c.get('user').id) return c.json({ error: 'You cannot change your own status' }, 400)
+  if (String(id) === String(c.get('user').id)) return c.json({ error: 'You cannot change your own status' }, 400)
   await c.env.DB.prepare(`UPDATE users SET status=? WHERE id=?`).bind(status, id).run()
   if (status === 'suspended') await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(id).run()
   await audit(c, c.get('user').id, status === 'active' ? 'activate' : 'deactivate', 'user', String(id))
@@ -2786,7 +2792,7 @@ app.put('/api/users/:id/status', requireAuth, requireRole('admin', 'super_admin'
 })
 app.delete('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
-  if (Number(id) === c.get('user').id) return c.json({ error: 'You cannot delete your own account' }, 400)
+  if (String(id) === String(c.get('user').id)) return c.json({ error: 'You cannot delete your own account' }, 400)
   const u = await c.env.DB.prepare(`SELECT role FROM users WHERE id=?`).bind(id).first<any>()
   if (u?.role === 'super_admin') return c.json({ error: 'Cannot delete a Super Admin account' }, 400)
   await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(id).run()
@@ -2987,8 +2993,8 @@ app.get('/api/profile-amendments', requireAuth, async (c) => {
   const status = c.req.query('status') || 'pending'
   let q = `SELECT pa.*, u.full_name AS requester_name, u.role AS requester_role, r.full_name AS reviewer_name
            FROM profile_amendments pa
-           JOIN users u ON u.id = pa.user_id
-           LEFT JOIN users r ON r.id = pa.reviewed_by`
+           JOIN users u ON CAST(u.id AS TEXT) = pa.user_id
+           LEFT JOIN users r ON CAST(r.id AS TEXT) = pa.reviewed_by`
   const binds: any[] = []
   if (status !== 'all') { q += ` WHERE pa.status=?`; binds.push(status) }
   q += ` ORDER BY pa.created_at DESC`
@@ -3076,7 +3082,7 @@ app.get('/api/backups', requireAuth, requireRole('admin', 'super_admin'), async 
   await maybeAutoBackup(c)
   const { results } = await c.env.DB.prepare(
     `SELECT b.id, b.trigger_type, b.summary, b.record_count, b.size_bytes, b.status, b.error, b.created_at, u.full_name created_by_name
-       FROM system_backups b LEFT JOIN users u ON u.id=b.created_by
+       FROM system_backups b LEFT JOIN users u ON CAST(u.id AS TEXT)=b.created_by
       ORDER BY b.id DESC LIMIT 100`
   ).all()
   return c.json({ backups: results || [], interval_hours: AUTO_BACKUP_INTERVAL_MS / 3600000 })
@@ -3111,7 +3117,7 @@ app.post('/api/backups/run-auto', async (c) => {
     return c.json({ ok: true, ...r })
   }
   const sessionToken = getCookie(c, 'session')
-  const sess = sessionToken ? await c.env.DB.prepare(`SELECT u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND s.expires_at > ?`).bind(sessionToken, Date.now()).first<any>() : null
+  const sess = sessionToken ? await c.env.DB.prepare(`SELECT u.role FROM sessions s JOIN users u ON CAST(u.id AS TEXT)=s.user_id WHERE s.token=? AND s.expires_at > ?`).bind(sessionToken, Date.now()).first<any>() : null
   if (!sess || !['admin', 'super_admin'].includes(sess.role)) return c.json({ error: 'Unauthorized' }, 401)
   const r = await maybeAutoBackup(c)
   return c.json({ ok: true, ...r })
@@ -3206,7 +3212,7 @@ app.post('/api/imports', requireAuth, requireRole('admin', 'super_admin'), async
 
 app.get('/api/imports', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const { results } = await c.env.DB.prepare(
-    `SELECT b.*, u.full_name created_by_name FROM import_batches b LEFT JOIN users u ON u.id=b.created_by ORDER BY b.id DESC LIMIT 100`
+    `SELECT b.*, u.full_name created_by_name FROM import_batches b LEFT JOIN users u ON CAST(u.id AS TEXT)=b.created_by ORDER BY b.id DESC LIMIT 100`
   ).all()
   return c.json({ batches: results || [] })
 })
@@ -3328,7 +3334,7 @@ const EXPORT_DATASETS: Record<string, { label: string; sql: string; cols: string
   },
   customers: {
     label: 'Customers / Farmers',
-    sql: `SELECT cu.id, cu.full_name, cu.mobile, cu.county, cu.value_chain, cu.kyc_status, cu.risk_band, cu.credit_score, u.full_name agent FROM customers cu LEFT JOIN users u ON u.id=cu.agent_id`,
+    sql: `SELECT cu.id, cu.full_name, cu.mobile, cu.county, cu.value_chain, cu.kyc_status, cu.risk_band, cu.credit_score, u.full_name agent FROM customers cu LEFT JOIN users u ON CAST(u.id AS TEXT)=cu.agent_id`,
     cols: ['id', 'full_name', 'mobile', 'county', 'value_chain', 'kyc_status', 'risk_band', 'credit_score', 'agent'],
     filterable: { kyc_status: 'cu.kyc_status', risk_band: 'cu.risk_band', county: 'cu.county' }
   },
@@ -3364,7 +3370,7 @@ const EXPORT_DATASETS: Record<string, { label: string; sql: string; cols: string
   },
   audit_logs: {
     label: 'Audit Log',
-    sql: `SELECT a.id, u.full_name actor, a.action, a.entity, a.detail, a.created_at FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id`,
+    sql: `SELECT a.id, u.full_name actor, a.action, a.entity, a.detail, a.created_at FROM audit_logs a LEFT JOIN users u ON CAST(u.id AS TEXT)=a.user_id`,
     cols: ['id', 'actor', 'action', 'entity', 'detail', 'created_at'],
     filterable: { action: 'a.action', entity: 'a.entity' }
   }
@@ -3461,21 +3467,21 @@ app.post('/api/export/email', requireAuth, requireRole('admin', 'super_admin'), 
 
 // Ensure a user has a wallet row; returns the wallet id. Created under admin
 // context so it works regardless of the caller's ownership scope.
-async function ensureWallet(c: any, userId: number, assignedBy: number | null = null): Promise<number> {
+async function ensureWallet(c: any, userId: string | number, assignedBy: string | number | null = null): Promise<number> {
   return await withAdminContext(c, async () => {
-    const existing = await c.env.DB.prepare(`SELECT id FROM wallets WHERE user_id=?`).bind(userId).first<any>()
+    const existing = await c.env.DB.prepare(`SELECT id FROM wallets WHERE user_id=?`).bind(String(userId)).first<any>()
     if (existing) return Number(existing.id)
-    const r = await c.env.DB.prepare(`INSERT INTO wallets (user_id, assigned_by) VALUES (?,?)`).bind(userId, assignedBy).run()
+    const r = await c.env.DB.prepare(`INSERT INTO wallets (user_id, assigned_by) VALUES (?,?)`).bind(String(userId), assignedBy == null ? null : String(assignedBy)).run()
     return Number(r.meta.last_row_id)
   })
 }
 // Post a ledger entry (the ONLY sanctioned way a balance changes). The DB
 // trigger stamps balance_after and syncs wallets.balance atomically.
-async function postLedger(c: any, opts: { userId: number; walletId: number; type: 'credit' | 'debit'; amount: number; category: string; reference?: string | null; description?: string | null; createdBy?: number | null }) {
+async function postLedger(c: any, opts: { userId: string | number; walletId: number; type: 'credit' | 'debit'; amount: number; category: string; reference?: string | null; description?: string | null; createdBy?: string | number | null }) {
   return await c.env.DB.prepare(
     `INSERT INTO wallet_ledger (wallet_id, user_id, entry_type, amount, balance_after, category, reference, description, created_by)
      VALUES (?,?,?,?, 0, ?,?,?,?)`
-  ).bind(opts.walletId, opts.userId, opts.type, roundMoney(opts.amount), opts.category, opts.reference ?? null, opts.description ?? null, opts.createdBy ?? null).run()
+  ).bind(opts.walletId, String(opts.userId), opts.type, roundMoney(opts.amount), opts.category, opts.reference ?? null, opts.description ?? null, opts.createdBy == null ? null : String(opts.createdBy)).run()
 }
 
 // GET my wallet + ledger statement (RLS scopes agents to their own).
@@ -3495,7 +3501,7 @@ app.get('/api/wallets', requireAuth, requirePermission('manage_wallets'), async 
     const { results } = await c.env.DB.prepare(
       `SELECT w.*, u.full_name, u.phone, u.role,
               (SELECT COUNT(*) FROM earning_rules er WHERE er.user_id=w.user_id AND er.is_active=1) AS rule_count
-         FROM wallets w JOIN users u ON u.id = w.user_id ORDER BY u.full_name`
+         FROM wallets w JOIN users u ON CAST(u.id AS TEXT) = w.user_id ORDER BY u.full_name`
     ).all()
     return results
   })
@@ -3505,7 +3511,7 @@ app.get('/api/wallets', requireAuth, requirePermission('manage_wallets'), async 
 app.post('/api/wallets', requireAuth, requirePermission('manage_wallets'), async (c) => {
   const admin = c.get('user') as SessionUser
   const b = await c.req.json()
-  const userId = Number(b.user_id)
+  const userId = String(b.user_id ?? '').trim()
   if (!userId) return c.json({ error: 'user_id is required' }, 400)
   const walletId = await ensureWallet(c, userId, admin.id)
   await audit(c, admin.id, 'assign', 'wallet', `wallet for user ${userId}`)
@@ -3524,7 +3530,7 @@ app.get('/api/earning-rules/:userId', requireAuth, requirePermission('manage_wal
 app.post('/api/earning-rules', requireAuth, requirePermission('manage_wallets'), async (c) => {
   const admin = c.get('user') as SessionUser
   const b = await c.req.json()
-  const userId = Number(b.user_id)
+  const userId = String(b.user_id ?? '').trim()
   const ruleType = String(b.rule_type || '').trim()
   if (!userId || !ruleType) return c.json({ error: 'user_id and rule_type are required' }, 400)
   const calcMethod = b.calc_method === 'percentage' ? 'percentage' : 'fixed'
@@ -3586,14 +3592,14 @@ app.post('/api/wallet/payouts', requireAuth, requirePermission('manage_wallets')
   if (amount <= 0) return c.json({ error: 'amount must be > 0' }, 400)
   const batchRef = ref('PAY')
   const result = await withAdminContext(c, async () => {
-    let recipients: number[] = []
+    let recipients: string[] = []
     if (Array.isArray(b.user_ids) && b.user_ids.length) {
-      recipients = b.user_ids.map((x: any) => Number(x)).filter(Boolean)
+      recipients = b.user_ids.map((x: any) => String(x ?? '').trim()).filter(Boolean)
     } else if (b.user_id) {
-      recipients = [Number(b.user_id)]
+      recipients = [String(b.user_id).trim()]
     } else if (b.target === 'all_agents') {
       const { results } = await c.env.DB.prepare(`SELECT id FROM users WHERE role='agent' AND status='active'`).all()
-      recipients = (results as any[]).map((r) => Number(r.id))
+      recipients = (results as any[]).map((r) => String(r.id)).filter(Boolean)
     }
     if (!recipients.length) return { error: 'No recipients resolved' }
     let total = 0, count = 0
@@ -3753,7 +3759,7 @@ app.post('/api/wallet/direct-pay', requireAuth, requirePermission('manage_wallet
 
   if (destination === 'wallet') {
     // Credit an internal user's wallet directly.
-    const recipientId = Number(b.user_id)
+    const recipientId = String(b.user_id ?? '').trim()
     if (!recipientId) return c.json({ error: 'user_id is required for a wallet payment' }, 400)
     const result = await withAdminContext(c, async () => {
       const walletId = await ensureWallet(c, recipientId, admin.id)
@@ -3779,7 +3785,7 @@ app.post('/api/wallet/direct-pay', requireAuth, requirePermission('manage_wallet
   await c.env.DB.prepare(
     `INSERT INTO wallet_withdrawals (reference, flow, user_id, recipient_user_id, amount, currency, channel_code, channel_name, receiver_number, recipient_name, reason, status, ledger_debited, created_by)
      VALUES (?, 'direct_pay', ?,?,?, 'KES', ?,?,?,?,?, 'processing', 0, ?)`
-  ).bind(reference, admin.id, b.user_id ? Number(b.user_id) : null, amount, channelCode, chan.name, receiver, b.account_name || null, b.reason || 'Direct payment', admin.id).run()
+  ).bind(reference, admin.id, b.user_id ? String(b.user_id).trim() : null, amount, channelCode, chan.name, receiver, b.account_name || null, b.reason || 'Direct payment', admin.id).run()
 
   const payout = await sasapayB2C(c.env, { amount, receiverNumber: receiver, channel: channelCode, reason: b.reason || 'Direct payment', reference })
   if (!payout.success) {
