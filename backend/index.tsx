@@ -2742,11 +2742,20 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first<any>()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
   const provided = b.password && String(b.password).length >= 4
-  // Multi-user onboarding: verify the new staff member's phone via OTP unless an
-  // explicit password was supplied, then issue a temporary password.
-  if (!provided) {
+  // Admin-driven onboarding. The creating admin is already authenticated and
+  // authorized (requireRole admin/super_admin), so we do NOT gate account
+  // creation behind a phone OTP — that regressed the legacy "Create User" flow
+  // into a "No active code. Request a new one." dead-end whenever the admin
+  // left the (optional) password blank. Behaviour:
+  //   • password supplied  → use it (account is immediately usable).
+  //   • password blank      → auto-generate a TEMPORARY password and SMS it to
+  //     the new user (they must change it on first login).
+  // An OTP is only consumed when the caller explicitly supplies one (kept for
+  // backward compatibility with any self-service onboarding UI); a missing or
+  // absent OTP never blocks an admin create.
+  if (!provided && b.otp_code) {
     const v = await verifyOtp(c, p, String(b.otp_code || ''), 'onboard')
-    if (!v.ok) return c.json({ error: v.error || 'Phone verification required', otp_required: true }, 400)
+    if (!v.ok) return c.json({ error: v.error || 'Phone verification failed', otp_required: true }, 400)
   }
   const pwd = provided ? String(b.password) : genPassword()
   const perms = await permissionsForRole(c, String(b.role), b.permissions || {})

@@ -9,13 +9,33 @@
 -- =====================================================================
 
 -- --- Demo account phone numbers (kept in sync with seed.sql) -----------
-UPDATE users SET phone = '+254702875711' WHERE id = 1 AND role = 'super_admin';
-UPDATE users SET phone = '+254729436383' WHERE id = 2 AND role = 'agent';
-UPDATE users SET phone = '+254716401463' WHERE id = 3 AND role = 'customer';
-UPDATE users SET phone = '+254712612489' WHERE id = 4 AND role = 'support';
+-- These originally matched on the integer seed ids (WHERE id = 1..4). On the
+-- shared central DB, users.id is a UUID, so `id = 1` raises
+-- `operator does not exist: uuid = integer` (42883). We therefore guard the
+-- integer-id UPDATEs behind a data-type check and ONLY run them when users.id
+-- is actually an integer type (Equipment's own standalone schema). On a UUID
+-- users table the demo phones are seeded by 0027 / normal onboarding instead,
+-- so skipping here is correct and lossless.
+DO $$
+DECLARE id_type text;
+BEGIN
+  SELECT data_type INTO id_type
+    FROM information_schema.columns
+   WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'id';
+
+  IF id_type IN ('integer', 'bigint', 'smallint') THEN
+    UPDATE users SET phone = '+254702875711' WHERE id = 1 AND role = 'super_admin';
+    UPDATE users SET phone = '+254729436383' WHERE id = 2 AND role = 'agent';
+    UPDATE users SET phone = '+254716401463' WHERE id = 3 AND role = 'customer';
+    UPDATE users SET phone = '+254712612489' WHERE id = 4 AND role = 'support';
+  END IF;
+END $$;
 
 -- Keep the linked customer record's mobile aligned with the farmer login.
-UPDATE customers SET mobile = '+254716401463' WHERE user_id = 3;
+-- customers.user_id was widened to TEXT (migration 0025) so it can hold an
+-- integer-as-string or a UUID. Match it as text to stay type-safe on both DB
+-- shapes (this is a no-op when no such row exists).
+UPDATE customers SET mobile = '+254716401463' WHERE CAST(user_id AS TEXT) = '3';
 
 -- --- KYC gating marker -------------------------------------------------
 -- Set once a customer completes ID upload + liveliness + TransUnion. Used to

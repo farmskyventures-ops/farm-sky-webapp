@@ -139,6 +139,30 @@ On startup the Node server runs every `migrations/*.sql` through
 `backend/db-init.ts` (SQLite dialect → PostgreSQL, idempotent). Notes for
 production databases that were created by an **older schema**:
 
+- **`0014_demo_accounts_kyc_uniqueness.sql` — UUID/INTEGER fix.** On the shared
+  central database the `users.id` (and `customers.user_id`) columns are **UUID**,
+  so the original migration's integer-id UPDATEs
+  (`UPDATE users … WHERE id = 1`, `UPDATE customers … WHERE user_id = 3`) failed
+  with `operator does not exist: uuid = integer` (SQLSTATE `42883`) /
+  `invalid input syntax for type integer` (`22P02`). The demo-phone backfill is
+  now wrapped in a `DO $$ … $$` guard that inspects `users.id`'s data type and
+  only runs the integer-keyed UPDATEs when the column is actually an integer
+  type; the customer match casts to text (`CAST(user_id AS TEXT) = '3'`). Verified
+  on a fresh UUID database: **0** `42883`/`22P02` errors, 0 skipped statements.
+
+### User Management (Admin) fixes
+- **Edit User button** now works on UUID-keyed databases. The Users-list row
+  actions previously interpolated the id **without quotes**
+  (`onclick="editUserModal(${u.id})"`), which produced invalid JS for a UUID
+  string; they now quote + stringify (`editUserModal('${esc(String(u.id))}')`),
+  and the finder loose-compares `String(x.id) === String(id)`.
+- **"No Active Code, Request a New One" on Create User** is fixed. `POST /api/users`
+  previously **always** required a phone OTP when no password was supplied, so a
+  blank-password create always failed (no onboard OTP is ever requested). It now
+  only verifies an OTP when `otp_code` is explicitly provided; otherwise the
+  admin-authenticated create **auto-generates a temporary password** (SMS'd).
+  The Add-User (`nu_pwd`) and Edit-User (`eu_pwd`) password fields are present.
+
 - **`0007_widen_epoch_columns.sql` is self-healing.** `expires_at` on
   `sessions` / `otp_codes` is stored as an epoch-millisecond **BIGINT**. If a
   legacy database created those columns as `TIMESTAMP`/`TIMESTAMPTZ`, a direct

@@ -2788,10 +2788,10 @@ async function viewUsers() {
         <td class="px-4 py-3 text-xs text-slate-500">${esc(permsText(u.permissions || {})) || '—'}</td>
         <td class="px-4 py-3">${badge(u.status)}</td>
         <td class="px-4 py-3 whitespace-nowrap text-right">
-          <button onclick="editUserModal(${u.id})" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>
-          <button onclick="resetUserPassword(${u.id},'${esc(u.full_name)}')" class="text-blue-600 hover:underline text-xs mr-2">Reset Password</button>
-          ${u.status === 'active' ? `<button onclick="setUserStatus(${u.id},'suspended','users','${esc(u.full_name)}')" class="text-amber-600 hover:underline text-xs mr-2">Deactivate</button>` : `<button onclick="setUserStatus(${u.id},'active','users','${esc(u.full_name)}')" class="text-emerald-600 hover:underline text-xs mr-2">Activate</button>`}
-          <button onclick="deleteUser(${u.id},'${esc(u.full_name)}','users')" class="text-red-600 hover:underline text-xs">Delete</button>
+          <button onclick="editUserModal('${esc(String(u.id))}')" class="text-teal-600 hover:underline text-xs mr-2">Edit</button>
+          <button onclick="resetUserPassword('${esc(String(u.id))}','${esc(u.full_name)}')" class="text-blue-600 hover:underline text-xs mr-2">Reset Password</button>
+          ${u.status === 'active' ? `<button onclick="setUserStatus('${esc(String(u.id))}','suspended','users','${esc(u.full_name)}')" class="text-amber-600 hover:underline text-xs mr-2">Deactivate</button>` : `<button onclick="setUserStatus('${esc(String(u.id))}','active','users','${esc(u.full_name)}')" class="text-emerald-600 hover:underline text-xs mr-2">Activate</button>`}
+          <button onclick="deleteUser('${esc(String(u.id))}','${esc(u.full_name)}','users')" class="text-red-600 hover:underline text-xs">Delete</button>
         </td></tr>`).join('')}</tbody>
     </table></div>`
 }
@@ -3033,7 +3033,10 @@ window.doAddUser = async () => {
 }
 window.editUserModal = async (id) => {
   await ensurePermissionMeta()
-  const u = _users.find(x => x.id === id)
+  // id arrives as a string (UUID or integer-as-string). Compare loosely so it
+  // matches whether _users carries numeric (Equipment) or UUID (shared DB) ids.
+  const u = _users.find(x => String(x.id) === String(id))
+  if (!u) { toast('User not found', false); return }
   const allowCustomPerms = state.user.role === 'super_admin'
   showModal(`<h3 class="font-bold mb-3">Edit User</h3><div class="space-y-3 text-sm">
     <input id="eu_name" value="${esc(u.full_name)}" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
@@ -3045,7 +3048,7 @@ window.editUserModal = async (id) => {
     <div><div class="field-label">Permission check-boxes</div><div id="eu_perm_box" class="responsive-grid cols-2">${permissionChecklist('eu_perm', u.permissions || {}, !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Update the assigned permission check-boxes, then confirm to save.' : 'Only Super Admin can customize the permission check-boxes.'}</div></div>
     ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control (login window)</div>${scheduleEditor('eu', { schedule_enabled: u.schedule_enabled, access_days: u.access_days, access_start: u.access_start, access_end: u.access_end }, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
     <input id="eu_pwd" placeholder="New password (leave blank to keep)" class="w-full px-3 py-2 border rounded-lg">
-  </div><div class="flex gap-2 mt-4"><button onclick="doEditUser(${id})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
+  </div><div class="flex gap-2 mt-4"><button onclick="doEditUser('${esc(String(id))}')" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
   $('eu_role').onchange = () => refreshPermissionChecklist('eu_perm', 'eu_role', !allowCustomPerms)
 }
 window.doEditUser = async (id) => {
