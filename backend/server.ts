@@ -85,7 +85,12 @@ const ENV = {
   CROSS_APP_HMAC_SECRET: process.env.CROSS_APP_HMAC_SECRET,
   AUTH_HASH_ITERATIONS: process.env.AUTH_HASH_ITERATIONS,
   AUTH_HASH_KEYLEN: process.env.AUTH_HASH_KEYLEN,
-  AUTH_PEPPER: process.env.AUTH_PEPPER
+  AUTH_PEPPER: process.env.AUTH_PEPPER,
+  // Optional explicit default tenant for user rows created outside an admin
+  // session (public self-signup / bulk import). Built explicitly here because
+  // the Node server constructs ENV by hand — otherwise undefined at runtime.
+  EQUIPMENT_ORG_ID: process.env.EQUIPMENT_ORG_ID,
+  DEFAULT_ORG_ID: process.env.DEFAULT_ORG_ID
 }
 
 const root = new Hono()

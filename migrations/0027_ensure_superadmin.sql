@@ -39,9 +39,46 @@ UPDATE users
 --    Column list is explicit so the id default (serial/uuid) fills the PK.
 --    Super-Admin capability comes from role (hasPermission() short-circuits to
 --    true for super_admin/admin), so permissions is just '{}' (role defaults).
-INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label, permissions)
-SELECT 'System Administrator', '254702875711', 'admin@farmsky.africa', '1224',
-       'super_admin', 'active', 'HQ - Nairobi', 1, 'Super Admin', '{}'
-WHERE NOT EXISTS (
-  SELECT 1 FROM users WHERE phone = '254702875711'
-);
+--
+--    org_id HANDLING: on the shared central DB, `public.users` carries a
+--    `org_id UUID NOT NULL` column (created by the Score platform). Omitting it
+--    throws 23502 and the whole INSERT is skipped, so the Super-Admin was never
+--    created there. This DO-block detects the column and, when present, supplies
+--    a tenant (the most-populated existing org, else the oldest organizations
+--    row). On the Equipment-only shape (no org_id column) it runs the plain
+--    INSERT. Idempotent & id-type-agnostic.
+DO $$
+DECLARE
+  has_org  BOOLEAN;
+  v_org    UUID;
+BEGIN
+  IF EXISTS (SELECT 1 FROM users WHERE phone = '254702875711') THEN
+    RETURN;
+  END IF;
+
+  SELECT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_name = 'users' AND column_name = 'org_id'
+  ) INTO has_org;
+
+  IF has_org THEN
+    -- Prefer the most-populated existing tenant, else the oldest organization.
+    SELECT org_id INTO v_org
+      FROM users WHERE org_id IS NOT NULL
+      GROUP BY org_id ORDER BY COUNT(*) DESC LIMIT 1;
+    IF v_org IS NULL THEN
+      SELECT id INTO v_org FROM organizations ORDER BY created_at ASC LIMIT 1;
+    END IF;
+
+    -- Only insert when we actually have a tenant to attach (NOT NULL constraint).
+    IF v_org IS NOT NULL THEN
+      INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label, permissions, org_id)
+      VALUES ('System Administrator', '254702875711', 'admin@farmsky.africa', '1224',
+              'super_admin', 'active', 'HQ - Nairobi', 1, 'Super Admin', '{}', v_org);
+    END IF;
+  ELSE
+    INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label, permissions)
+    VALUES ('System Administrator', '254702875711', 'admin@farmsky.africa', '1224',
+            'super_admin', 'active', 'HQ - Nairobi', 1, 'Super Admin', '{}');
+  END IF;
+END $$;

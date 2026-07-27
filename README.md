@@ -162,6 +162,25 @@ production databases that were created by an **older schema**:
   only verifies an OTP when `otp_code` is explicitly provided; otherwise the
   admin-authenticated create **auto-generates a temporary password** (SMS'd).
   The Add-User (`nu_pwd`) and Edit-User (`eu_pwd`) password fields are present.
+- **`null value in column "org_id" of relation "users"` on Create User is fixed.**
+  On the shared central `farmsky_central_db`, the Score platform owns
+  `public.users` and declares `org_id UUID NOT NULL`. Equipment never populated
+  it, so **every** user INSERT (admin create, agent create, public self-signup,
+  bulk import, and the `0027` super-admin bootstrap) failed with `23502`. Each
+  insert path now supplies a tenant:
+  - **Admin-created** users (`POST /api/users`, `POST /api/agents`, bulk import)
+    inherit the **creating admin's `org_id`** (loaded onto the session in
+    `getSessionUser`, re-read from the DB if the session predates it).
+  - **Public self-signup** (`/api/signup/verify`) and any creator lacking an org
+    fall back to a resolved **default tenant**: `EQUIPMENT_ORG_ID` /
+    `DEFAULT_ORG_ID` env → the most-populated existing `org_id` → the oldest
+    `organizations` row.
+  - Migration **`0027`** now inserts the super-admin with a `DO $$` block that
+    detects the `org_id` column and attaches the same default tenant.
+  - Every insert is **shape-aware**: the `org_id` column is only referenced when
+    it actually exists (`usersHasOrgId()` probe), so the Equipment-only SQLite/D1
+    dev DB (no `org_id`) still works. Verified end-to-end on a reproduced central
+    shape: all 5 creation paths populate `org_id`, **0** `23502` errors.
 
 - **`0007_widen_epoch_columns.sql` is self-healing.** `expires_at` on
   `sessions` / `otp_codes` is stored as an epoch-millisecond **BIGINT**. If a

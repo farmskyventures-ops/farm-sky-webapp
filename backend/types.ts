@@ -24,6 +24,11 @@ export type Bindings = MpesaEnv & SmsEnv & EmailEnv & SasaPayEnv & BuniEnv & {
   AUTH_HASH_ITERATIONS?: string
   AUTH_HASH_KEYLEN?: string
   AUTH_PEPPER?: string
+  // Optional explicit default tenant for user rows created outside an admin
+  // session (public self-signup / bulk import). Falls back to the most-populated
+  // existing org, then the oldest organizations row, when unset.
+  EQUIPMENT_ORG_ID?: string
+  DEFAULT_ORG_ID?: string
 }
 
 export type SessionUser = {
@@ -36,4 +41,9 @@ export type SessionUser = {
   region?: string
   label?: string
   permissions?: Record<string, boolean>
+  // Tenant scope. The central `farmsky_central_db` (shared with Score) defines
+  // `users.org_id UUID NOT NULL`. Equipment must propagate the creating admin's
+  // org_id onto any user it inserts. `null` on Equipment-only DB shapes (SQLite/
+  // D1 dev) that predate the multitenant column.
+  org_id?: string | null
 }
