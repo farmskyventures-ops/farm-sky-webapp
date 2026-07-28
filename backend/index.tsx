@@ -671,6 +671,58 @@ function genPassword(): string {
   return String(Math.floor(1000 + Math.random() * 9000))
 }
 
+// Roles for which an email address is MANDATORY. Everyone else (agent, customer,
+// partner, investor, operations_finance, …) may be onboarded without one.
+const EMAIL_REQUIRED_ROLES = ['super_admin', 'admin', 'lender']
+function emailIsRequired(role: string): boolean {
+  return EMAIL_REQUIRED_ROLES.includes(String(role || '').toLowerCase())
+}
+
+// Local domain used for synthetic placeholder emails. These are NOT deliverable
+// addresses — they exist purely to satisfy the central schema. Anything using
+// `email` for real delivery must treat an @PLACEHOLDER_EMAIL_DOMAIN address as
+// "no email on file".
+const PLACEHOLDER_EMAIL_DOMAIN = 'no-email.farmsky.local'
+function isPlaceholderEmail(email: any): boolean {
+  return String(email || '').toLowerCase().endsWith('@' + PLACEHOLDER_EMAIL_DOMAIN)
+}
+
+// Resolve the value bound to the central `users.email` column. On the shared
+// farmsky_central_db this column is BOTH `NOT NULL` and `UNIQUE`, so we cannot
+// bind NULL and we cannot reuse a shared sentinel like '' across users (the 2nd
+// such insert hits users_email_key → 23505). Behaviour:
+//   • email supplied             → trimmed, lower-cased value.
+//   • email blank, role needs it → { error } so the caller can 400.
+//   • email blank, role optional → a UNIQUE, non-deliverable placeholder derived
+//     from the phone (or a random UUID) so NOT NULL + UNIQUE are both satisfied.
+//     `isPlaceholderEmail()` lets the rest of the app treat it as "no email".
+function resolveEmail(role: string, rawEmail: any, phone?: any): { value: string } | { error: string } {
+  const email = String(rawEmail ?? '').trim()
+  if (email) return { value: email.toLowerCase() }
+  if (emailIsRequired(role)) {
+    return { error: `An email address is required for ${String(role).replace(/_/g, ' ')} accounts.` }
+  }
+  const key = String(phone ?? '').replace(/[^a-z0-9]/gi, '').toLowerCase() || (crypto.randomUUID().replace(/-/g, ''))
+  return { value: `no-email+${key}@${PLACEHOLDER_EMAIL_DOMAIN}` }
+}
+
+// Re-authenticate the CURRENT session user by password. Used to gate sensitive
+// data-egress actions (system-backup download + platform data export) so a
+// walked-away session cannot be used to exfiltrate the whole database. Reads the
+// caller's own stored password hash and verifies the supplied plaintext.
+// Returns { ok:true } on success, or { ok:false, error } to be surfaced as 401/400.
+async function verifyReauth(c: any, password: any): Promise<{ ok: true } | { ok: false; error: string; status: number }> {
+  const pw = String(password ?? '')
+  if (!pw) return { ok: false, error: 'Enter your password to confirm this download.', status: 400 }
+  const user = c.get('user') as SessionUser
+  if (!user) return { ok: false, error: 'Not authenticated.', status: 401 }
+  const row = await c.env.DB.prepare(`SELECT password FROM users WHERE CAST(id AS TEXT) = ?`).bind(String(user.id)).first<any>()
+  if (!row) return { ok: false, error: 'Account not found.', status: 401 }
+  const check = await verifyPassword(pw, row.password)
+  if (!check.ok) return { ok: false, error: 'Incorrect password. Please try again.', status: 401 }
+  return { ok: true }
+}
+
 // A secure, random TEMPORARY password for the multi-user onboarding flow.
 // Mixed-case + digits, avoids ambiguous characters (0/O, 1/l/I).
 function genTempPassword(len = 10): string {
@@ -959,17 +1011,23 @@ app.post('/api/signup/verify', async (c) => {
   if (idClash) return c.json({ error: 'An account with this National ID already exists.' }, 409)
   const role = 'customer'
   const farmerPerms = await permissionsForRole(c, role)
+  // Customers never provide an email at signup — resolveEmail supplies a UNIQUE,
+  // non-deliverable placeholder derived from the phone. This satisfies the
+  // central users.email NOT NULL + UNIQUE constraints (binding '' collided on
+  // the 2nd signup → users_email_key / 23505).
+  const signupEmailRes = resolveEmail(role, null, p)
+  const signupEmail = 'value' in signupEmailRes ? signupEmailRes.value : ''
   // Public self-signup has no creating admin — assign the deployment's default
   // tenant so the central NOT NULL users.org_id constraint is satisfied.
   const orgId = await resolveDefaultOrgId(c)
   const withOrg = await usersHasOrgId(c) && orgId != null
   const r = withOrg
     ? await c.env.DB.prepare(
-        `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions, org_id) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?, ?)`
-      ).bind(name, p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms), orgId).run()
+        `INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label, permissions, org_id) VALUES (?,?,?,?, ?, 'active', ?, 1, ?, ?, ?)`
+      ).bind(name, p, signupEmail, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms), orgId).run()
     : await c.env.DB.prepare(
-        `INSERT INTO users (full_name, phone, password, role, status, region, password_set, label, permissions) VALUES (?,?,?, ?, 'active', ?, 1, ?, ?)`
-      ).bind(name, p, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
+        `INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label, permissions) VALUES (?,?,?,?, ?, 'active', ?, 1, ?, ?)`
+      ).bind(name, p, signupEmail, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
   const userId = r.meta.last_row_id
   await c.env.DB.prepare(
     `INSERT INTO customers (user_id, full_name, national_id, mobile, kyc_status) VALUES (?,?,?,?, 'pending')`
@@ -2725,7 +2783,7 @@ app.get('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async (
      FROM users u WHERE u.role='agent'`
   ).all()
   const agentFallback = await loadRoleTemplate(c, 'agent')
-  return c.json({ agents: results.map((a: any) => ({ ...a, permissions: parsePermissions(a.permissions, 'agent', agentFallback) })) })
+  return c.json({ agents: results.map((a: any) => ({ ...a, email: isPlaceholderEmail(a.email) ? '' : a.email, permissions: parsePermissions(a.permissions, 'agent', agentFallback) })) })
 })
 // Multi-user onboarding: request an OTP to verify a new user's phone before
 // creating their account (parity).
@@ -2757,11 +2815,17 @@ app.post('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async 
   const perms = await permissionsForRole(c, 'agent', b.permissions || {})
   const creator = c.get('user') as SessionUser
   const creatorId = creator.id
+  // Email is optional for agents. resolveEmail supplies a unique, non-deliverable
+  // placeholder (derived from phone) when blank, satisfying the central
+  // users.email NOT NULL + UNIQUE constraints (was 23502 on null, 23505 on '').
+  const emailRes = resolveEmail('agent', b.email, b.phone)
+  if ('error' in emailRes) return c.json({ error: emailRes.error }, 400)
+  const email = emailRes.value
   const orgId = (await resolveCreatorOrgId(c, creator)) ?? (await resolveDefaultOrgId(c))
   const withOrg = await usersHasOrgId(c) && orgId != null
   const r = withOrg
-    ? await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by,org_id) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId, orgId).run()
-    : await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId).run()
+    ? await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by,org_id) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?, ?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId, orgId).run()
+    : await c.env.DB.prepare(`INSERT INTO users (full_name,phone,email,password,role,region,password_set,label,permissions,created_by) VALUES (?,?,?,?, 'agent', ?, ?, ?, ?, ?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.region || null, provided, b.label || 'Agent', JSON.stringify(perms), creatorId).run()
   await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
   await audit(c, creatorId, 'create', 'agent', b.full_name)
   if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
@@ -2805,7 +2869,12 @@ app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), asy
   const id = c.req.param('id')
   const b = await c.req.json()
   const perms = await permissionsForRole(c, 'agent', b.permissions || {})
-  await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, region=?, label=?, permissions=? WHERE id=? AND role='agent'`).bind(b.full_name, b.phone, b.email, b.region, b.label || 'Agent', JSON.stringify(perms), id).run()
+  // Agents don't require email — resolveEmail supplies a unique placeholder when
+  // blank (central users.email is NOT NULL + UNIQUE).
+  const emailRes = resolveEmail('agent', b.email, b.phone)
+  if ('error' in emailRes) return c.json({ error: emailRes.error }, 400)
+  const email = emailRes.value
+  await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, region=?, label=?, permissions=? WHERE id=? AND role='agent'`).bind(b.full_name, b.phone, email, b.region, b.label || 'Agent', JSON.stringify(perms), id).run()
   await c.env.DB.prepare(`UPDATE agents SET region=?, permissions=? WHERE user_id=?`).bind(b.region, JSON.stringify(perms), id).run()
   await audit(c, c.get('user').id, 'update', 'agent', b.full_name)
   return c.json({ ok: true })
@@ -2819,7 +2888,7 @@ app.get('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c
   const usersWithPerms = [] as any[]
   for (const u of results as any[]) {
     const fallback = await loadRoleTemplate(c, u.role)
-    usersWithPerms.push({ ...u, permissions: parsePermissions(u.permissions, u.role, fallback), access_days: safeJson(u.access_days, []) })
+    usersWithPerms.push({ ...u, email: isPlaceholderEmail(u.email) ? '' : u.email, permissions: parsePermissions(u.permissions, u.role, fallback), access_days: safeJson(u.access_days, []) })
   }
   return c.json({ users: usersWithPerms })
 })
@@ -2851,6 +2920,12 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const label = b.label || templateRow?.label || (String(b.role) === 'operations_finance' ? 'Operations & Finance' : String(b.role).replace(/_/g, ' '))
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
+  // Email is mandatory ONLY for super_admin/admin/lender; any other role may be
+  // created without one. resolveEmail supplies a unique placeholder when blank so
+  // the central users.email NOT NULL + UNIQUE constraints hold (23502/23505).
+  const emailRes = resolveEmail(String(b.role), b.email, b.phone)
+  if ('error' in emailRes) return c.json({ error: emailRes.error }, 400)
+  const email = emailRes.value
   const creator = c.get('user') as SessionUser
   const creatorId = creator.id
   // Central farmsky_central_db enforces users.org_id NOT NULL. New accounts
@@ -2860,8 +2935,8 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const orgId = (await resolveCreatorOrgId(c, creator)) ?? (await resolveDefaultOrgId(c))
   const withOrg = await usersHasOrgId(c) && orgId != null
   const r = withOrg
-    ? await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by, org_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId, orgId).run()
-    : await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, b.email || null, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
+    ? await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by, org_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId, orgId).run()
+    : await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
   await audit(c, creatorId, 'create', 'user', `${b.full_name} (${b.role})`)
   if (provided) return c.json({ id: r.meta.last_row_id, password: pwd, password_was_set_by_admin: true })
@@ -2874,10 +2949,15 @@ app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), asyn
   const perms = await permissionsForRole(c, String(b.role), b.permissions || {})
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
+  // Same email policy on edit: required for super_admin/admin/lender; a unique
+  // placeholder otherwise so central users.email NOT NULL + UNIQUE both hold.
+  const emailRes = resolveEmail(String(b.role), b.email, b.phone)
+  if ('error' in emailRes) return c.json({ error: emailRes.error }, 400)
+  const email = emailRes.value
   if (b.password) {
-    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=?, password=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, await hashPassword(String(b.password)), id).run()
+    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=?, password=? WHERE id=?`).bind(b.full_name, b.phone, email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, await hashPassword(String(b.password)), id).run()
   } else {
-    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=? WHERE id=?`).bind(b.full_name, b.phone, b.email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, id).run()
+    await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=? WHERE id=?`).bind(b.full_name, b.phone, email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, id).run()
   }
   if (b.role === 'agent') {
     const exists = await c.env.DB.prepare(`SELECT user_id FROM agents WHERE user_id=?`).bind(id).first<any>()
@@ -3149,8 +3229,16 @@ app.post('/api/profile-amendments/:id/decision', requireAuth, async (c) => {
 // ============================================================================
 // AUTOMATED SYSTEM BACKUPS (parity)
 // ============================================================================
-const AUTO_BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000 // daily
+const AUTO_BACKUP_INTERVAL_MS = 6 * 60 * 60 * 1000 // every 6 hours
 const BACKUP_DATASETS = ['users', 'customers', 'agents', 'products', 'murabaha_contracts', 'repayments', 'transactions', 'audit_logs']
+
+// Resolve the recipient(s) for automated backup emails. Supports a comma/;-
+// separated list so ops can notify multiple mailboxes.
+function backupRecipients(env: any): string[] {
+  const raw = String(env?.BACKUP_EMAIL_TO || env?.BACKUP_NOTIFY_EMAIL || '').trim()
+  if (!raw) return []
+  return raw.split(/[,;\s]+/).map((s: string) => s.trim()).filter((s: string) => /.+@.+\..+/.test(s))
+}
 
 async function performBackup(c: any, triggerType: 'manual' | 'auto', createdBy: number | null) {
   const snapshot: Record<string, any[]> = {}
@@ -3169,7 +3257,48 @@ async function performBackup(c: any, triggerType: 'manual' | 'auto', createdBy: 
   const res = await c.env.DB.prepare(
     `INSERT INTO system_backups (trigger_type, summary, record_count, size_bytes, payload, status, created_by) VALUES (?,?,?,?,?, 'success', ?)`
   ).bind(triggerType, summary, total, payload.length, payload, createdBy).run()
-  return { backup_id: res.meta?.last_row_id, record_count: total, size_bytes: payload.length }
+  return { backup_id: res.meta?.last_row_id, record_count: total, size_bytes: payload.length, payload, summary, snapshot }
+}
+
+// Build the platform DATA EXPORT (all datasets) as a single CSV bundle. Each
+// dataset section is prefixed by a header line, so ops get one file covering
+// every table. Runs under admin context so RLS never hides rows.
+async function buildFullExportCsv(c: any): Promise<string> {
+  const parts: string[] = []
+  await withAdminContext(c, async () => {
+    for (const [key, def] of Object.entries(EXPORT_DATASETS)) {
+      try {
+        const { results } = await c.env.DB.prepare(def.sql + ' ORDER BY 1 DESC').all()
+        parts.push(`### ${def.label} (${key}) — ${(results || []).length} rows`)
+        parts.push(toCsv(def.cols, results || []))
+        parts.push('')
+      } catch (_) { /* skip dataset that failed */ }
+    }
+  })
+  return parts.join('\n')
+}
+
+// Email BOTH backups (system snapshot JSON + platform data export CSV) to the
+// configured recipient(s). Best-effort: returns whether it sent and why not.
+async function emailBackups(c: any, backup: { backup_id?: any; payload: string; summary: string }): Promise<{ sent: boolean; reason?: string; to?: string[] }> {
+  const to = backupRecipients(c.env)
+  if (!to.length) return { sent: false, reason: 'no_recipient' }
+  if (!emailConfigured(c.env)) return { sent: false, reason: 'email_not_configured' }
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+  let exportCsv = ''
+  try { exportCsv = await buildFullExportCsv(c) } catch (_) { exportCsv = '' }
+  const attachments = [
+    { filename: `farmsky-system-backup-${stamp}.json`, contentBase64: base64Utf8(backup.payload), contentType: 'application/json' }
+  ]
+  if (exportCsv) attachments.push({ filename: `farmsky-data-export-${stamp}.csv`, contentBase64: base64Utf8(exportCsv), contentType: 'text/csv' })
+  const r = await sendEmail(c.env, {
+    to: to.join(', '),
+    subject: `Farmsky automated backup — ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`,
+    text: `Automated 6-hourly Farmsky backup.\n\nSystem backup #${backup.backup_id || '?'}\nDatasets: ${backup.summary}\n\nTwo files are attached:\n  1) Full system backup (JSON snapshot of all tables)\n  2) Platform data export (CSV bundle of all datasets)\n\nThis email is generated automatically; do not reply.`,
+    attachments
+  })
+  if (!r.success) return { sent: false, reason: r.error || 'send_failed', to }
+  return { sent: true, to }
 }
 
 async function maybeAutoBackup(c: any) {
@@ -3179,8 +3308,11 @@ async function maybeAutoBackup(c: any) {
       const lastMs = new Date(last.created_at).getTime()
       if (!Number.isNaN(lastMs) && Date.now() - lastMs < AUTO_BACKUP_INTERVAL_MS) return { ran: false }
     }
-    await performBackup(c, 'auto', null)
-    return { ran: true }
+    const bk = await performBackup(c, 'auto', null)
+    // Automated delivery: email BOTH backups to the designated recipient(s).
+    let emailed: { sent: boolean; reason?: string; to?: string[] } = { sent: false, reason: 'no_recipient' }
+    try { emailed = await emailBackups(c, bk) } catch (e: any) { emailed = { sent: false, reason: e?.message || 'email_error' } }
+    return { ran: true, emailed }
   } catch (_) { return { ran: false } }
 }
 
@@ -3197,16 +3329,25 @@ app.get('/api/backups', requireAuth, requireRole('admin', 'super_admin'), async 
 app.post('/api/backups', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   try {
     const out = await performBackup(c, 'manual', c.get('user').id)
-    return c.json({ ok: true, ...out })
+    // Return ONLY metadata — never the snapshot/payload here. The full data
+    // (which contains password hashes) is downloadable only via the
+    // password-re-auth /download endpoint.
+    return c.json({ ok: true, backup_id: out.backup_id, record_count: out.record_count, size_bytes: out.size_bytes })
   } catch (e: any) {
     return c.json({ error: e?.message || 'Backup failed' }, 500)
   }
 })
 
-app.get('/api/backups/:id/download', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+// SENSITIVE — downloading a full system backup requires the admin/super-admin to
+// RE-ENTER their password (defence against a walked-away session exfiltrating the
+// whole DB). Delivered as POST so the password travels in the body, never a URL.
+app.post('/api/backups/:id/download', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const reauth = await verifyReauth(c, body?.password)
+  if (!reauth.ok) return c.json({ error: reauth.error, reauth_required: true }, reauth.status as any)
   const row = await c.env.DB.prepare(`SELECT id, payload, created_at FROM system_backups WHERE id=?`).bind(c.req.param('id')).first<any>()
   if (!row || !row.payload) return c.json({ error: 'Backup not found' }, 404)
-  await audit(c, c.get('user').id, 'backup_download', 'system', `backup #${row.id}`)
+  await audit(c, c.get('user').id, 'backup_download', 'system', `backup #${row.id} (password re-auth)`)
   return new Response(row.payload, {
     headers: {
       'Content-Type': 'application/json',
@@ -3214,11 +3355,23 @@ app.get('/api/backups/:id/download', requireAuth, requireRole('admin', 'super_ad
     }
   })
 })
+// Legacy GET is retired for security — always instruct the client to POST with a
+// password confirmation. Never returns backup data.
+app.get('/api/backups/:id/download', requireAuth, requireRole('admin', 'super_admin'), (c) => {
+  return c.json({ error: 'Password confirmation required. POST to this URL with { password } to download.', reauth_required: true }, 401)
+})
 
 app.post('/api/backups/run-auto', async (c) => {
   const token = c.req.header('x-admin-task-token') || ''
   const expected = (c.env as any).ADMIN_TASK_TOKEN
   if (expected && token === expected) {
+    const r = await maybeAutoBackup(c)
+    return c.json({ ok: true, ...r })
+  }
+  // In-process scheduler (Node server 6h timer). Authorized by a per-boot nonce
+  // injected into ENV that never leaves the process — external callers can't know it.
+  const internalNonce = (c.env as any).INTERNAL_SCHEDULER_NONCE
+  if (internalNonce && c.req.header('x-internal-scheduler') === internalNonce) {
     const r = await maybeAutoBackup(c)
     return c.json({ ok: true, ...r })
   }
@@ -3385,13 +3538,18 @@ app.post('/api/imports/:id/dispatch', requireAuth, requireRole('admin', 'super_a
     try {
       const perms = await permissionsForRole(c, roleForCategory === 'agent' ? 'agent' : roleForCategory === 'partner' ? 'partner' : 'customer', {})
       const placeholder = await hashPassword(genPassword())
+      // Bulk-import roles (agent/partner/customer) never require email; a unique
+      // placeholder (from phone) satisfies central users.email NOT NULL + UNIQUE.
+      const emailRes = resolveEmail(roleForCategory, row.email, phone)
+      if ('error' in emailRes) { skipped++; errors.push(`${row.full_name || phone}: ${emailRes.error}`); continue }
+      const email = emailRes.value
       const ur = withImportOrg && importOrgId != null
         ? await c.env.DB.prepare(
             `INSERT INTO users (full_name, phone, email, password, role, region, password_set, permissions, created_by, org_id) VALUES (?,?,?,?,?,?,0,?,?,?)`
-          ).bind(row.full_name, phone, row.email || null, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator, importOrgId).run()
+          ).bind(row.full_name, phone, email, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator, importOrgId).run()
         : await c.env.DB.prepare(
             `INSERT INTO users (full_name, phone, email, password, role, region, password_set, permissions, created_by) VALUES (?,?,?,?,?,?,0,?,?)`
-          ).bind(row.full_name, phone, row.email || null, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator).run()
+          ).bind(row.full_name, phone, email, placeholder, roleForCategory, row.region || row.county || null, JSON.stringify(perms), creator).run()
       const userId = ur.meta.last_row_id as number
       if (roleForCategory === 'customer') {
         await c.env.DB.prepare(
@@ -3511,7 +3669,10 @@ async function buildExport(c: any, dataset: string, filters: Record<string, stri
   sql += ` ORDER BY 1 DESC`
   const stmt = binds.length ? c.env.DB.prepare(sql).bind(...binds) : c.env.DB.prepare(sql)
   const { results } = await stmt.all()
-  return { label: def.label, cols: def.cols, rows: results || [] }
+  // Mask non-deliverable placeholder emails so exports never leak internal
+  // synthetic addresses (they mean "no email on file").
+  const rows = (results || []).map((r: any) => (r && 'email' in r && isPlaceholderEmail(r.email)) ? { ...r, email: '' } : r)
+  return { label: def.label, cols: def.cols, rows }
 }
 
 // base64 of a UTF-8 string, works in both Node and Workers runtimes.
@@ -3570,6 +3731,29 @@ app.post('/api/export/email', requireAuth, requireRole('admin', 'super_admin'), 
     if (!r.success) return c.json({ error: r.error || 'Email send failed' }, 502)
     await audit(c, c.get('user').id, 'export_email', dataset, `to ${to}`)
     return c.json({ ok: true, message: `Export emailed to ${to}` })
+  } catch (e: any) {
+    return c.json({ error: e.message || 'Export failed' }, 400)
+  }
+})
+// SENSITIVE — downloading platform data requires the admin/super-admin to
+// RE-ENTER their password (same protection as the full system backup). Returns
+// the filtered CSV directly as an attachment once the password is confirmed.
+app.post('/api/export/download', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const reauth = await verifyReauth(c, body?.password)
+  if (!reauth.ok) return c.json({ error: reauth.error, reauth_required: true }, reauth.status as any)
+  const { dataset, filters, date_from, date_to } = body || {}
+  try {
+    const out = await buildExport(c, dataset, filters || {}, date_from, date_to)
+    const csv = toCsv(out.cols, out.rows)
+    const fname = `farmsky-${dataset}-${new Date().toISOString().slice(0, 10)}.csv`
+    await audit(c, c.get('user').id, 'export_download', dataset, `${out.rows.length} rows (password re-auth)`)
+    return new Response(csv, {
+      headers: {
+        'Content-Type': 'text/csv',
+        'Content-Disposition': `attachment; filename="${fname}"`
+      }
+    })
   } catch (e: any) {
     return c.json({ error: e.message || 'Export failed' }, 400)
   }

@@ -29,6 +29,20 @@ export type Bindings = MpesaEnv & SmsEnv & EmailEnv & SasaPayEnv & BuniEnv & {
   // existing org, then the oldest organizations row, when unset.
   EQUIPMENT_ORG_ID?: string
   DEFAULT_ORG_ID?: string
+  // Automated backup email delivery. Both backups (system snapshot + platform
+  // data export) are emailed to this recipient every 6h. Comma/;-separated for
+  // multiple mailboxes. Requires EMAIL_* provider settings to also be present.
+  BACKUP_EMAIL_TO?: string
+  BACKUP_NOTIFY_EMAIL?: string      // alias for BACKUP_EMAIL_TO
+  // Email provider (used by backend/email.ts sendEmail)
+  EMAIL_PROVIDER?: string
+  EMAIL_API_URL?: string
+  EMAIL_API_TOKEN?: string
+  EMAIL_FROM?: string
+  // Token allowing an external cron/pinger to trigger POST /api/backups/run-auto
+  ADMIN_TASK_TOKEN?: string
+  // Per-boot nonce for the Node server's in-process 6h backup scheduler.
+  INTERNAL_SCHEDULER_NONCE?: string
 }
 
 export type SessionUser = {

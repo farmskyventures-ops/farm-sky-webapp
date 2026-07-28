@@ -3595,21 +3595,41 @@ function exFilename(ext) {
 window.downloadExport = async (fmt) => {
   if (!_lastExport) { await runExport() }
   if (!_lastExport || !_lastExport.rows.length) return toast('Nothing to download — preview first', false)
-  const { cols, rows } = _lastExport
-  if (fmt === 'csv') {
-    const esc2 = v => { const s = v == null ? '' : String(v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s }
-    const csv = cols.join(',') + '\n' + rows.map(r => cols.map(c => esc2(r[c])).join(',')).join('\n')
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
-    triggerDownload(blob, exFilename('csv'))
-  } else {
-    // Real .xlsx via SheetJS
-    const aoa = [cols, ...rows.map(r => cols.map(c => r[c]))]
-    const ws = XLSX.utils.aoa_to_sheet(aoa)
-    const wb = XLSX.utils.book_new()
-    XLSX.utils.book_append_sheet(wb, ws, 'Export')
-    XLSX.writeFile(wb, exFilename('xlsx'))
+  // SENSITIVE: platform data download requires password re-auth. The server
+  // /export/download endpoint verifies the password and returns the authoritative
+  // CSV, so we always confirm the download server-side before writing any file.
+  const pw = await promptPassword('Download platform data', 'Downloading platform data exports records from the database. Re-enter your password to continue.')
+  if (pw == null) return
+  try {
+    if (fmt === 'csv') {
+      await postDownload('/export/download', { ...exParams(), password: pw }, exFilename('csv'))
+    } else {
+      // XLSX: verify the password server-side (returns CSV), then build the .xlsx
+      // locally from the server-authoritative rows via SheetJS.
+      const res = await api.post('/export/download', { ...exParams(), password: pw }, { responseType: 'text' })
+      const csv = typeof res.data === 'string' ? res.data : await res.data.text()
+      const lines = csv.split('\n')
+      // Parse CSV honouring quoted fields.
+      const parseLine = (line) => {
+        const out = []; let cur = ''; let q = false
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i]
+          if (q) { if (ch === '"') { if (line[i + 1] === '"') { cur += '"'; i++ } else q = false } else cur += ch }
+          else { if (ch === '"') q = true; else if (ch === ',') { out.push(cur); cur = '' } else cur += ch }
+        }
+        out.push(cur); return out
+      }
+      const aoa = lines.filter(l => l.length).map(parseLine)
+      const ws = XLSX.utils.aoa_to_sheet(aoa)
+      const wb = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(wb, ws, 'Export')
+      XLSX.writeFile(wb, exFilename('xlsx'))
+    }
+    toast('Download started')
+  } catch (err) {
+    const d = await blobErrorMessage(err)
+    toast(d?.error || err.response?.data?.error || 'Download failed', false)
   }
-  toast('Download started')
 }
 function triggerDownload(blob, name) {
   const url = URL.createObjectURL(blob)
@@ -3735,12 +3755,50 @@ window.runBackupNow = async () => {
     await refreshBackups()
   } catch (err) { done(); toast(err.response?.data?.error || 'Backup failed', false) }
 }
+// Password re-authentication modal for sensitive downloads. Resolves with the
+// typed password, or null if cancelled. Admins/super-admins must confirm their
+// password before any full-data download (backup snapshot or platform export).
+window.promptPassword = (title, message) => new Promise((resolve) => {
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-shield-halved text-amber-600 mr-2"></i>${esc(title || 'Confirm your password')}</h3>
+    <p class="text-xs text-slate-500 mb-3">${esc(message || 'For security, re-enter your account password to download this data.')}</p>
+    <label class="text-sm font-medium">Password</label>
+    <input id="reauth_pw" type="password" autocomplete="current-password" placeholder="Your account password" class="w-full mt-1 mb-2 px-3 py-2 border border-slate-300 rounded-lg">
+    <p id="reauth_err" class="text-xs text-red-600 mb-3 hidden"></p>
+    <div class="flex gap-2">
+      <button id="reauth_ok" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">Confirm &amp; Download</button>
+      <button id="reauth_cancel" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+  const input = $('reauth_pw')
+  if (input) input.focus()
+  const done = (val) => { closeModal(); resolve(val) }
+  $('reauth_ok').onclick = () => { const v = input.value; if (!v) { const e = $('reauth_err'); e.textContent = 'Enter your password.'; e.classList.remove('hidden'); return } done(v) }
+  $('reauth_cancel').onclick = () => done(null)
+  if (input) input.onkeydown = (ev) => { if (ev.key === 'Enter') $('reauth_ok').click() }
+})
+
+// POST a JSON body and download the response as a file (used for password-gated
+// downloads that must send the password in the body, not the URL).
+async function postDownload(path, body, filename) {
+  const res = await api.post(path, body, { responseType: 'blob' })
+  triggerDownload(res.data, filename)
+}
+// If a blob response actually contained a JSON error (e.g. reauth failed), read it.
+async function blobErrorMessage(err) {
+  const d = err.response?.data
+  if (d instanceof Blob) { try { return JSON.parse(await d.text()) } catch (_) { return null } }
+  return d || null
+}
+
 window.downloadBackup = async (id) => {
+  const pw = await promptPassword('Download system backup', 'Downloading a full system backup exports the entire database. Re-enter your password to continue.')
+  if (pw == null) return
   try {
-    const res = await api.get(`/backups/${id}/download`, { responseType: 'blob' })
-    triggerDownload(res.data, `farmsky-backup-${id}.json`)
+    await postDownload(`/backups/${id}/download`, { password: pw }, `farmsky-backup-${id}.json`)
     toast('Download started')
-  } catch (err) { toast('Download failed', false) }
+  } catch (err) {
+    const d = await blobErrorMessage(err)
+    toast(d?.error || 'Download failed', false)
+  }
 }
 
 // ===========================================================================

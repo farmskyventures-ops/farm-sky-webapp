@@ -51,6 +51,14 @@ tokens into `.env` (see `.env.example` for step-by-step instructions):
 - **Email share — Resend** (`resend.com`): paste `EMAIL_API_TOKEN` (re_xxx) +
   `EMAIL_FROM` (verified address). Blank = email button disabled, local download
   still works.
+- **Automated backup email**: `BACKUP_EMAIL_TO` (or alias `BACKUP_NOTIFY_EMAIL`) —
+  comma/`;`-separated recipient(s) that receive the 6-hourly backup (system JSON +
+  data CSV). Needs the `EMAIL_*` provider settings above. Optional
+  `ADMIN_TASK_TOKEN` gates an external cron pinging `POST /api/backups/run-auto`
+  on the edge; the Node server also self-schedules with an internal per-boot nonce.
+- **Default tenant** (shared central DB): `EQUIPMENT_ORG_ID` / `DEFAULT_ORG_ID` —
+  the `organizations.id` assigned to users created without a creating admin
+  (public signup / bulk import). Falls back to most-populated → oldest org.
 
 ## Test credentials
 | Role | Phone | Password |
@@ -181,6 +189,53 @@ production databases that were created by an **older schema**:
     it actually exists (`usersHasOrgId()` probe), so the Equipment-only SQLite/D1
     dev DB (no `org_id`) still works. Verified end-to-end on a reproduced central
     shape: all 5 creation paths populate `org_id`, **0** `23502` errors.
+
+- **`null value in column "email" of relation "users"` (and the follow-on
+  `duplicate key … users_email_key`) is fixed.** The central `public.users.email`
+  is BOTH `NOT NULL` **and** `UNIQUE`. Equipment used to omit / bind `null` for
+  email-less users (→ `23502`); a naïve fix of binding `''` then collided on the
+  second such user (→ `23505`). Now a single helper `resolveEmail(role, email, phone)`
+  governs **every** insert/update path (`POST/PUT /api/users`, `POST/PUT /api/agents`,
+  public self-signup, bulk import):
+  - **Email is required only for `super_admin`, `admin`, and `lender`.** Creating
+    one of these without an email returns a clear 400
+    (`An email address is required for … accounts.`).
+  - **All other roles** (operations_finance, investor, partner, agent, customer)
+    are optional — when blank, a **unique, non-deliverable placeholder**
+    `no-email+<phone>@no-email.farmsky.local` is stored, satisfying `NOT NULL` +
+    `UNIQUE` without collision.
+  - Placeholder addresses are **masked back to blank** in the Users/Agents lists
+    and in data exports via `isPlaceholderEmail()`, so the UI still shows "no
+    email on file". Verified E2E on the reproduced central shape (admin/super_admin
+    rejected without email; agent/customer/investor/partner all created; multiple
+    email-less users no longer collide).
+
+### Data protection — backups, downloads & 6-hourly email delivery
+- **Password re-auth on every full-data download.** Because a downloaded backup
+  or export contains the whole database (including password hashes), the logged-in
+  Admin / Super-Admin must **re-enter their password** before either download:
+  - `POST /api/backups/:id/download` — system backup JSON. Requires `{ password }`
+    in the body; the legacy `GET` is retired and returns `401 reauth_required`.
+  - `POST /api/export/download` — platform data export (CSV). Requires `{ password }`;
+    `POST /api/export/data` remains a password-free **preview** only.
+  - The frontend prompts with a password modal (`promptPassword`) before starting
+    either download. `POST /api/backups` (manual snapshot) now returns **metadata
+    only** — the payload is never handed out except through the re-auth download.
+- **Automated backups every 6 hours, emailed to a designated address.**
+  `AUTO_BACKUP_INTERVAL_MS` is **6h**. When an auto backup runs it emails **both**
+  artefacts — the system-snapshot JSON **and** the full data-export CSV — as
+  attachments to the recipient(s) in `BACKUP_EMAIL_TO` (comma/`;`-separated;
+  `BACKUP_NOTIFY_EMAIL` is an alias). Requires the `EMAIL_*` provider settings;
+  if unset the backup still runs and the response reports
+  `emailed: { sent:false, reason:"email_not_configured" }`.
+  - On the **Node/Render** server an in-process scheduler self-triggers the auto
+    backup (authorised by a per-boot `INTERNAL_SCHEDULER_NONCE`), so it fires even
+    with no admin logged in.
+  - On **Cloudflare/edge**, point an external cron at
+    `POST /api/backups/run-auto` every ~6h with header
+    `x-admin-task-token: $ADMIN_TASK_TOKEN` (or it runs opportunistically when an
+    admin opens the Backups page). The handler is idempotent (skips if the last
+    auto backup is < 6h old).
 
 - **`0007_widen_epoch_columns.sql` is self-healing.** `expires_at` on
   `sessions` / `otp_codes` is stored as an epoch-millisecond **BIGINT**. If a

@@ -90,7 +90,15 @@ const ENV = {
   // session (public self-signup / bulk import). Built explicitly here because
   // the Node server constructs ENV by hand — otherwise undefined at runtime.
   EQUIPMENT_ORG_ID: process.env.EQUIPMENT_ORG_ID,
-  DEFAULT_ORG_ID: process.env.DEFAULT_ORG_ID
+  DEFAULT_ORG_ID: process.env.DEFAULT_ORG_ID,
+  // Automated backup email delivery (every 6h) + external cron trigger token.
+  // Built explicitly because the Node server constructs ENV by hand.
+  BACKUP_EMAIL_TO: process.env.BACKUP_EMAIL_TO,
+  BACKUP_NOTIFY_EMAIL: process.env.BACKUP_NOTIFY_EMAIL,
+  ADMIN_TASK_TOKEN: process.env.ADMIN_TASK_TOKEN,
+  // Per-boot nonce so the in-process 6h backup scheduler can authorize itself to
+  // POST /api/backups/run-auto without exposing a token. Never leaves the process.
+  INTERNAL_SCHEDULER_NONCE: crypto.randomUUID()
 }
 
 const root = new Hono()
@@ -163,4 +171,34 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
       ? 'SasaPay: LIVE credentials detected (' + modeOf(process.env.SASAPAY_ENV) + ')'
       : `SasaPay: SIMULATION mode (missing ${[!sasapayId && 'CLIENT_ID', !sasapaySecret && 'CLIENT_SECRET', !sasapayMerchant && 'MERCHANT_CODE'].filter(Boolean).join(', ') || 'credentials'}).`
   )
+
+  // ------------------------------------------------------------------------
+  // Automated 6-hourly backups (Node/Render). Cloudflare/Workers has no long-
+  // lived process, so on the edge this is driven by GET /api/backups (on admin
+  // dashboard load) or an external cron hitting POST /api/backups/run-auto with
+  // x-admin-task-token. On the persistent Node server we ALSO self-trigger so
+  // backups + email delivery happen even when no admin is logged in. The handler
+  // itself is idempotent (skips if the last auto backup is < 6h old).
+  // ------------------------------------------------------------------------
+  const BACKUP_TICK_MS = 30 * 60 * 1000 // check every 30 min; handler dedupes to 6h
+  const runAutoBackup = async () => {
+    if (!dbReady) return
+    try {
+      const req = new Request('http://internal/api/backups/run-auto', {
+        method: 'POST',
+        headers: { 'x-internal-scheduler': String((ENV as any).INTERNAL_SCHEDULER_NONCE || ''), 'content-type': 'application/json' },
+        body: '{}'
+      })
+      const res = await app.fetch(req, ENV as any, nodeExecutionCtx as any)
+      if (res.ok) {
+        const j: any = await res.json().catch(() => ({}))
+        if (j?.ran) console.log(`Auto-backup ran; email ${j?.emailed?.sent ? 'sent to ' + (j.emailed.to || []).join(', ') : 'skipped (' + (j?.emailed?.reason || 'n/a') + ')'}`)
+      }
+    } catch (e: any) {
+      console.warn('Auto-backup tick failed:', e?.message || e)
+    }
+  }
+  // First tick shortly after boot (once DB is ready), then on the interval.
+  setTimeout(runAutoBackup, 60 * 1000)
+  setInterval(runAutoBackup, BACKUP_TICK_MS)
 })
