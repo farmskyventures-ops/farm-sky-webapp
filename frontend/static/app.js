@@ -129,6 +129,7 @@ function subcategorySuggestions(marketplace, category) {
 }
 
 let _products = [], _agents = [], _users = [], _customers = [], _walletUsers = []
+let _walletWithdrawInfo = null
 // Shop UI state: active marketplace section, category filter, and the cross-
 // marketplace cart (Farmer / Offtaker only).
 let _shopFilter = { marketplace: 'equipment', category: '', subcategory: '' }
@@ -332,6 +333,8 @@ async function shopCrossApp() {
 function scoreHeaderButton() {
   const cfg = state.crossApp
   if (!cfg || !cfg.score_configured) return ''
+  // Only Super-Admin, Admin or Lender may see the "Open Score App" button.
+  if (!state.user || !['super_admin', 'admin', 'lender'].includes(state.user.role)) return ''
   return `<button onclick="openScore()" title="Open Farmsky Score — identity &amp; credit scoring"
     class="btn inline-flex items-center gap-2 brand-bg text-white px-4 py-2 rounded-lg text-sm whitespace-nowrap">
     <i class="fas fa-chart-line"></i><span class="hidden sm:inline">Open Score</span></button>`
@@ -1989,11 +1992,15 @@ function ledgerRow(l) {
 }
 async function viewMyWallet() {
   let wallet = null, ledger = [], rules = [], analytics = null
+  let withdrawable = null, wdCharge = null, supportContact = null
   try {
     const [w, a] = await Promise.all([api.get('/wallet'), api.get('/wallet/analytics')])
     wallet = w.data.wallet; ledger = w.data.ledger || []; rules = w.data.earning_rules || []
+    withdrawable = w.data.withdrawable; wdCharge = w.data.withdrawal_charge; supportContact = w.data.support_contact
     analytics = a.data
   } catch (err) { toast(err.response?.data?.error || 'Wallet unavailable', false) }
+  // Stash for the withdraw modal (avoids a second round-trip).
+  _walletWithdrawInfo = { withdrawable, charge: wdCharge, support_contact: supportContact }
   const rulesHtml = rules.length ? rules.map(r => `<div class="flex items-center justify-between border-b border-slate-100 py-2 text-sm">
       <span><b>${esc(r.rule_type)}</b> · ${esc(r.calc_method)}</span>
       <span class="text-slate-600">${r.calc_method === 'percentage' ? Number(r.rate || 0) + '%' : fmt(r.fixed_amount)}</span>
@@ -2004,6 +2011,7 @@ async function viewMyWallet() {
       <div class="text-xs text-slate-500 mb-1">Wallet balance</div>
       <div class="text-2xl font-bold text-teal-700">${fmt(wallet?.balance)}</div>
       <div class="text-xs text-slate-400 mt-1">${esc(wallet?.currency || 'KES')} · ${esc(wallet?.status || 'active')}</div>
+      ${withdrawable != null ? `<div class="text-xs text-slate-500 mt-1">Withdrawable now: <b class="text-teal-700">${fmt(withdrawable)}</b>${(wdCharge && wdCharge.enabled) ? ' <span class="text-slate-400">(after withdrawal charge)</span>' : ''}</div>` : ''}
       <button onclick="withdrawModal(${Number(wallet?.balance || 0)})" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs mt-3"><i class="fas fa-money-bill-transfer mr-1"></i>Withdraw</button>
       <button onclick="payoutAccountsModal()" class="btn bg-white border px-3 py-1.5 rounded-lg text-xs mt-3 ml-1"><i class="fas fa-building-columns mr-1"></i>Payout accounts</button>
     </div>
@@ -2140,8 +2148,16 @@ window.withdrawModal = async (balance) => {
   let accounts = []
   try { const { data } = await api.get('/payout-accounts'); accounts = data.accounts || [] } catch (_) {}
   const savedOpts = accounts.map(a => `<option value="${a.id}">${esc(a.label || a.channel_name)} · ${esc(a.account_number)}${a.is_verified ? ' ✓' : ''}</option>`).join('')
+  const info = _walletWithdrawInfo || {}
+  const wdCharge = info.charge || null
+  const withdrawable = info.withdrawable
+  const chargeLine = (wdCharge && wdCharge.enabled)
+    ? `<p class="text-xs text-slate-500 mb-1">A withdrawal charge applies${wdCharge.flat_fee ? ` (flat KES ${Number(wdCharge.flat_fee).toLocaleString()}` : ''}${wdCharge.percentage_rate ? `${wdCharge.flat_fee ? ' + ' : ' ('}${Number(wdCharge.percentage_rate)}%` : ''}${(wdCharge.flat_fee || wdCharge.percentage_rate) ? ')' : ''}. You can withdraw up to <b>${fmt(withdrawable)}</b>.</p>`
+    : ''
   showModal(`<h3 class="font-bold mb-1"><i class="fas fa-money-bill-transfer text-teal-600 mr-2"></i>Withdraw funds</h3>
-    <p class="text-xs text-slate-500 mb-3">Available balance: <b>${fmt(balance)}</b>. Funds are sent via SasaPay to your mobile, bank, or SasaPay wallet.</p>
+    <p class="text-xs text-slate-500 mb-1">Available balance: <b>${fmt(balance)}</b>. Funds are sent via SasaPay to your mobile, bank, or SasaPay wallet.</p>
+    ${chargeLine}
+    <div class="mb-3"></div>
     ${savedOpts ? `<label class="field-label">Use a saved account</label>
     <select id="wd_saved" onchange="onWithdrawSavedChange()" class="w-full px-3 py-2 border rounded-lg mb-3">
       <option value="">— New / one-off destination —</option>${savedOpts}
@@ -2201,7 +2217,30 @@ window.doWithdraw = async () => {
     const { data } = await api.post('/wallet/withdraw', payload)
     closeModal(); toast(data.customer_message || `Withdrawal ${data.status} (${data.reference})`); viewMyWallet()
   } catch (err) {
-    $('wd_status').innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-2">${esc(err.response?.data?.error || 'Withdrawal failed')}</div>`
+    const d = err.response?.data || {}
+    let html
+    if (d.contact_farmsky) {
+      // SasaPay main wallet is short — show "Contact Farmsky" with configured phone/email.
+      const phone = d.support_phone ? `<div class="mt-1"><i class="fas fa-phone mr-1"></i><a class="underline" href="tel:${esc(d.support_phone)}">${esc(d.support_phone)}</a></div>` : ''
+      const email = d.support_email ? `<div class="mt-1"><i class="fas fa-envelope mr-1"></i><a class="underline" href="mailto:${esc(d.support_email)}">${esc(d.support_email)}</a></div>` : ''
+      const noContact = (!d.support_phone && !d.support_email) ? '<div class="mt-1 text-amber-700">Please reach out to Farmsky support.</div>' : ''
+      html = `<div class="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-800 mb-2">
+        <div class="font-semibold text-sm"><i class="fas fa-headset mr-1"></i>Contact Farmsky</div>
+        <div class="mt-1">${esc(d.message || 'We are unable to process your withdrawal right now.')}</div>
+        ${phone}${email}${noContact}
+      </div>`
+    } else if (d.insufficient) {
+      // "Unsuccessful. You have insufficient Balance" + the withdrawable limit.
+      const limitLine = (d.withdrawable != null) ? `<div class="mt-1">The most you can withdraw now is <b>${fmt(d.withdrawable)}</b>.</div>` : ''
+      html = `<div class="bg-red-50 border border-red-200 rounded-lg p-3 text-xs text-red-700 mb-2">
+        <div class="font-semibold text-sm">${esc(d.error || 'Unsuccessful. You have insufficient Balance')}</div>
+        ${limitLine}
+        <div class="mt-1 text-slate-500">A notification has also been sent to your registered number.</div>
+      </div>`
+    } else {
+      html = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700 mb-2">${esc(d.error || 'Withdrawal failed')}</div>`
+    }
+    $('wd_status').innerHTML = html
     btn.disabled = false; btn.classList.remove('opacity-50')
   }
 }
@@ -3283,10 +3322,20 @@ let _feeCfg = { enabled: false, mode: 'percentage', percentage_rate: 0, tiers: [
 let _mkCfg = { financing_applicable: true, mode: 'percentage', percentage_rate: 20, tiers: [], cash_markup_pct: 10, cash_terms_text: '', product_ids: [] }
 let _inventory = []
 let _canManageFees = false, _canManageMarkup = false
+let _wdCfg = { enabled: true, percentage_rate: 0, flat_fee: 0, min_charge: 0, max_charge: 0, min_withdrawal: 0 }
+let _supportCfg = { phone: '', email: '' }
+let _canManageWithdrawal = false
 async function viewSettings() {
   let data
   try { data = (await api.get('/settings/financing')).data }
   catch (err) { $('content').innerHTML = `<div class="card p-6 text-red-600 text-sm">${esc(err.response?.data?.error || 'Failed to load settings')}</div>`; return }
+  // Withdrawal charge + support contact (best-effort; endpoint is auth-open for reads).
+  try {
+    const wd = (await api.get('/settings/withdrawal')).data
+    _wdCfg = Object.assign({ enabled: true, percentage_rate: 0, flat_fee: 0, min_charge: 0, max_charge: 0, min_withdrawal: 0 }, wd.withdrawal_charge || {})
+    _supportCfg = Object.assign({ phone: '', email: '' }, wd.support_contact || {})
+    _canManageWithdrawal = !!wd.can_manage
+  } catch (_) {}
   _feeCfg = Object.assign({ enabled: false, mode: 'percentage', percentage_rate: 0, tiers: [], product_ids: [] }, data.processing_fee || {})
   if (!Array.isArray(_feeCfg.tiers)) _feeCfg.tiers = []
   if (!Array.isArray(_feeCfg.product_ids)) _feeCfg.product_ids = []
@@ -3317,9 +3366,64 @@ async function viewSettings() {
           ? `<div class="flex gap-2 mt-5"><button onclick="saveProcessingFee()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Processing Fee</button></div>`
           : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>You lack the "Manage Processing Fees" permission — read-only.</p>`}
       </div>
+
+      <!-- ============ WITHDRAWAL CHARGE (standard withdrawal schema) ============ -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-money-bill-transfer text-teal-600 mr-2"></i>Withdrawal Charge</h3>
+        <p class="text-xs text-slate-500 mb-4">The standard withdrawal charge deducted when a wallet holder cashes out. A holder can only withdraw an amount whose <b>gross + charge</b> is within their balance.</p>
+        <label class="flex items-center gap-2 text-sm mb-4 ${_canManageWithdrawal ? 'cursor-pointer' : 'opacity-60'}">
+          <input type="checkbox" id="wc_enabled" ${_wdCfg.enabled ? 'checked' : ''} ${_canManageWithdrawal ? '' : 'disabled'}> Apply a withdrawal charge
+        </label>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div><label class="field-label">Percentage of amount (%)</label><input id="wc_pct" type="number" step="0.01" value="${Number(_wdCfg.percentage_rate || 0)}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Flat fee (KES)</label><input id="wc_flat" type="number" step="0.01" value="${Number(_wdCfg.flat_fee || 0)}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Minimum charge (KES)</label><input id="wc_min" type="number" step="0.01" value="${Number(_wdCfg.min_charge || 0)}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Maximum charge (KES, 0 = none)</label><input id="wc_max" type="number" step="0.01" value="${Number(_wdCfg.max_charge || 0)}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Minimum withdrawal (KES, 0 = none)</label><input id="wc_minwd" type="number" step="0.01" value="${Number(_wdCfg.min_withdrawal || 0)}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+        </div>
+        ${_canManageWithdrawal
+          ? `<div class="flex gap-2 mt-5"><button onclick="saveWithdrawalCharge()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Withdrawal Charge</button></div>`
+          : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>Only Admin / Super-Admin can change this — read-only.</p>`}
+      </div>
+
+      <!-- ============ SUPPORT CONTACT (shown when SasaPay main wallet is short) ============ -->
+      <div class="card p-6">
+        <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-headset text-teal-600 mr-2"></i>Farmsky Support Contact</h3>
+        <p class="text-xs text-slate-500 mb-4">Shown to users as "Contact Farmsky" when a withdrawal cannot be settled because the SasaPay main wallet is short of funds.</p>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div><label class="field-label">Support phone</label><input id="sc_phone" type="text" placeholder="e.g. 0700000000" value="${esc(_supportCfg.phone || '')}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Support email</label><input id="sc_email" type="email" placeholder="e.g. support@farmsky.co.ke" value="${esc(_supportCfg.email || '')}" ${_canManageWithdrawal ? '' : 'disabled'} class="w-full px-3 py-2 border rounded-lg"></div>
+        </div>
+        ${_canManageWithdrawal
+          ? `<div class="flex gap-2 mt-5"><button onclick="saveSupportContact()" class="btn brand-bg text-white px-5 py-2 rounded-lg text-sm"><i class="fas fa-save mr-1"></i>Save Support Contact</button></div>`
+          : `<p class="text-xs text-amber-600 mt-4"><i class="fas fa-lock mr-1"></i>Only Admin / Super-Admin can change this — read-only.</p>`}
+      </div>
     </div>`
   renderMarkupBuilder()
   renderFeeBuilder()
+}
+window.saveWithdrawalCharge = async () => {
+  const payload = {
+    enabled: !!($('wc_enabled') || {}).checked,
+    percentage_rate: Number(($('wc_pct') || {}).value || 0),
+    flat_fee: Number(($('wc_flat') || {}).value || 0),
+    min_charge: Number(($('wc_min') || {}).value || 0),
+    max_charge: Number(($('wc_max') || {}).value || 0),
+    min_withdrawal: Number(($('wc_minwd') || {}).value || 0)
+  }
+  try {
+    const { data } = await api.put('/settings/withdrawal-charge', payload)
+    _wdCfg = data.withdrawal_charge || payload
+    toast('Withdrawal charge saved')
+  } catch (err) { toast(err.response?.data?.error || 'Failed to save', false) }
+}
+window.saveSupportContact = async () => {
+  const payload = { phone: ($('sc_phone') || {}).value || '', email: ($('sc_email') || {}).value || '' }
+  try {
+    const { data } = await api.put('/settings/support-contact', payload)
+    _supportCfg = data.support_contact || payload
+    toast('Support contact saved')
+  } catch (err) { toast(err.response?.data?.error || 'Failed to save', false) }
 }
 
 // ---- shared helpers -------------------------------------------------------

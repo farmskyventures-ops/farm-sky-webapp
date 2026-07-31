@@ -94,7 +94,11 @@ function ref(prefix: string): string {
   return `${prefix}-${Date.now().toString().slice(-6)}${n}`
 }
 function safeJson<T = any>(value: any, fallback: T): T {
-  try { return value ? JSON.parse(String(value)) : fallback } catch { return fallback }
+  if (value == null) return fallback
+  // Postgres `jsonb` columns are returned already-parsed by the `pg` driver.
+  // Only strings need JSON.parse; objects/arrays are handed back as-is.
+  if (typeof value === 'object') return value as T
+  try { return JSON.parse(String(value)) } catch { return fallback }
 }
 // Fallback permissions when role catalog has not loaded yet.
 function builtinDefaults(role: string): Record<string, boolean> {
@@ -337,6 +341,75 @@ function computeProcessingFee(cfg: any, borrowedAmount: number, productId?: any)
   const tier = c.tiers.find((t: any) => amount >= t.min && amount <= t.max)
   return tier ? roundMoney(tier.fee) : 0
 }
+
+// ----------------------------------------------------------------------------
+// WITHDRAWAL CHARGE SCHEMA (standard withdrawal schema)
+// A withdrawal costs the wallet holder an "effective charge" that is deducted
+// on top of the gross withdrawal. The withdrawable limit for a given balance is
+//   withdrawable = balance - effectiveCharge(withdrawable)
+// i.e. the most a holder can request such that (request + charge) <= balance.
+// The charge itself is a flat fee + a percentage of the requested amount, with
+// optional min/max clamps — this mirrors typical mobile-money withdrawal tariffs.
+// ----------------------------------------------------------------------------
+const DEFAULT_WITHDRAWAL_CHARGE = {
+  enabled: true,
+  percentage_rate: 0,     // % of the requested amount
+  flat_fee: 0,            // flat KES added per withdrawal
+  min_charge: 0,          // charge is never below this (when enabled)
+  max_charge: 0,          // 0 = no upper cap
+  min_withdrawal: 0       // smallest gross amount a holder may request (0 = none)
+}
+function normalizeWithdrawalCharge(raw: any) {
+  const cfg: any = { ...DEFAULT_WITHDRAWAL_CHARGE, ...(raw && typeof raw === 'object' ? raw : {}) }
+  cfg.enabled = raw && Object.prototype.hasOwnProperty.call(raw, 'enabled') ? Boolean(cfg.enabled) : true
+  cfg.percentage_rate = Math.max(0, numberVal(cfg.percentage_rate, 0))
+  cfg.flat_fee = Math.max(0, numberVal(cfg.flat_fee, 0))
+  cfg.min_charge = Math.max(0, numberVal(cfg.min_charge, 0))
+  cfg.max_charge = Math.max(0, numberVal(cfg.max_charge, 0))
+  cfg.min_withdrawal = Math.max(0, numberVal(cfg.min_withdrawal, 0))
+  return cfg
+}
+// Effective charge for a requested (gross) withdrawal amount.
+function computeWithdrawalCharge(cfg: any, amount: number): number {
+  const c = normalizeWithdrawalCharge(cfg)
+  if (!c.enabled) return 0
+  const amt = Math.max(0, Number(amount) || 0)
+  let charge = c.flat_fee + amt * (c.percentage_rate / 100)
+  if (c.min_charge > 0 && charge < c.min_charge) charge = c.min_charge
+  if (c.max_charge > 0 && charge > c.max_charge) charge = c.max_charge
+  return roundMoney(charge)
+}
+// Given a wallet balance, the maximum gross amount a holder may withdraw such
+// that (amount + effective charge) never exceeds the balance.
+function computeWithdrawableLimit(cfg: any, balance: number): { withdrawable: number; charge_at_max: number } {
+  const c = normalizeWithdrawalCharge(cfg)
+  const bal = roundMoney(Math.max(0, Number(balance) || 0))
+  if (!c.enabled) return { withdrawable: bal, charge_at_max: 0 }
+  // Closed-form for the percentage + flat portion: amount + flat + amount*p = balance
+  const p = c.percentage_rate / 100
+  let withdrawable = (bal - c.flat_fee) / (1 + p)
+  withdrawable = roundMoney(Math.max(0, withdrawable))
+  // Re-clamp using the real charge (handles min/max clamps) so amount+charge<=bal.
+  while (withdrawable > 0 && roundMoney(withdrawable + computeWithdrawalCharge(c, withdrawable)) > bal) {
+    withdrawable = roundMoney(withdrawable - 0.01)
+  }
+  // When nothing can be withdrawn, report a zero charge (cosmetic — avoids
+  // showing a flat fee against a KES 0 withdrawable).
+  return { withdrawable, charge_at_max: withdrawable > 0 ? computeWithdrawalCharge(c, withdrawable) : 0 }
+}
+
+// ----------------------------------------------------------------------------
+// SUPPORT CONTACT (configurable in the Super-Admin dashboard). Shown to users
+// when a withdrawal cannot be settled because the SasaPay main wallet is short.
+// ----------------------------------------------------------------------------
+const DEFAULT_SUPPORT_CONTACT = { phone: '', email: '' }
+function normalizeSupportContact(raw: any) {
+  const cfg: any = { ...DEFAULT_SUPPORT_CONTACT, ...(raw && typeof raw === 'object' ? raw : {}) }
+  cfg.phone = String(cfg.phone || '').trim().slice(0, 40)
+  cfg.email = String(cfg.email || '').trim().slice(0, 120)
+  return cfg
+}
+
 // ---- Time-based access windows ----
 const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat']
 function parseHM(value: any): number | null {
@@ -3082,6 +3155,42 @@ app.put('/api/settings/financing-markup', requireAuth, requirePermission('manage
 // Backward-compatible alias (the earlier frontend saved to /settings/markup, which 404'd).
 app.put('/api/settings/markup', requireAuth, requirePermission('manage_markup_pct'), saveFinancingMarkup)
 
+// ----------------------------------------------------------------------------
+// WITHDRAWAL CHARGE + SUPPORT CONTACT SETTINGS
+//   • withdrawal_charge : the standard withdrawal charge schema (flat + %).
+//   • support_contact   : phone/email shown when SasaPay main wallet is short.
+// Both are configured from the Super-Admin dashboard (admin/super_admin only).
+// ----------------------------------------------------------------------------
+function isAdminRole(user: SessionUser) {
+  return user.role === 'admin' || user.role === 'super_admin' || hasPermission(user, 'manage_wallets')
+}
+// GET — readable by any authenticated user so the wallet/withdraw UI can show
+// the withdrawable limit and the support contact if a payout can't be settled.
+app.get('/api/settings/withdrawal', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const withdrawal_charge = normalizeWithdrawalCharge(await getSetting(c, 'withdrawal_charge', DEFAULT_WITHDRAWAL_CHARGE))
+  const support_contact = normalizeSupportContact(await getSetting(c, 'support_contact', DEFAULT_SUPPORT_CONTACT))
+  return c.json({ withdrawal_charge, support_contact, can_manage: isAdminRole(user) })
+})
+app.put('/api/settings/withdrawal-charge', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!isAdminRole(user)) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json()
+  const cfg = normalizeWithdrawalCharge(b)
+  await setSetting(c, 'withdrawal_charge', cfg)
+  await audit(c, user.id, 'update', 'settings', `withdrawal_charge:${cfg.enabled ? 'on' : 'off'} flat:${cfg.flat_fee} pct:${cfg.percentage_rate}`)
+  return c.json({ ok: true, withdrawal_charge: cfg })
+})
+app.put('/api/settings/support-contact', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!isAdminRole(user)) return c.json({ error: 'Forbidden' }, 403)
+  const b = await c.req.json()
+  const cfg = normalizeSupportContact(b)
+  await setSetting(c, 'support_contact', cfg)
+  await audit(c, user.id, 'update', 'settings', `support_contact phone:${cfg.phone ? 'set' : 'empty'} email:${cfg.email ? 'set' : 'empty'}`)
+  return c.json({ ok: true, support_contact: cfg })
+})
+
 // Inline "add product to inventory" used by the Processing Fee / Markup builders.
 // Authorized either by the classic admin roles OR the fee/markup management perms.
 app.post('/api/settings/quick-product', requireAuth, async (c) => {
@@ -3789,7 +3898,18 @@ app.get('/api/wallet', requireAuth, requirePermission('view_wallet', 'manage_wal
   const wallet = await c.env.DB.prepare(`SELECT * FROM wallets WHERE id=?`).bind(walletId).first<any>()
   const { results: ledger } = await c.env.DB.prepare(`SELECT * FROM wallet_ledger WHERE wallet_id=? ORDER BY id DESC LIMIT 200`).bind(walletId).all()
   const { results: rules } = await c.env.DB.prepare(`SELECT * FROM earning_rules WHERE user_id=? AND is_active=1 ORDER BY id`).bind(user.id).all()
-  return c.json({ wallet, ledger, earning_rules: rules })
+  // Withdrawal charge schema + the holder's withdrawable limit (balance − effective charge).
+  const chargeCfg = normalizeWithdrawalCharge(await getSetting(c, 'withdrawal_charge', DEFAULT_WITHDRAWAL_CHARGE))
+  const supportContact = normalizeSupportContact(await getSetting(c, 'support_contact', DEFAULT_SUPPORT_CONTACT))
+  const balance = numberVal(wallet?.balance, 0)
+  const limit = computeWithdrawableLimit(chargeCfg, balance)
+  return c.json({
+    wallet, ledger, earning_rules: rules,
+    withdrawal_charge: chargeCfg,
+    withdrawable: limit.withdrawable,
+    charge_at_max: limit.charge_at_max,
+    support_contact: supportContact
+  })
 })
 
 // ---- Admin wallet management ----
@@ -4006,16 +4126,77 @@ app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', '
   const reference = ref('WD')
   const walletId = await ensureWallet(c, user.id)
 
-  // 1) Debit the wallet ledger up-front (the trigger rejects if balance is short).
+  // Load configuration + the holder's CURRENT balance so we can validate against
+  // the withdrawable limit (balance − effective withdrawal charge) before we
+  // touch the ledger. Wallet isolation: this is strictly the caller's own wallet.
+  const chargeCfg = normalizeWithdrawalCharge(await getSetting(c, 'withdrawal_charge', DEFAULT_WITHDRAWAL_CHARGE))
+  const supportContact = normalizeSupportContact(await getSetting(c, 'support_contact', DEFAULT_SUPPORT_CONTACT))
+  const walletRow = await c.env.DB.prepare(`SELECT balance FROM wallets WHERE id=?`).bind(walletId).first<any>()
+  const balance = roundMoney(numberVal(walletRow?.balance, 0))
+  const charge = computeWithdrawalCharge(chargeCfg, amount)
+  const totalDebit = roundMoney(amount + charge)
+  const limit = computeWithdrawableLimit(chargeCfg, balance)
+
+  // Enforce an optional minimum withdrawal.
+  if (chargeCfg.min_withdrawal > 0 && amount < chargeCfg.min_withdrawal) {
+    return c.json({ error: `The minimum withdrawal is KES ${chargeCfg.min_withdrawal.toLocaleString()}.` }, 400)
+  }
+
+  // 1) Withdrawable-limit pre-check (automated backend calculation). The holder
+  // may only withdraw an amount whose gross + effective charge is within their
+  // balance. On failure: on-screen message + SMS to the registered number.
+  if (totalDebit > balance) {
+    const insufficientMsg = 'Unsuccessful. You have insufficient Balance'
+    const smsBody = `${insufficientMsg}. Your wallet balance is KES ${balance.toLocaleString()}. `
+      + `The most you can withdraw now is KES ${limit.withdrawable.toLocaleString()} `
+      + `(after a KES ${limit.charge_at_max.toLocaleString()} withdrawal charge).`
+    // Fire-and-forget SMS to the user's registered number (simulated when unconfigured).
+    try { if (user.phone) await sendSms(c.env, user.phone, smsBody) } catch (_) {}
+    return c.json({
+      error: insufficientMsg,
+      insufficient: true,
+      balance,
+      requested: amount,
+      charge,
+      withdrawable: limit.withdrawable,
+      charge_at_max: limit.charge_at_max
+    }, 400)
+  }
+
+  // 2) SasaPay main-wallet funding check. If the settlement account (org balance)
+  // cannot cover the gross payout, we DO NOT debit the holder — instead we tell
+  // them to contact Farmsky (support phone/email configured by the super-admin).
+  const mainBal = await sasapayBalance(c.env)
+  if (mainBal.success && !mainBal.simulated && numberVal(mainBal.org_balance, 0) < amount) {
+    return c.json({
+      error: 'Contact Farmsky',
+      contact_farmsky: true,
+      support_phone: supportContact.phone,
+      support_email: supportContact.email,
+      message: 'We are unable to process your withdrawal right now. Please contact Farmsky.'
+    }, 503)
+  }
+
+  // 3) Debit the wallet ledger up-front (gross + charge). The trigger rejects if
+  //    the balance is short (defence-in-depth against a race with the pre-check).
   try {
     await postLedger(c, { userId: user.id, walletId, type: 'debit', amount, category: 'withdrawal', reference, description: b.reason || `Withdrawal to ${chan.name}`, createdBy: user.id })
+    if (charge > 0) {
+      await postLedger(c, { userId: user.id, walletId, type: 'debit', amount: charge, category: 'withdrawal_charge', reference, description: `Withdrawal charge for ${reference}`, createdBy: user.id })
+    }
   } catch (e: any) {
     const msg = String(e?.message || '')
-    if (/insufficient/i.test(msg)) return c.json({ error: 'Insufficient wallet balance' }, 400)
+    if (/insufficient/i.test(msg)) {
+      // Roll back the gross debit if the charge debit failed after it succeeded.
+      try { await postLedger(c, { userId: user.id, walletId, type: 'credit', amount, category: 'adjustment', reference, description: `Reversal — charge could not be posted ${reference}`, createdBy: user.id }) } catch (_) {}
+      const insufficientMsg = 'Unsuccessful. You have insufficient Balance'
+      try { if (user.phone) await sendSms(c.env, user.phone, `${insufficientMsg}. The most you can withdraw now is KES ${limit.withdrawable.toLocaleString()}.`) } catch (_) {}
+      return c.json({ error: insufficientMsg, insufficient: true, withdrawable: limit.withdrawable }, 400)
+    }
     return c.json({ error: 'Withdrawal could not be posted' }, 400)
   }
 
-  // 2) Record the withdrawal, then push B2C.
+  // 4) Record the withdrawal, then push B2C.
   await c.env.DB.prepare(
     `INSERT INTO wallet_withdrawals (reference, flow, wallet_id, user_id, amount, currency, channel_code, channel_name, receiver_number, recipient_name, reason, status, ledger_debited, created_by)
      VALUES (?, 'withdrawal', ?,?,?, 'KES', ?,?,?,?,?, 'processing', 1, ?)`
@@ -4024,8 +4205,11 @@ app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', '
   const payout = await sasapayB2C(c.env, { amount, receiverNumber: receiver, channel: channelCode, reason: b.reason || 'Wallet withdrawal', reference })
 
   if (!payout.success) {
-    // Reverse the debit (credit back) and mark failed.
+    // Reverse BOTH the gross debit and the charge (credit back) and mark failed.
     await postLedger(c, { userId: user.id, walletId, type: 'credit', amount, category: 'adjustment', reference, description: `Reversal — failed withdrawal ${reference}`, createdBy: user.id })
+    if (charge > 0) {
+      await postLedger(c, { userId: user.id, walletId, type: 'credit', amount: charge, category: 'adjustment', reference, description: `Reversal — withdrawal charge ${reference}`, createdBy: user.id })
+    }
     await c.env.DB.prepare(`UPDATE wallet_withdrawals SET status='failed', ledger_debited=0, result_desc=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`).bind(payout.error || 'B2C failed', reference).run()
     return c.json({ error: payout.error || 'Disbursal failed; wallet has been refunded.' }, 502)
   }
@@ -4033,8 +4217,8 @@ app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', '
   await c.env.DB.prepare(`UPDATE wallet_withdrawals SET simulated=?, b2c_request_id=?, conversation_id=?, transaction_charges=?, status=?, updated_at=CURRENT_TIMESTAMP WHERE reference=?`)
     .bind(payout.simulated ? 1 : 0, payout.b2c_request_id || null, payout.conversation_id || null, numberVal(payout.transaction_charges, 0), payout.simulated ? 'success' : 'processing', reference).run()
 
-  await audit(c, user.id, 'withdraw', 'wallet', `KES ${amount} to ${chan.name} ${receiver} (${payout.simulated ? 'sim' : 'live'})`)
-  return c.json({ ok: true, simulated: payout.simulated, reference, status: payout.simulated ? 'success' : 'processing', customer_message: payout.customer_message || (payout.simulated ? 'Withdrawal completed (simulation).' : 'Withdrawal is being processed.') })
+  await audit(c, user.id, 'withdraw', 'wallet', `KES ${amount} (+KES ${charge} charge) to ${chan.name} ${receiver} (${payout.simulated ? 'sim' : 'live'})`)
+  return c.json({ ok: true, simulated: payout.simulated, reference, amount, charge, total_debited: totalDebit, status: payout.simulated ? 'success' : 'processing', customer_message: payout.customer_message || (payout.simulated ? 'Withdrawal completed (simulation).' : 'Withdrawal is being processed.') })
 })
 
 app.get('/api/wallet/withdrawals', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
