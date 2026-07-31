@@ -2012,7 +2012,8 @@ async function viewMyWallet() {
       <div class="text-2xl font-bold text-teal-700">${fmt(wallet?.balance)}</div>
       <div class="text-xs text-slate-400 mt-1">${esc(wallet?.currency || 'KES')} · ${esc(wallet?.status || 'active')}</div>
       ${withdrawable != null ? `<div class="text-xs text-slate-500 mt-1">Withdrawable now: <b class="text-teal-700">${fmt(withdrawable)}</b>${(wdCharge && wdCharge.enabled) ? ' <span class="text-slate-400">(after withdrawal charge)</span>' : ''}</div>` : ''}
-      <button onclick="withdrawModal(${Number(wallet?.balance || 0)})" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs mt-3"><i class="fas fa-money-bill-transfer mr-1"></i>Withdraw</button>
+      <button onclick="sendMoneyModal(${Number(wallet?.balance || 0)})" class="btn brand-bg text-white px-3 py-1.5 rounded-lg text-xs mt-3"><i class="fas fa-paper-plane mr-1"></i>Send</button>
+      <button onclick="withdrawModal(${Number(wallet?.balance || 0)})" class="btn bg-white border px-3 py-1.5 rounded-lg text-xs mt-3 ml-1"><i class="fas fa-money-bill-transfer mr-1"></i>Withdraw</button>
       <button onclick="payoutAccountsModal()" class="btn bg-white border px-3 py-1.5 rounded-lg text-xs mt-3 ml-1"><i class="fas fa-building-columns mr-1"></i>Payout accounts</button>
     </div>
     <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Total earned</div><div class="text-2xl font-bold text-emerald-600">${fmt(analytics?.totals?.total_earned)}</div></div>
@@ -2030,7 +2031,7 @@ async function viewMyWallet() {
 async function viewWallets() {
   let wallets = [], analytics = null
   try {
-    const [w, a] = await Promise.all([api.get('/wallets'), api.get('/wallet/analytics')])
+    const [w, a] = await Promise.all([api.get('/wallets'), api.get('/wallet/analytics?scope=global')])
     wallets = w.data.wallets || []
     analytics = a.data
   } catch (err) { toast(err.response?.data?.error || 'Failed to load wallets', false) }
@@ -2169,15 +2170,30 @@ window.withdrawModal = async (balance) => {
         </select></div>
       <div><label class="field-label" id="wd_chanlbl">Network</label>
         <select id="wd_channel" class="w-full px-3 py-2 border rounded-lg"></select></div>
-      <div><label class="field-label">Account / phone number</label>
+      <!-- PHONE NUMBER LOCK: mobile / SasaPay-wallet cash-outs always go to the
+           holder's own registered number — no custom / third-party input. -->
+      <div id="wd_phonelock">
+        <label class="field-label">Destination (registered number)</label>
+        <div class="flex items-center gap-2 px-3 py-2 border rounded-lg bg-slate-50">
+          <i class="fas fa-lock text-slate-400 text-xs"></i>
+          <span class="text-sm font-medium text-slate-700">${esc(state.user?.phone || '—')}</span>
+        </div>
+        <div class="text-xs text-slate-400 mt-1">Withdrawals are locked to your registered phone number.</div>
+      </div>
+      <div id="wd_bankacct" style="display:none"><label class="field-label">Bank account number</label>
         <div class="flex gap-2">
-          <input id="wd_account" type="text" placeholder="e.g. 0712345678" class="flex-1 px-3 py-2 border rounded-lg">
+          <input id="wd_account" type="text" placeholder="Bank account number" class="flex-1 px-3 py-2 border rounded-lg">
           <button type="button" onclick="doValidateWithdrawAccount()" class="btn px-3 bg-slate-100 rounded-lg text-xs whitespace-nowrap">Verify</button>
         </div>
         <div id="wd_acctname" class="text-xs text-emerald-700 mt-1"></div></div>
     </div>
     <label class="field-label mt-3">Amount (KES)</label><input id="wd_amt" type="number" class="w-full px-3 py-2 border rounded-lg mb-3">
     <label class="field-label">Reason (optional)</label><input id="wd_reason" placeholder="e.g. Cash out earnings" class="w-full px-3 py-2 border rounded-lg mb-3">
+    <div id="wd_otpbox" class="mb-3" style="display:none">
+      <label class="field-label">Verification code (OTP)</label>
+      <input id="wd_otp" type="text" inputmode="numeric" placeholder="Enter the code sent to your phone" class="w-full px-3 py-2 border rounded-lg">
+      <div id="wd_otphint" class="text-xs text-slate-500 mt-1"></div>
+    </div>
     <div id="wd_status"></div>
     <div class="flex gap-2 mt-2"><button id="wd_btn" onclick="doWithdraw()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Withdraw</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
   onWithdrawTypeChange()
@@ -2189,6 +2205,11 @@ window.onWithdrawTypeChange = () => {
   let list = type === 'mobile' ? (cat.mobile || []) : type === 'bank' ? (cat.banks || cat.bank || []) : (cat.wallet || [])
   if (lbl) lbl.textContent = type === 'bank' ? 'Select Bank' : (type === 'wallet' ? 'Wallet' : 'Network')
   if (sel) sel.innerHTML = list.map(ch => `<option value="${esc(ch.code)}">${esc(ch.name)}</option>`).join('') || '<option value="">— none —</option>'
+  // PHONE NUMBER LOCK: mobile / wallet → registered-number display; bank → account input.
+  const isBank = type === 'bank'
+  const lock = $('wd_phonelock'); const bank = $('wd_bankacct')
+  if (lock) lock.style.display = isBank ? 'none' : ''
+  if (bank) bank.style.display = isBank ? '' : 'none'
 }
 window.onWithdrawSavedChange = () => {
   const saved = $('wd_saved')?.value
@@ -2210,11 +2231,34 @@ window.doWithdraw = async () => {
   const payload = { amount, reason: $('wd_reason')?.value || null }
   const saved = $('wd_saved')?.value
   if (saved) payload.payout_account_id = Number(saved)
-  else { payload.channel_code = $('wd_channel')?.value; payload.account_number = $('wd_account')?.value }
+  else {
+    payload.channel_code = $('wd_channel')?.value
+    // PHONE NUMBER LOCK: only a bank withdrawal carries an account number; for
+    // mobile / SasaPay-wallet the backend forces the registered phone number.
+    if (($('wd_type')?.value || 'mobile') === 'bank') payload.account_number = $('wd_account')?.value
+  }
+  // If the OTP box is showing, include the entered code (second step).
+  const otpBox = $('wd_otpbox')
+  if (otpBox && otpBox.style.display !== 'none') {
+    const code = String($('wd_otp')?.value || '').trim()
+    if (!code) return toast('Enter the verification code', false)
+    payload.otp_code = code
+  }
   const btn = $('wd_btn'); btn.disabled = true; btn.classList.add('opacity-50')
   $('wd_status').innerHTML = `<div class="text-xs text-slate-500 mb-2"><i class="fas fa-spinner fa-spin mr-1"></i>Processing withdrawal…</div>`
   try {
     const { data } = await api.post('/wallet/withdraw', payload)
+    // ---- OTP STEP: backend asks us to verify before committing. ----
+    if (data.needs_otp) {
+      if (otpBox) otpBox.style.display = ''
+      const hint = $('wd_otphint')
+      if (hint) hint.innerHTML = `${esc(data.message || 'Enter the code sent to your registered number.')} ${data.phone ? `<span class="text-slate-400">(${esc(data.phone)})</span>` : ''}${data.demo_otp ? ` <b class="text-teal-700">Demo code: ${esc(data.demo_otp)}</b>` : ''}`
+      if (btn) btn.textContent = 'Confirm withdrawal'
+      $('wd_status').innerHTML = ''
+      const otpEl = $('wd_otp'); if (otpEl) otpEl.focus()
+      btn.disabled = false; btn.classList.remove('opacity-50')
+      return
+    }
     closeModal(); toast(data.customer_message || `Withdrawal ${data.status} (${data.reference})`); viewMyWallet()
   } catch (err) {
     const d = err.response?.data || {}
@@ -2242,6 +2286,109 @@ window.doWithdraw = async () => {
     }
     $('wd_status').innerHTML = html
     btn.disabled = false; btn.classList.remove('opacity-50')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// P2P "SEND MONEY" — step-by-step peer-to-peer transfer to another Farmsky
+// user/wallet. Step 1: recipient + amount. Step 2: OTP authorisation. Every
+// outgoing transfer is OTP-verified (code sent to the sender's registered
+// number) before it is committed to the ledger.
+// ---------------------------------------------------------------------------
+let _p2p = null  // { step, recipient, amount, reason }
+window.sendMoneyModal = (balance) => {
+  _p2p = { step: 1, recipient: null, amount: 0, reason: '' }
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-paper-plane text-teal-600 mr-2"></i>Send money</h3>
+    <p class="text-xs text-slate-500 mb-3">Send funds directly to another Farmsky user's wallet. Available balance: <b>${fmt(balance)}</b>.</p>
+    <div id="p2p_body"></div>`)
+  renderP2PStep(balance)
+}
+function renderP2PStep(balance) {
+  const body = $('p2p_body'); if (!body) return
+  if (_p2p.step === 1) {
+    body.innerHTML = `
+      <label class="field-label">Recipient phone number</label>
+      <div class="flex gap-2">
+        <input id="p2p_phone" type="text" placeholder="e.g. 0712345678" class="flex-1 px-3 py-2 border rounded-lg" oninput="_p2p.recipient=null;$('p2p_recip').innerHTML=''">
+        <button type="button" onclick="doLookupRecipient()" class="btn px-3 bg-slate-100 rounded-lg text-xs whitespace-nowrap">Find</button>
+      </div>
+      <div id="p2p_recip" class="text-xs mt-1"></div>
+      <label class="field-label mt-3">Amount (KES)</label>
+      <input id="p2p_amt" type="number" class="w-full px-3 py-2 border rounded-lg mb-3">
+      <label class="field-label">Note (optional)</label>
+      <input id="p2p_reason" placeholder="e.g. Payment for goods" class="w-full px-3 py-2 border rounded-lg mb-3">
+      <div id="p2p_status"></div>
+      <div class="flex gap-2 mt-2">
+        <button id="p2p_next" onclick="doSendMoney()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Continue</button>
+        <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+      </div>`
+  } else if (_p2p.step === 2) {
+    const r = _p2p.recipient || {}
+    body.innerHTML = `
+      <div class="bg-slate-50 border rounded-lg p-3 text-sm mb-3">
+        <div class="flex justify-between"><span class="text-slate-500">To</span><b>${esc(r.name || 'Farmsky user')}</b></div>
+        <div class="flex justify-between mt-1"><span class="text-slate-500">Amount</span><b class="text-teal-700">${fmt(_p2p.amount)}</b></div>
+      </div>
+      <label class="field-label">Verification code (OTP)</label>
+      <input id="p2p_otp" type="text" inputmode="numeric" placeholder="Enter the code sent to your phone" class="w-full px-3 py-2 border rounded-lg">
+      <div id="p2p_otphint" class="text-xs text-slate-500 mt-1"></div>
+      <div id="p2p_status" class="mt-2"></div>
+      <div class="flex gap-2 mt-3">
+        <button id="p2p_confirm" onclick="doSendMoney()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Confirm & send</button>
+        <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+      </div>`
+    const otpEl = $('p2p_otp'); if (otpEl) otpEl.focus()
+  }
+}
+window.doLookupRecipient = async () => {
+  const phone = String($('p2p_phone')?.value || '').trim()
+  const box = $('p2p_recip')
+  if (!phone) { if (box) { box.className = 'text-xs text-red-600 mt-1'; box.textContent = 'Enter a phone number.' } return }
+  if (box) { box.className = 'text-xs text-slate-500 mt-1'; box.textContent = 'Searching…' }
+  try {
+    const { data } = await api.get('/wallet/lookup-recipient', { params: { phone } })
+    _p2p.recipient = data.recipient
+    if (box) { box.className = 'text-xs text-emerald-700 mt-1'; box.innerHTML = `<i class="fas fa-check-circle mr-1"></i>${esc(data.recipient.name)} · ${esc(data.recipient.phone)}` }
+  } catch (err) {
+    _p2p.recipient = null
+    if (box) { box.className = 'text-xs text-red-600 mt-1'; box.textContent = err.response?.data?.error || 'Recipient not found.' }
+  }
+}
+window.doSendMoney = async () => {
+  if (_p2p.step === 1) {
+    const amount = Number($('p2p_amt')?.value || 0)
+    const phone = String($('p2p_phone')?.value || '').trim()
+    if (!phone) return toast('Enter the recipient phone number', false)
+    if (amount <= 0) return toast('Enter a valid amount', false)
+    _p2p.amount = amount
+    _p2p.reason = $('p2p_reason')?.value || ''
+    _p2p.phone = phone
+  }
+  const payload = { recipient_phone: _p2p.phone, amount: _p2p.amount, reason: _p2p.reason || null }
+  if (_p2p.step === 2) {
+    const code = String($('p2p_otp')?.value || '').trim()
+    if (!code) return toast('Enter the verification code', false)
+    payload.otp_code = code
+  }
+  const btn = _p2p.step === 1 ? $('p2p_next') : $('p2p_confirm')
+  if (btn) { btn.disabled = true; btn.classList.add('opacity-50') }
+  const status = $('p2p_status')
+  if (status) status.innerHTML = `<div class="text-xs text-slate-500"><i class="fas fa-spinner fa-spin mr-1"></i>Processing…</div>`
+  try {
+    const { data } = await api.post('/wallet/transfer', payload)
+    if (data.needs_otp) {
+      _p2p.step = 2
+      if (data.recipient) _p2p.recipient = { ...(_p2p.recipient || {}), name: data.recipient.name }
+      renderP2PStep()
+      const hint = $('p2p_otphint')
+      if (hint) hint.innerHTML = `${esc(data.message || 'Enter the code sent to your registered number.')} ${data.phone ? `<span class="text-slate-400">(${esc(data.phone)})</span>` : ''}${data.demo_otp ? ` <b class="text-teal-700">Demo code: ${esc(data.demo_otp)}</b>` : ''}`
+      return
+    }
+    closeModal(); toast(data.customer_message || `Sent (${data.reference})`); viewMyWallet()
+  } catch (err) {
+    const d = err.response?.data || {}
+    if (status) status.innerHTML = `<div class="bg-red-50 border border-red-200 rounded-lg p-2 text-xs text-red-700">${esc(d.error || 'Transfer failed')}</div>`
+    if (btn) { btn.disabled = false; btn.classList.remove('opacity-50') }
   }
 }
 
