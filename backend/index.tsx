@@ -870,6 +870,14 @@ async function verifyOtp(c: any, phone: string, code: string, purpose: string): 
   await c.env.DB.prepare(`UPDATE otp_codes SET consumed=1 WHERE id=?`).bind(row.id).run()
   return { ok: true }
 }
+// Mask a phone number for display in OTP prompts, e.g. 254712345678 -> 2547****5678.
+function maskPhone(phone: string): string {
+  const p = String(phone || '').trim()
+  if (p.length <= 6) return p ? p.replace(/.(?=.{2})/g, '*') : p
+  const head = p.slice(0, 4)
+  const tail = p.slice(-4)
+  return `${head}${'*'.repeat(Math.max(2, p.length - 8))}${tail}`
+}
 
 // ----------------------------------------------------------------------------
 // AUTH
@@ -4040,18 +4048,42 @@ app.post('/api/wallet/payouts', requireAuth, requirePermission('manage_wallets')
 app.get('/api/wallet/analytics', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
   const user = c.get('user') as SessionUser
   const isAdmin = hasPermission(user, 'manage_wallets') && ['admin', 'super_admin'].includes(user.role)
-  // With ownership RLS active, the SAME query returns per-agent data for agents
-  // and platform-wide data for admins — no branching in the query itself.
+  // `scope=self` (default) always reports figures for the CALLER'S OWN wallet
+  // only — statement, Total Debited and Total Earned are strictly scoped to the
+  // active wallet id (double-entry integrity). `scope=global` is an admin-only
+  // platform-wide roll-up used by the admin Wallets view.
+  const requested = String(c.req.query('scope') || 'self')
+  const wantGlobal = requested === 'global' && isAdmin
+
+  if (wantGlobal) {
+    // Platform-wide roll-up (admin). Runs under admin context so RLS does not clip it.
+    return await withAdminContext(c, async () => {
+      const byCategory = await c.env.DB.prepare(
+        `SELECT category, entry_type, COUNT(*) AS entries, COALESCE(SUM(amount),0) AS total
+           FROM wallet_ledger GROUP BY category, entry_type ORDER BY category`
+      ).all()
+      const totals = await c.env.DB.prepare(
+        `SELECT COALESCE(SUM(CASE WHEN entry_type='credit' THEN amount ELSE 0 END),0) AS total_earned,
+                COALESCE(SUM(CASE WHEN entry_type='debit'  THEN amount ELSE 0 END),0) AS total_debited
+           FROM wallet_ledger`
+      ).first<any>()
+      return c.json({ scope: 'global', totals, by_category: byCategory.results })
+    })
+  }
+
+  // Self scope: explicitly filter by the caller's own wallet id so the numbers
+  // never depend on RLS session context and can never leak another wallet's data.
+  const walletId = await ensureWallet(c, user.id)
   const byCategory = await c.env.DB.prepare(
     `SELECT category, entry_type, COUNT(*) AS entries, COALESCE(SUM(amount),0) AS total
-       FROM wallet_ledger GROUP BY category, entry_type ORDER BY category`
-  ).all()
+       FROM wallet_ledger WHERE wallet_id=? GROUP BY category, entry_type ORDER BY category`
+  ).bind(walletId).all()
   const totals = await c.env.DB.prepare(
     `SELECT COALESCE(SUM(CASE WHEN entry_type='credit' THEN amount ELSE 0 END),0) AS total_earned,
             COALESCE(SUM(CASE WHEN entry_type='debit'  THEN amount ELSE 0 END),0) AS total_debited
-       FROM wallet_ledger`
-  ).first<any>()
-  return c.json({ scope: isAdmin ? 'global' : 'self', totals, by_category: byCategory.results })
+       FROM wallet_ledger WHERE wallet_id=?`
+  ).bind(walletId).first<any>()
+  return c.json({ scope: 'self', wallet_id: walletId, totals, by_category: byCategory.results })
 })
 
 // ============================================================================
@@ -4107,9 +4139,14 @@ app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', '
   const amount = roundMoney(numberVal(b.amount, 0))
   if (amount <= 0) return c.json({ error: 'amount must be > 0' }, 400)
 
-  // Resolve the destination: either a saved payout account, or an inline channel+number.
+  // Resolve the destination channel. The DESTINATION NUMBER is always LOCKED to
+  // the user's own registered phone — custom / third-party cash-out numbers are
+  // strictly prohibited. Bank withdrawals still honour a saved bank payout
+  // account (a bank account can't be the phone number), but mobile / wallet
+  // cash-outs are forced to the registered number regardless of any input.
+  const registeredPhone = sasapayNormalizePhone(String(user.phone || '').trim())
   let channelCode = String(b.channel_code || '').trim()
-  let receiver = String(b.account_number || '').trim()
+  let receiver = ''
   let recipientName: string | null = b.account_name || null
   if (b.payout_account_id) {
     const acct = await c.env.DB.prepare(`SELECT * FROM payout_accounts WHERE id=? AND user_id=?`).bind(b.payout_account_id, user.id).first<any>()
@@ -4120,8 +4157,26 @@ app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', '
   }
   const chan = channelByCode(channelCode)
   if (!chan) return c.json({ error: 'A valid withdrawal channel is required' }, 400)
+  if (chan.type === 'mobile' || chan.type === 'wallet') {
+    // PHONE NUMBER LOCK: ignore any client-supplied number; use the registered one.
+    if (!registeredPhone) return c.json({ error: 'Your account has no registered phone number. Please update your profile.' }, 400)
+    receiver = registeredPhone
+    recipientName = recipientName || user.full_name || null
+  }
   if (!receiver) return c.json({ error: 'A destination account is required' }, 400)
   if (chan.type === 'mobile' || chan.type === 'wallet') receiver = sasapayNormalizePhone(receiver)
+
+  // ---- OTP AUTHORISATION (mandatory before any outgoing funds) ----------------
+  // Two-step: first call (no otp_code) issues an OTP to the registered number and
+  // returns needs_otp; second call (with otp_code) verifies it before we debit.
+  if (!registeredPhone) return c.json({ error: 'Your account has no registered phone number for OTP.' }, 400)
+  const otpCode = String(b.otp_code || '').trim()
+  if (!otpCode) {
+    const { demo_otp } = await issueOtp(c, registeredPhone, 'wallet_withdraw')
+    return c.json({ needs_otp: true, phone: maskPhone(registeredPhone), message: 'Enter the code sent to your registered number to authorise this withdrawal.', demo_otp })
+  }
+  const otpOk = await verifyOtp(c, registeredPhone, otpCode, 'wallet_withdraw')
+  if (!otpOk.ok) return c.json({ error: otpOk.error || 'Invalid verification code.', otp_failed: true }, 400)
 
   const reference = ref('WD')
   const walletId = await ensureWallet(c, user.id)
@@ -4224,6 +4279,137 @@ app.post('/api/wallet/withdraw', requireAuth, requirePermission('view_wallet', '
 app.get('/api/wallet/withdrawals', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
   const { results } = await c.env.DB.prepare(`SELECT * FROM wallet_withdrawals ORDER BY id DESC LIMIT 100`).all()
   return c.json({ withdrawals: results })
+})
+
+// ============================================================================
+// P2P FUND TRANSFER ("Send Money") — a wallet holder sends funds directly to
+// another user/wallet inside Farmsky. Double-entry: debit sender, credit
+// recipient (both via postLedger). OTP-authorised before any funds move, and
+// the OTP is dispatched to the SENDER's registered phone number.
+//
+// Two-step, like the withdrawal flow:
+//   1) POST with a recipient + amount (no otp_code) → resolves recipient, runs
+//      an insufficient-balance pre-check, issues an OTP, returns needs_otp.
+//   2) POST again with otp_code → verifies, then commits the double-entry.
+// ============================================================================
+
+// Resolve a P2P recipient from a phone number (preferred) or explicit user_id.
+// Returns the recipient user row (admin-context read so we can look up any user)
+// or an { error } object.
+async function resolveTransferRecipient(c: any, b: any): Promise<{ user?: any; error?: string }> {
+  return await withAdminContext(c, async () => {
+    const rawUserId = String(b.recipient_user_id ?? '').trim()
+    if (rawUserId) {
+      const u = await c.env.DB.prepare(`SELECT id, full_name, phone, status FROM users WHERE id=?`).bind(rawUserId).first<any>()
+      if (!u) return { error: 'Recipient not found.' }
+      return { user: u }
+    }
+    const rawPhone = String(b.recipient_phone ?? '').trim()
+    if (!rawPhone) return { error: 'A recipient phone number is required.' }
+    const norm = sasapayNormalizePhone(rawPhone)
+    const local = norm.startsWith('254') ? '0' + norm.slice(3) : rawPhone
+    const plus = norm ? '+' + norm : rawPhone
+    const u = await c.env.DB.prepare(
+      `SELECT id, full_name, phone, status FROM users WHERE phone=? OR phone=? OR phone=? OR phone=?`
+    ).bind(rawPhone, norm, plus, local).first<any>()
+    if (!u) return { error: 'No Farmsky user is registered with that phone number.' }
+    return { user: u }
+  })
+}
+
+// Look up a recipient (used by the frontend to preview the name before sending).
+app.get('/api/wallet/lookup-recipient', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const found = await resolveTransferRecipient(c, { recipient_phone: c.req.query('phone'), recipient_user_id: c.req.query('user_id') })
+  if (found.error) return c.json({ error: found.error }, 404)
+  const recipient = found.user
+  if (String(recipient.id) === String(user.id)) return c.json({ error: 'You cannot send money to yourself.' }, 400)
+  if (recipient.status && recipient.status !== 'active') return c.json({ error: 'That account cannot receive funds.' }, 400)
+  return c.json({ ok: true, recipient: { id: recipient.id, name: recipient.full_name || 'Farmsky user', phone: maskPhone(sasapayNormalizePhone(String(recipient.phone || ''))) } })
+})
+
+app.post('/api/wallet/transfer', requireAuth, requirePermission('view_wallet', 'manage_wallets'), async (c) => {
+  const user = c.get('user') as SessionUser
+  const b = await c.req.json()
+  const amount = roundMoney(numberVal(b.amount, 0))
+  if (amount <= 0) return c.json({ error: 'amount must be > 0' }, 400)
+
+  // Resolve the recipient (by phone or explicit user_id).
+  const found = await resolveTransferRecipient(c, b)
+  if (found.error) return c.json({ error: found.error }, 404)
+  const recipient = found.user
+  if (String(recipient.id) === String(user.id)) return c.json({ error: 'You cannot send money to yourself.' }, 400)
+  if (recipient.status && recipient.status !== 'active') return c.json({ error: 'That account cannot receive funds.' }, 400)
+
+  // Sender's wallet + balance (strictly the caller's own wallet).
+  const senderWalletId = await ensureWallet(c, user.id)
+  const senderRow = await c.env.DB.prepare(`SELECT balance FROM wallets WHERE id=?`).bind(senderWalletId).first<any>()
+  const balance = roundMoney(numberVal(senderRow?.balance, 0))
+  if (amount > balance) {
+    return c.json({ error: 'Unsuccessful. You have insufficient Balance', insufficient: true, balance }, 400)
+  }
+
+  // ---- OTP AUTHORISATION (mandatory before any outgoing funds) ----------------
+  const registeredPhone = sasapayNormalizePhone(String(user.phone || '').trim())
+  if (!registeredPhone) return c.json({ error: 'Your account has no registered phone number for OTP.' }, 400)
+  const otpCode = String(b.otp_code || '').trim()
+  if (!otpCode) {
+    const { demo_otp } = await issueOtp(c, registeredPhone, 'wallet_transfer')
+    return c.json({
+      needs_otp: true,
+      phone: maskPhone(registeredPhone),
+      recipient: { id: recipient.id, name: recipient.full_name || 'Farmsky user' },
+      amount,
+      message: 'Enter the code sent to your registered number to authorise this transfer.',
+      demo_otp
+    })
+  }
+  const otpOk = await verifyOtp(c, registeredPhone, otpCode, 'wallet_transfer')
+  if (!otpOk.ok) return c.json({ error: otpOk.error || 'Invalid verification code.', otp_failed: true }, 400)
+
+  const reference = ref('P2P')
+  const note = String(b.reason || '').trim()
+
+  // Commit the double-entry under admin context (so we can credit the recipient's
+  // wallet regardless of RLS). The DB trigger rejects the sender debit if the
+  // balance is short — defence-in-depth against a race with the pre-check.
+  try {
+    await withAdminContext(c, async () => {
+      const recipientWalletId = await ensureWallet(c, recipient.id)
+      // 1) Debit the sender first (trigger enforces sufficient balance).
+      await postLedger(c, {
+        userId: user.id, walletId: senderWalletId, type: 'debit', amount,
+        category: 'p2p_transfer', reference,
+        description: note || `Sent to ${recipient.full_name || 'user'}`, createdBy: user.id
+      })
+      // 2) Credit the recipient.
+      await postLedger(c, {
+        userId: recipient.id, walletId: recipientWalletId, type: 'credit', amount,
+        category: 'p2p_transfer', reference,
+        description: note || `Received from ${user.full_name || 'a Farmsky user'}`, createdBy: user.id
+      })
+      // 3) Record the transfer.
+      await c.env.DB.prepare(
+        `INSERT INTO wallet_withdrawals (reference, flow, wallet_id, user_id, recipient_user_id, amount, currency, channel_code, channel_name, receiver_number, recipient_name, reason, status, ledger_debited, created_by)
+         VALUES (?, 'p2p_transfer', ?,?,?,?, 'KES', '0', 'Farmsky Wallet (P2P)', ?, ?, ?, 'success', 1, ?)`
+      ).bind(reference, senderWalletId, user.id, String(recipient.id), amount, sasapayNormalizePhone(String(recipient.phone || '')), recipient.full_name || null, note || 'P2P transfer', user.id).run()
+    })
+  } catch (e: any) {
+    const msg = String(e?.message || '')
+    if (/insufficient/i.test(msg)) {
+      return c.json({ error: 'Unsuccessful. You have insufficient Balance', insufficient: true }, 400)
+    }
+    return c.json({ error: 'Transfer could not be completed' }, 400)
+  }
+
+  // Notify both parties by SMS (simulated when unconfigured).
+  try {
+    if (user.phone) await sendSms(c.env, user.phone, `You sent KES ${amount.toLocaleString()} to ${recipient.full_name || 'a Farmsky user'}. Ref ${reference}.`)
+    if (recipient.phone) await sendSms(c.env, String(recipient.phone), `You received KES ${amount.toLocaleString()} from ${user.full_name || 'a Farmsky user'}. Ref ${reference}.`)
+  } catch (_) {}
+
+  await audit(c, user.id, 'transfer', 'wallet', `KES ${amount} to user ${recipient.id} (${recipient.full_name || ''})`)
+  return c.json({ ok: true, reference, amount, recipient: { id: recipient.id, name: recipient.full_name || 'Farmsky user' }, status: 'success', customer_message: `KES ${amount.toLocaleString()} sent to ${recipient.full_name || 'the recipient'}.` })
 })
 
 // ============================================================================
