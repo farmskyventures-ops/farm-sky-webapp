@@ -1780,6 +1780,36 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
 // Body: { customer_id?, delivery_location?, consent, items: [ { product_id,
 //         quantity, payment_type, term_months } ] }
 // ----------------------------------------------------------------------------
+// KYC PRE-CHECK for checkout. Resolves the buyer (the farmer themselves for a
+// self-purchase, or the agent's selected roster farmer for a Buy-For order) and
+// reports whether their registration/KYC is complete. The client calls this the
+// moment "Place an Order" is pressed so an unverified buyer is redirected to the
+// registration flow BEFORE any order is created — for both cash and financing.
+app.post('/api/checkout/kyc-check', requireAuth, async (c) => {
+  const user = c.get('user')
+  const { customer_id } = await c.req.json().catch(() => ({}))
+  let custId = customer_id
+  if (user.role === 'customer') {
+    const myCust = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id FROM customers WHERE user_id=?`).bind(user.id).first<any>())
+    if (!myCust) return c.json({ error: 'Customer profile not found' }, 404)
+    custId = myCust.id
+  }
+  if (!custId) return c.json({ error: 'No buyer selected for this order' }, 400)
+  const custRow = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id, full_name, mobile, agent_id, kyc_status FROM customers WHERE id=?`).bind(custId).first<any>())
+  if (!custRow) return c.json({ error: 'Farmer not found' }, 404)
+  // Agents may only run this for a farmer on their own roster.
+  if (user.role === 'agent' && String(custRow.agent_id) !== String(user.id)) {
+    return c.json({ error: 'You can only place orders for farmers assigned to you.' }, 403)
+  }
+  const verified = custRow.kyc_status === 'verified'
+  return c.json({
+    verified,
+    kyc_status: custRow.kyc_status || 'pending',
+    customer_id: custRow.id,
+    farmer: { id: custRow.id, name: custRow.full_name || 'Farmer', phone: custRow.mobile || '' }
+  })
+})
+
 app.post('/api/murabaha/apply-bundle', requireAuth, async (c) => {
   const user = c.get('user')
   const { customer_id, delivery_location, consent, items } = await c.req.json()
