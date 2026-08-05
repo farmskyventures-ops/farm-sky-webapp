@@ -1175,6 +1175,7 @@ window.buyModal = async (productId) => {
   ].join('')
   showModal(`
     <h3 class="text-lg font-bold mb-1">Purchase: ${esc(p.name)}</h3>
+    ${_buyFor ? `<div class="mb-2 p-2 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800"><i class="fas fa-cart-plus mr-1"></i>Buying on behalf of <b>${esc(_buyFor.name)}</b>${_buyFor.phone ? ` · ${esc(_buyFor.phone)}` : ''}</div>` : ''}
     <p class="text-xs text-slate-500 mb-4">Configure the order, review the deposit and repayment terms, then consent before purchase.</p>
     <div class="responsive-grid cols-2 text-sm">
       <div style="grid-column:1 / -1"><label class="font-medium">Description</label><div class="mt-1 text-slate-600 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">${esc(p.description || 'No description added')}</div></div>
@@ -1235,6 +1236,14 @@ window.getQuote = async (productId) => {
 }
 window.submitBuy = async (productId) => {
   if (!$('consent').checked) return toast('Consent is required', false)
+  // AGENT SAFETY NET: an agent has no personal customer profile, so an order
+  // MUST target a farmer. If the buy-for session was lost (e.g. after a refresh)
+  // prompt the agent to re-select a farmer instead of firing a request that the
+  // backend rejects with a confusing "Farmer not found".
+  if (state.user.role === 'agent' && !_buyFor) {
+    toast('Select the farmer you are buying for first.', false)
+    closeModal(); return buyForModal()
+  }
   const body = { product_id: productId, quantity: $('qty').value, payment_type: $('ptype').value, term_months: $('term') ? $('term').value : 0, delivery_location: $('dloc').value, consent: true }
   // AGENT "BUY FOR": target the selected farmer (backend validates roster ownership).
   if (_buyFor) body.customer_id = _buyFor.id
@@ -1245,9 +1254,11 @@ window.submitBuy = async (productId) => {
     if (data.requires_payment) {
       // When an agent bought for a farmer, direct the deposit prompt to the
       // farmer's registered phone number (they authorise the deposit).
+      // NOTE: we deliberately KEEP `_buyFor` set so the agent can continue
+      // adding more items for the same farmer after this order — the buy-for
+      // session only ends on an explicit "Cancel Buy-For" (clearBuyFor).
       const farmer = data.buy_for ? (data.farmer || _buyFor) : null
       if (farmer) {
-        _buyFor = null  // order is placed; end the buy-for shopping session
         payModal(data.id, data.amount_due_now, data.outstanding, 'cash', { phone: farmer.phone, name: farmer.name, deposit: true })
       } else {
         payModal(data.id, data.amount_due_now, data.outstanding, 'cash')
@@ -1256,12 +1267,15 @@ window.submitBuy = async (productId) => {
     }
     closeModal()
     if (data.buy_for) {
+      // Order placed for the farmer with no deposit. Keep the buy-for session
+      // active and return the agent to the shop so they can add more items for
+      // the same farmer without re-selecting from the "Buy For" button.
       const who = (data.farmer && data.farmer.name) || (_buyFor && _buyFor.name) || 'the farmer'
-      _buyFor = null
-      toast(`Order placed for ${who}: ${data.contract_ref}. No deposit required — advanced to approval / delivery.`)
-    } else {
-      toast('Application submitted: ' + data.contract_ref)
+      toast(`Order placed for ${who}: ${data.contract_ref}. No deposit required — advanced to approval / delivery. Continue adding items or Cancel Buy-For when done.`)
+      state.route = 'shop'; renderApp()
+      return
     }
+    toast('Application submitted: ' + data.contract_ref)
     state.route = 'contracts'; renderApp()
   } catch (err) {
     const d = err.response?.data
