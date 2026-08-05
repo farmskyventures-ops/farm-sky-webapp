@@ -1767,6 +1767,137 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
     farmer: { id: custRow.id, name: custRow.full_name || 'Farmer', phone: custRow.mobile || '' }
   })
 })
+
+// ----------------------------------------------------------------------------
+// MULTI-PRODUCT BUNDLED CHECKOUT
+// Place a SINGLE checkout that contains several products. Each item keeps its
+// OWN payment_type / term / deposit so every product independently respects its
+// listing (cash) or finance-specified conditions — exactly like placing each
+// order on its own, but grouped under one shared bundle_ref and settled with a
+// single aggregated deposit prompt.
+//
+// Available to farmers (their own basket) AND agents (Buy-For a roster farmer).
+// Body: { customer_id?, delivery_location?, consent, items: [ { product_id,
+//         quantity, payment_type, term_months } ] }
+// ----------------------------------------------------------------------------
+app.post('/api/murabaha/apply-bundle', requireAuth, async (c) => {
+  const user = c.get('user')
+  const { customer_id, delivery_location, consent, items } = await c.req.json()
+  if (!consent) return c.json({ error: 'Customer consent to the configured terms is required' }, 400)
+  if (!Array.isArray(items) || items.length === 0) return c.json({ error: 'Add at least one product to the order' }, 400)
+  if (items.length > 50) return c.json({ error: 'Too many items in a single order' }, 400)
+
+  // Resolve the buyer once. Farmers order for themselves; agents/staff pass a
+  // customer_id (the roster guard below restricts agents to their own farmers).
+  let custId = customer_id
+  if (user.role === 'customer') {
+    const myCust = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT id, agent_id FROM customers WHERE user_id=?`).bind(user.id).first<any>())
+    if (!myCust) return c.json({ error: 'Customer profile not found' }, 404)
+    custId = myCust.id
+  }
+  const custRow = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM customers WHERE id=?`).bind(custId).first<any>())
+  if (!custRow) return c.json({ error: 'Farmer not found' }, 404)
+  // AGENT "BUY FOR" GUARD: an agent may only order for a farmer on their roster.
+  if (user.role === 'agent' && String(custRow.agent_id) !== String(user.id)) {
+    return c.json({ error: 'You can only place orders for farmers assigned to you.' }, 403)
+  }
+
+  const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
+  const bundleRef = ref('BND')
+
+  // ---- PASS 1: validate & quote every item BEFORE writing anything, so a bad
+  // item (out of stock / unknown product / KYC-gated financing) fails the whole
+  // bundle atomically instead of leaving a half-created order. ----
+  const prepared: Array<{ p: any; qty: number; ptype: string; q: any }> = []
+  for (const raw of items) {
+    const productId = raw?.product_id
+    const p = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(productId).first<any>())
+    if (!p) return c.json({ error: `Product not found (id ${productId})` }, 404)
+    if (p.finance_status && p.finance_status !== 'published') return c.json({ error: `"${p.name}" is not yet available for purchase` }, 400)
+    const qty = Math.max(1, Number(raw?.quantity) || 1)
+    if (p.quantity < qty) return c.json({ error: `Insufficient stock for "${p.name}"` }, 400)
+    const ptype = raw?.payment_type === 'cash' ? 'cash' : 'financing'
+    // Each item independently respects its listing/finance conditions: cash must
+    // be enabled for cash items, financing enabled for financed items.
+    if (ptype === 'cash' && p.cash_enabled === 0) return c.json({ error: `"${p.name}" cannot be bought with cash` }, 400)
+    if (ptype === 'financing' && p.financing_enabled === 0) return c.json({ error: `"${p.name}" is not available on financing` }, 400)
+    // Financing requires a verified farmer (TransUnion/KYC), same as single apply.
+    if (ptype === 'financing' && custRow?.kyc_status !== 'verified') {
+      return c.json({
+        error: 'kyc_required',
+        message: 'Complete registration (TransUnion credit check, ID upload, and liveness verification) before equipment financing purchases.',
+        customer_id: custId,
+        product_name: p.name
+      }, 412)
+    }
+    const q = financingQuote(p, qty, ptype, raw?.term_months, feeCfg)
+    prepared.push({ p, qty, ptype, q })
+  }
+
+  // ---- PASS 2: create one contract per item, all under the shared bundle_ref. ----
+  const created: any[] = []
+  let depositDueNow = 0
+  let bundleTotal = 0
+  let bundleOutstanding = 0
+  for (const it of prepared) {
+    const { p, qty, ptype, q } = it
+    const contractRef = ref(ptype === 'cash' ? 'CSH' : (q.financing_model === 'paygo' ? 'PGO' : 'FIN'))
+    const status = ptype === 'cash'
+      ? (q.amount_due_now > 0 ? 'pending_payment' : 'awaiting_cash_balance')
+      : 'pending'
+    const r = await c.env.DB.prepare(
+      `INSERT INTO murabaha_contracts (contract_ref,bundle_ref,customer_id,agent_id,created_by,product_id,quantity,payment_type,supplier_cost,markup_pct,murabaha_price,term_months,monthly_payment,delivery_location,status,ownership_recorded,consent_given,amount_paid,outstanding,financing_model,interest_rate_pct,deposit_pct,deposit_amount,finance_principal,payment_frequency,installment_amount,dispatch_status,terms_document_url,terms_text)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(
+      contractRef, bundleRef, custId, custRow?.agent_id || null, custRow?.onboarded_by || custRow?.agent_id || user.id, p.id, qty, ptype, q.supplier_cost, q.markup_pct,
+      q.total_payable, q.term_months, q.monthly_payment || q.installment_amount || 0, delivery_location || '', status,
+      0, 1, 0, q.total_payable, q.financing_model, q.interest_rate_pct || 0, q.deposit_pct, q.deposit_amount,
+      q.finance_principal, q.payment_frequency, q.installment_amount || 0, 'pending', q.terms_document_url || null, q.terms_text || null
+    ).run()
+    const contractId = r.meta.last_row_id
+    // Only cash deposits are collected via the upfront checkout prompt; financing
+    // deposits are collected on their own schedule at approval time.
+    const itemDueNow = ptype === 'cash' ? numberVal(q.amount_due_now, 0) : 0
+    depositDueNow = roundMoney(depositDueNow + itemDueNow)
+    bundleTotal = roundMoney(bundleTotal + numberVal(q.total_payable, 0))
+    bundleOutstanding = roundMoney(bundleOutstanding + numberVal(q.total_payable, 0))
+    created.push({
+      id: contractId,
+      contract_ref: contractRef,
+      product_id: p.id,
+      product_name: p.name,
+      quantity: qty,
+      payment_type: ptype,
+      status,
+      amount_due_now: itemDueNow,
+      deposit_amount: q.deposit_amount,
+      total_payable: q.total_payable
+    })
+  }
+
+  await audit(c, user.id, 'apply_bundle', 'financing', `${bundleRef} (${created.length} items)`)
+  const cashItems = created.filter(x => x.payment_type === 'cash')
+  return c.json({
+    ok: true,
+    bundle_ref: bundleRef,
+    items: created,
+    item_count: created.length,
+    // Aggregated cash deposit across all cash items in the bundle. When > 0 the
+    // client raises a SINGLE payment prompt (directed to the farmer for Buy-For).
+    deposit_due_now: depositDueNow,
+    requires_payment: depositDueNow > 0,
+    // Settle the combined cash deposit against the first cash item's contract;
+    // remaining cash items with a due deposit are listed so the client can chain
+    // their prompts if a provider requires one STK per contract.
+    pay_contract_id: cashItems.find(x => x.amount_due_now > 0)?.id || null,
+    cash_deposit_contract_ids: cashItems.filter(x => x.amount_due_now > 0).map(x => x.id),
+    bundle_total: bundleTotal,
+    bundle_outstanding: bundleOutstanding,
+    buy_for: user.role === 'agent',
+    farmer: { id: custRow.id, name: custRow.full_name || 'Farmer', phone: custRow.mobile || '' }
+  })
+})
+
 app.get('/api/murabaha', requireAuth, async (c) => {
   const user = c.get('user')
   let q = `SELECT mc.*, p.name as product_name, cu.full_name as customer_name

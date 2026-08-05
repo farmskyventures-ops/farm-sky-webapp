@@ -967,8 +967,10 @@ function prodImg(p, cls) {
     ? `<img src="${esc(p.image)}" alt="${esc(p.name)}" class="${cls} object-cover">`
     : `<div class="${cls} flex items-center justify-center bg-gradient-to-br from-teal-50 to-emerald-100 text-teal-400"><i class="fas fa-box-open text-3xl"></i></div>`
 }
-// Only Farmer (customer) and Offtaker accounts may build a cross-marketplace cart.
-function canUseCart() { return ['customer', 'offtaker'].includes(state.user.role) }
+// Farmer (customer) and Offtaker accounts may build a cross-marketplace cart for
+// their own purchases; an AGENT may build one while in an active Buy-For session
+// (placing a bundled order on behalf of a selected roster farmer).
+function canUseCart() { return ['customer', 'offtaker'].includes(state.user.role) || (state.user.role === 'agent' && !!_buyFor) }
 window.toggleShopMenu = (open) => {
   const d = $('shopDrawer'), o = $('shopDrawerOverlay')
   if (!d) return
@@ -1013,8 +1015,11 @@ async function viewShop() {
   _products = data.products
   // Agent "Buy For" banner: show the selected farmer + a cancel action.
   const buyForBanner = _buyFor ? `<div class="mb-4 p-3 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-between flex-wrap gap-2">
-      <div class="text-sm text-emerald-800"><i class="fas fa-cart-plus mr-1"></i>Buying on behalf of <b>${esc(_buyFor.name)}</b>${_buyFor.phone ? ` · ${esc(_buyFor.phone)}` : ''}. Add products and check out for this farmer.</div>
-      <button onclick="clearBuyFor()" class="btn bg-white border border-emerald-300 text-emerald-700 px-3 py-1.5 rounded-lg text-xs">Cancel Buy-For</button>
+      <div class="text-sm text-emerald-800"><i class="fas fa-cart-plus mr-1"></i>Buying on behalf of <b>${esc(_buyFor.name)}</b>${_buyFor.phone ? ` · ${esc(_buyFor.phone)}` : ''}. Add multiple products to one order, or use <b>Buy</b> for a single item.</div>
+      <div class="flex gap-2">
+        <button onclick="openCart()" class="btn bg-white border border-emerald-300 text-emerald-700 px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-shopping-cart mr-1"></i>Order (${_cart.length})</button>
+        <button onclick="clearBuyFor()" class="btn bg-white border border-emerald-300 text-emerald-700 px-3 py-1.5 rounded-lg text-xs">Cancel Buy-For</button>
+      </div>
     </div>` : ''
   $('content').innerHTML = `${buyForBanner}${shopDrawerHtml()}
     <div class="flex items-center gap-3 mb-4 flex-wrap">
@@ -1055,37 +1060,158 @@ function renderShopGrid() {
   setHTML('shopGrid', `<div class="grid grid-cols-1 md:grid-cols-3 gap-5">${grid}</div>`)
 }
 // ---- Cross-marketplace cart (Farmer / Offtaker only) ----
+// ===========================================================================
+// MULTI-PRODUCT BUNDLED CHECKOUT
+// The cart lets a farmer (or an agent in a Buy-For session) bundle several
+// products into ONE checkout. Products are added incrementally and EACH item
+// carries its OWN terms (payment type + financing term), so every product
+// independently respects its listing (cash) or finance-specified conditions.
+// Cart item shape: { id, name, marketplace, cash_price, credit_price, qty,
+//                    payment_type, term_months, cash_enabled, financing_enabled,
+//                    financing_term_min_months, financing_term_max_months }
+// ===========================================================================
 window.addToCart = (id) => {
-  if (!canUseCart()) return toast('Cart is available to Farmer and Offtaker accounts only.', false)
+  if (!canUseCart()) return toast('Add products to the cart from your own shop or a Buy-For session.', false)
   const p = _products.find(x => x.id === id); if (!p) return
-  const existing = _cart.find(x => x.id === id)
-  if (existing) existing.qty += 1; else _cart.push({ id, name: p.name, cash_price: p.cash_price, marketplace: marketplaceOf(p), qty: 1 })
-  const cc = $('cartCount'); if (cc) cc.textContent = _cart.length
-  toast(`${p.name} added to cart`)
+  // Open the per-item terms picker so the added product respects its own listing.
+  cartItemModal(id)
 }
-window.removeFromCart = (id) => { _cart = _cart.filter(x => x.id !== id); openCart() }
-window.openCart = () => {
-  if (!_cart.length) return showModal(`<h3 class="font-bold mb-3"><i class="fas fa-shopping-cart mr-2"></i>Your Cart</h3><p class="text-slate-400 text-sm mb-4">Your cart is empty. Add items from any marketplace section.</p><button onclick="closeModal()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Close</button>`)
-  const total = _cart.reduce((s, x) => s + Number(x.cash_price) * x.qty, 0)
-  const rows = _cart.map(x => `<div class="flex items-center justify-between py-2 border-b border-slate-100">
-    <div><div class="font-medium text-sm">${esc(x.name)}</div><div class="text-[11px] text-slate-400">${MARKETPLACE_LABELS[x.marketplace] || 'Equipment'} · x${x.qty}</div></div>
-    <div class="flex items-center gap-3"><span class="font-semibold text-sm">${fmt(x.cash_price * x.qty)}</span><button onclick="removeFromCart(${x.id})" class="text-red-500 text-xs hover:underline">remove</button></div>
-  </div>`).join('')
-  showModal(`<h3 class="font-bold mb-3"><i class="fas fa-shopping-cart mr-2"></i>Your Cart <span class="text-xs text-slate-400">(items from any marketplace)</span></h3>
-    ${rows}
-    <div class="flex justify-between font-bold mt-3"><span>Estimated cash total</span><span>${fmt(total)}</span></div>
+// Configure an individual item's terms (payment type, term, quantity) before it
+// joins the bundle. Reused for editing an item already in the cart.
+window.cartItemModal = (id, editIndex) => {
+  const p = _products.find(x => x.id === id)
+  if (!p) return toast('Product unavailable', false)
+  const existing = (typeof editIndex === 'number') ? _cart[editIndex] : null
+  const minTerm = Math.max(1, Number(p.financing_term_min_months || 3))
+  const maxTerm = Math.max(minTerm, Number(p.financing_term_max_months || 12))
+  const curTerm = existing ? Number(existing.term_months) : Math.min(6, maxTerm)
+  const termOptions = Array.from({ length: maxTerm - minTerm + 1 }, (_, i) => minTerm + i)
+    .map(m => `<option value="${m}" ${m === Math.max(minTerm, curTerm) ? 'selected' : ''}>${m}</option>`).join('')
+  const curPtype = existing ? existing.payment_type : (p.cash_enabled ? 'cash' : 'financing')
+  const paymentOptions = [
+    p.cash_enabled ? `<option value="cash" ${curPtype === 'cash' ? 'selected' : ''}>Cash purchase</option>` : '',
+    p.financing_enabled ? `<option value="financing" ${curPtype === 'financing' ? 'selected' : ''}>${p.financing_model === 'paygo' ? 'PAYGO financing' : 'Normal financing'}</option>` : ''
+  ].join('')
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-cart-plus text-emerald-600 mr-2"></i>${existing ? 'Edit item' : 'Add to order'}: ${esc(p.name)}</h3>
+    ${_buyFor ? `<div class="mb-2 p-2 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800"><i class="fas fa-user mr-1"></i>For <b>${esc(_buyFor.name)}</b></div>` : ''}
+    <p class="text-xs text-slate-500 mb-3">Set this item's own terms. Each product in the order keeps its own payment terms.</p>
+    <div class="grid grid-cols-2 gap-3 text-sm">
+      <div><label class="font-medium">Quantity</label><input id="ci_qty" type="number" value="${existing ? existing.qty : 1}" min="1" max="${p.quantity}" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
+      <div><label class="font-medium">Payment Type</label><select id="ci_ptype" onchange="ciToggleTerm()" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg">${paymentOptions}</select></div>
+      <div id="ci_termWrap" class="col-span-2 ${curPtype === 'financing' ? '' : 'hidden'}"><label class="font-medium">Financing Term (months)</label><select id="ci_term" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg">${termOptions}</select></div>
+    </div>
+    <div class="grid grid-cols-2 gap-2 mt-3 text-xs">
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-2"><div class="text-slate-500">Cash price</div><div class="font-semibold">${fmt(p.cash_price)}</div><div class="text-slate-400 mt-0.5">deposit ${Number(p.cash_deposit_pct ?? 100)}%</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-2"><div class="text-slate-500">Financing price</div><div class="font-semibold">${fmt(p.credit_price)}</div><div class="text-slate-400 mt-0.5">deposit ${Number(p.financing_deposit_pct ?? 10)}%</div></div>
+    </div>
     <div class="flex gap-2 mt-4">
-      <button onclick="checkoutCart()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-cash-register mr-1"></i>Checkout items</button>
+      <button onclick="saveCartItem(${p.id}, ${typeof editIndex === 'number' ? editIndex : 'null'})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">${existing ? 'Update item' : 'Add to order'}</button>
+      <button onclick="${existing ? 'openCart()' : 'closeModal()'}" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+    </div>`)
+}
+window.ciToggleTerm = () => { const w = $('ci_termWrap'); if (w) w.classList.toggle('hidden', $('ci_ptype').value !== 'financing') }
+window.saveCartItem = (id, editIndex) => {
+  const p = _products.find(x => x.id === id); if (!p) return
+  const qty = Math.max(1, Number($('ci_qty').value) || 1)
+  const payment_type = $('ci_ptype').value === 'cash' ? 'cash' : 'financing'
+  const term_months = payment_type === 'financing' ? Number($('ci_term')?.value || 0) : 0
+  const item = {
+    id, name: p.name, marketplace: marketplaceOf(p), cash_price: p.cash_price, credit_price: p.credit_price,
+    qty, payment_type, term_months
+  }
+  if (typeof editIndex === 'number' && _cart[editIndex]) { _cart[editIndex] = item; toast(`${p.name} updated`) }
+  else {
+    // Merge into an existing identical line (same product + same terms).
+    const dup = _cart.find(x => x.id === id && x.payment_type === payment_type && x.term_months === term_months)
+    if (dup) { dup.qty += qty; toast(`${p.name} quantity updated`) }
+    else { _cart.push(item); toast(`${p.name} added to your order`) }
+  }
+  const cc = $('cartCount'); if (cc) cc.textContent = _cart.length
+  openCart()
+}
+window.removeFromCart = (index) => { _cart.splice(index, 1); openCart() }
+window.openCart = () => {
+  const who = _buyFor ? ` for ${esc(_buyFor.name)}` : ''
+  if (!_cart.length) return showModal(`<h3 class="font-bold mb-3"><i class="fas fa-shopping-cart mr-2"></i>Your Order${who}</h3><p class="text-slate-400 text-sm mb-4">No products added yet. Add items from any marketplace section — each item keeps its own payment terms.</p><button onclick="closeModal()" class="btn bg-slate-100 px-4 py-2 rounded-lg text-sm">Close</button>`)
+  const cashTotal = _cart.filter(x => x.payment_type === 'cash').reduce((s, x) => s + Number(x.cash_price) * x.qty, 0)
+  const finTotal = _cart.filter(x => x.payment_type === 'financing').reduce((s, x) => s + Number(x.credit_price) * x.qty, 0)
+  const rows = _cart.map((x, i) => `<div class="flex items-center justify-between py-2 border-b border-slate-100">
+    <div class="min-w-0">
+      <div class="font-medium text-sm truncate">${esc(x.name)}</div>
+      <div class="text-[11px] text-slate-400">${MARKETPLACE_LABELS[x.marketplace] || 'Equipment'} · x${x.qty} · ${x.payment_type === 'cash' ? 'Cash' : `Financing ${x.term_months}mo`}</div>
+    </div>
+    <div class="flex items-center gap-3">
+      <span class="font-semibold text-sm">${fmt((x.payment_type === 'cash' ? x.cash_price : x.credit_price) * x.qty)}</span>
+      <button onclick="cartItemModal(${x.id}, ${i})" class="text-slate-500 text-xs hover:underline">edit</button>
+      <button onclick="removeFromCart(${i})" class="text-red-500 text-xs hover:underline">remove</button>
+    </div>
+  </div>`).join('')
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-shopping-cart mr-2"></i>Your Order${who}</h3>
+    <p class="text-xs text-slate-400 mb-3">${_cart.length} item(s) · each item keeps its own payment terms</p>
+    ${rows}
+    ${cashTotal ? `<div class="flex justify-between text-sm mt-3"><span class="text-slate-500">Cash items total</span><span class="font-semibold">${fmt(cashTotal)}</span></div>` : ''}
+    ${finTotal ? `<div class="flex justify-between text-sm"><span class="text-slate-500">Financing items total</span><span class="font-semibold">${fmt(finTotal)}</span></div>` : ''}
+    <div class="flex gap-2 mt-4">
+      <button onclick="checkoutCart()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-cash-register mr-1"></i>Place order</button>
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
     </div>`)
 }
-window.checkoutCart = () => {
-  // Sequential per-item checkout using the existing single-item buy flow so each
-  // item's cash/financing terms + KYC gating still apply individually.
-  const first = _cart[0]
-  if (!first) return closeModal()
-  toast('Checkout each item to confirm its payment terms.')
-  buyModal(first.id)
+// Submit the whole cart as ONE bundled order. Each item keeps its own terms; a
+// single aggregated cash-deposit prompt is raised (directed to the farmer when
+// an agent is buying on their behalf).
+window.checkoutCart = async () => {
+  if (!_cart.length) return closeModal()
+  const items = _cart.map(x => ({ product_id: x.id, quantity: x.qty, payment_type: x.payment_type, term_months: x.term_months }))
+  const body = { items, delivery_location: '', consent: true }
+  if (_buyFor) body.customer_id = _buyFor.id
+  try {
+    const { data } = await api.post('/murabaha/apply-bundle', body)
+    _cart = []  // bundle placed — clear the basket
+    const cc = $('cartCount'); if (cc) cc.textContent = '0'
+    const who = data.buy_for ? ((data.farmer && data.farmer.name) || (_buyFor && _buyFor.name) || 'the farmer') : 'you'
+    if (data.requires_payment && data.pay_contract_id) {
+      // Chain a deposit prompt for each cash item that has a deposit due. The
+      // prompts run sequentially; for Buy-For they target the farmer's phone.
+      const farmer = data.buy_for ? (data.farmer || _buyFor) : null
+      const ids = data.cash_deposit_contract_ids && data.cash_deposit_contract_ids.length ? data.cash_deposit_contract_ids : [data.pay_contract_id]
+      const cashItems = (data.items || []).filter(it => ids.includes(it.id))
+      toast(`Order ${data.bundle_ref} placed (${data.item_count} item(s)). Authorising the ${fmt(data.deposit_due_now)} deposit${cashItems.length > 1 ? 's' : ''}${data.buy_for ? ` from ${who}` : ''}.`)
+      _bundlePayQueue = cashItems.map(it => ({ id: it.id, amount: it.amount_due_now, outstanding: it.total_payable }))
+      _bundlePayOpts = farmer ? { phone: farmer.phone, name: farmer.name, deposit: true } : { deposit: true }
+      return nextBundlePayment()
+    }
+    // No deposit due (all financing, or 0% cash deposits) — advance automatically.
+    closeModal()
+    toast(`Order ${data.bundle_ref} placed for ${who}: ${data.item_count} item(s). No deposit required — advanced to approval / delivery.`)
+    if (_buyFor && state.user.role === 'agent') { state.route = 'shop'; renderApp() }
+    else { state.route = 'contracts'; renderApp() }
+  } catch (err) {
+    const d = err.response?.data
+    if (err.response?.status === 412 && d?.error === 'kyc_required') {
+      return toast(`${d.product_name ? d.product_name + ': ' : ''}${d.message || 'KYC verification required for financing items.'}`, false)
+    }
+    toast(d?.error || 'Could not place the order', false)
+  }
+}
+// Sequential deposit-prompt queue for a bundled checkout (one STK per cash item).
+let _bundlePayQueue = []
+let _bundlePayOpts = {}
+let _payBundleNext = false  // set by payModal when the prompt is a bundle step
+function nextBundlePayment() {
+  const next = _bundlePayQueue.shift()
+  if (!next) {
+    // All deposits handled — land on the shop (agent) or contracts (farmer).
+    if (_buyFor && state.user.role === 'agent') { state.route = 'shop'; renderApp() }
+    else { state.route = 'contracts'; renderApp() }
+    return
+  }
+  payModal(next.id, next.amount, next.outstanding, 'cash', { ..._bundlePayOpts, bundleNext: true })
+}
+// After a successful payment: if it was a bundled-checkout deposit step, advance
+// to the next queued item; otherwise navigate to the contracts list as before.
+function _afterPaySuccess() {
+  if (_payBundleNext) { _payBundleNext = false; return nextBundlePayment() }
+  closeModal(); state.route = 'contracts'; renderApp()
 }
 // ===========================================================================
 // AGENT "BUY FOR" — an agent places an order on behalf of a farmer assigned to
@@ -1140,11 +1266,12 @@ window.buyForFarmer = (farmerId) => {
 }
 function _enterBuyFor(f) {
   _buyFor = { id: f.id, name: f.full_name, phone: f.mobile || '' }
+  _cart = []  // a fresh basket per farmer — never carry items across farmers
   closeModal()
-  toast(`Buying for ${f.full_name}. Add products and check out on their behalf.`)
+  toast(`Buying for ${f.full_name}. Add products to build their order.`)
   state.route = 'shop'; renderApp()
 }
-window.clearBuyFor = () => { _buyFor = null; toast('Buy-For cancelled'); route() }
+window.clearBuyFor = () => { _buyFor = null; _cart = []; toast('Buy-For cancelled'); route() }
 
 window.productDetail = (id) => {
   const p = _products.find(x => x.id === id)
@@ -1433,6 +1560,9 @@ window.deliverContract = async (id) => {
 window.payModal = async (id, amount, outstanding, kind, opts) => {
   kind = kind || 'repay'
   opts = opts || {}
+  // Remember whether this prompt is a step in a bundled-checkout deposit queue,
+  // so a successful payment advances to the next item instead of navigating away.
+  _payBundleNext = !!opts.bundleNext
   const isCash = kind === 'cash'
   // When set (agent Buy-For), the prompt is directed to the farmer's phone.
   const targetPhone = opts.phone || state.user.phone
@@ -1625,7 +1755,7 @@ window.doPay = async (id, kind) => {
         if (cd.status === 'success') {
           payStateAlert('success', null, cd.mpesa_receipt)
           toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
-          setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 1800)
+          setTimeout(() => { _afterPaySuccess() }, 1800)
           return
         }
         else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); reEnable(); return }
@@ -1664,7 +1794,7 @@ window.doSasaOtp = async (checkoutId, id, kind) => {
         if (cd.status === 'success') {
           payStateAlert('success', null, cd.mpesa_receipt)
           toast((isCash ? 'Cash purchase complete! Receipt: ' : 'Payment received! Receipt: ') + cd.mpesa_receipt)
-          setTimeout(() => { closeModal(); state.route = 'contracts'; renderApp() }, 1800)
+          setTimeout(() => { _afterPaySuccess() }, 1800)
           return
         }
         else if (cd.status === 'failed') { payStateAlert('failed', cd.result_desc || 'Payment failed'); return }
