@@ -1152,7 +1152,7 @@ window.openCart = () => {
     ${cashTotal ? `<div class="flex justify-between text-sm mt-3"><span class="text-slate-500">Cash items total</span><span class="font-semibold">${fmt(cashTotal)}</span></div>` : ''}
     ${finTotal ? `<div class="flex justify-between text-sm"><span class="text-slate-500">Financing items total</span><span class="font-semibold">${fmt(finTotal)}</span></div>` : ''}
     <div class="flex gap-2 mt-4">
-      <button onclick="checkoutCart()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-cash-register mr-1"></i>Place order</button>
+      <button onclick="checkoutCart()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-cash-register mr-1"></i>Place an Order</button>
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Close</button>
     </div>`)
 }
@@ -1164,6 +1164,22 @@ window.checkoutCart = async () => {
   const items = _cart.map(x => ({ product_id: x.id, quantity: x.qty, payment_type: x.payment_type, term_months: x.term_months }))
   const body = { items, delivery_location: '', consent: true }
   if (_buyFor) body.customer_id = _buyFor.id
+  // KYC GATE: placing an order requires the buyer to have completed registration.
+  // If they have not, redirect straight to the ID / selfie verification flow
+  // (Screenshot 2) instead of attempting the order. The cart is preserved so the
+  // buyer can finalise the same order right after they finish verifying.
+  try {
+    const check = await api.post('/checkout/kyc-check', _buyFor ? { customer_id: _buyFor.id } : {})
+    if (check.data && !check.data.verified) {
+      toast('Complete registration to place your order.', false)
+      closeModal()
+      // returnToShop=true lands the user back on the shop after verifying, with
+      // their cart intact so they can press "Place an Order" again.
+      return completeRegistration(check.data.customer_id, true)
+    }
+  } catch (err) {
+    return toast(err.response?.data?.error || 'Could not verify registration status', false)
+  }
   try {
     const { data } = await api.post('/murabaha/apply-bundle', body)
     _cart = []  // bundle placed — clear the basket
@@ -1324,6 +1340,7 @@ window.buyModal = async (productId) => {
     <div id="quoteBox" class="mt-4"></div>
     <div class="flex gap-2 mt-5">
       <button onclick="getQuote(${p.id})" class="btn flex-1 bg-slate-800 text-white py-2.5 rounded-lg text-sm"><i class="fas fa-calculator mr-1"></i>Preview Payment Terms</button>
+      ${canUseCart() ? `<button onclick="addMoreFromBuyModal(${p.id})" class="btn px-4 bg-emerald-600 text-white rounded-lg text-sm" title="Add this item and keep shopping"><i class="fas fa-cart-plus mr-1"></i>Add More Items</button>` : ''}
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
     </div>`)
   toggleTerm()
@@ -1417,6 +1434,28 @@ window.submitBuy = async (productId) => {
       </div>`)
     } else { toast(d?.error || 'Failed', false) }
   }
+}
+// "Add More Items" (from the single-product purchase modal): capture the terms
+// currently configured in buyModal into the cart/bundle, then return the buyer
+// to the shop so they can add additional products WITHOUT restarting checkout.
+// The order is only finalised later from the cart's "Place an Order" button.
+window.addMoreFromBuyModal = (productId) => {
+  if (!canUseCart()) return toast('Add products to the cart from your own shop or a Buy-For session.', false)
+  const p = _products.find(x => x.id === productId)
+  if (!p) return toast('Product unavailable', false)
+  const qty = Math.max(1, Number($('qty')?.value) || 1)
+  const payment_type = ($('ptype')?.value === 'cash') ? 'cash' : 'financing'
+  const term_months = payment_type === 'financing' ? Number($('term')?.value || 0) : 0
+  const item = {
+    id: productId, name: p.name, marketplace: marketplaceOf(p), cash_price: p.cash_price, credit_price: p.credit_price,
+    qty, payment_type, term_months
+  }
+  const dup = _cart.find(x => x.id === productId && x.payment_type === payment_type && x.term_months === term_months)
+  if (dup) { dup.qty += qty; toast(`${p.name} quantity updated`) }
+  else { _cart.push(item); toast(`${p.name} added — keep shopping, then Place an Order`) }
+  const cc = $('cartCount'); if (cc) cc.textContent = _cart.length
+  // Return to the marketplace so the buyer can pick more products.
+  closeModal(); state.route = 'shop'; renderApp()
 }
 
 // ---------------------------------------------------------------------------
