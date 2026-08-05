@@ -2954,7 +2954,7 @@ async function viewCustomers() {
   const canEditFarmers = isAdmin || state.user.role === 'agent'
   const isAgent = state.user.role === 'agent'
   const actionBar = canDo('add_farmer') || isAdmin
-    ? `<div class="action-bar"><button onclick="viewOnboard()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Farmer</button>${isAgent ? `<button onclick="buyForModal()" class="btn bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm ml-2"><i class="fas fa-cart-plus mr-1"></i>Buy For a Farmer</button>` : ''}</div>`
+    ? `<div class="action-bar"><button onclick="addCustomerModal()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-user-plus mr-1"></i>Add Customer</button><button onclick="viewOnboard()" class="btn bg-slate-100 text-slate-700 px-4 py-2 rounded-lg text-sm ml-2"><i class="fas fa-leaf mr-1"></i>Full Farmer Onboarding</button>${isAgent ? `<button onclick="buyForModal()" class="btn bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm ml-2"><i class="fas fa-cart-plus mr-1"></i>Buy For a Farmer</button>` : ''}</div>`
     : ''
   $('content').innerHTML = `${actionBar}<div class="card table-card"><table class="w-full text-sm">
     <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Farmer</th><th class="text-left px-4 py-3">Mobile</th><th class="text-left px-4 py-3">County</th><th class="text-left px-4 py-3">Value Chain</th><th class="text-left px-4 py-3">KYC</th><th class="text-left px-4 py-3">Profile Status</th><th class="text-left px-4 py-3">Risk</th><th></th></tr></thead>
@@ -3172,17 +3172,14 @@ async function viewAgents() {
       </td></tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No agents</td></tr>'}</tbody>
   </table></div>`
 }
-window.addAgentModal = () => {
-  showModal(`<h3 class="font-bold mb-1">Onboard New Agent</h3>
-    <p class="text-xs text-slate-500 mb-3">Create the agent's login. Set a password now, or leave blank to auto-generate one.</p>
-    <div class="space-y-3 text-sm">
-    <input id="ag_name" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
-    <input id="ag_phone" placeholder="Phone (07XX XXX XXX)" class="w-full px-3 py-2 border rounded-lg">
-    <input id="ag_email" placeholder="Email (optional)" class="w-full px-3 py-2 border rounded-lg">
-    <input id="ag_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
-    <input id="ag_pwd" placeholder="Password (optional — auto-generated if blank)" class="w-full px-3 py-2 border rounded-lg">
-  </div><div class="flex gap-2 mt-4"><button onclick="doAddAgent()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create Agent</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
-}
+// Adding an Agent uses the SAME unified account-creation flow as "Create User"
+// (Users Accounts), with the role locked to Agent. Identical data collection,
+// validation, error handling and API endpoint (POST /users).
+window.addAgentModal = () => addUserModal({ title: 'Create Agent', heading: 'Create the agent\u2019s account. The role is fixed to Agent; all other fields match the Create User flow.', role: 'agent', lockRole: true })
+// Adding a Customer uses the SAME unified account-creation flow as "Create User",
+// with the role locked to Customer. "Full Farmer Onboarding" (viewOnboard) remains
+// available for capturing the detailed KYC / farming-profile record.
+window.addCustomerModal = () => addUserModal({ title: 'Add Customer', heading: 'Create the customer\u2019s account. The role is fixed to Customer; all other fields match the Create User flow.', role: 'customer', lockRole: true })
 window.doAddAgent = async () => {
   try {
     const body = { full_name: $('ag_name').value, phone: $('ag_phone').value, email: $('ag_email').value, region: $('ag_region').value }
@@ -3484,17 +3481,27 @@ window.deleteRoleTemplate = async (key) => {
     closeModal(); toast('Role category deleted'); viewUsers()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
-window.addUserModal = async () => {
+// UNIFIED account-creation flow. The SAME modal, data collection, validation and
+// API endpoint (POST /users) back the "Create User" button (Users Accounts), the
+// "Add Customer" button (Customers) and the "Create Agent" button (Agents). Callers
+// may lock the role via opts so a section-specific button pre-selects (and locks)
+// customer / agent while still collecting the identical set of fields.
+//   opts = { title, role, lockRole, heading }
+window.addUserModal = async (opts = {}) => {
   await ensurePermissionMeta()
-  const defaultRole = getRoleTemplate('agent')?.role_key || 'agent'
+  const lockRole = !!opts.lockRole
+  const defaultRole = opts.role || getRoleTemplate('agent')?.role_key || 'agent'
   const allowCustomPerms = state.user.role === 'super_admin'
-  showModal(`<h3 class="font-bold mb-1">Create User Account</h3>
-    <p class="text-xs text-slate-500 mb-3">Choose the user category, label, and permission check-boxes that should apply.</p>
+  const roleField = lockRole
+    ? `<input type="hidden" id="nu_role" value="${esc(defaultRole)}"><input value="${esc(roleLabel(defaultRole))}" disabled class="w-full px-3 py-2 border rounded-lg bg-slate-100 text-slate-500">`
+    : `<select id="nu_role" class="w-full px-3 py-2 border rounded-lg">${userRoleOptions(defaultRole)}</select>`
+  showModal(`<h3 class="font-bold mb-1">${esc(opts.title || 'Create User Account')}</h3>
+    <p class="text-xs text-slate-500 mb-3">${esc(opts.heading || 'Choose the user category, label, and permission check-boxes that should apply.')}</p>
     <div class="space-y-3 text-sm">
       <input id="nu_name" placeholder="Full Name" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_phone" placeholder="Phone" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_email" placeholder="Email (optional)" class="w-full px-3 py-2 border rounded-lg">
-      <select id="nu_role" class="w-full px-3 py-2 border rounded-lg">${userRoleOptions(defaultRole)}</select>
+      ${roleField}
       <input id="nu_label" placeholder="Label (for example: Western Cluster Agent)" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_pwd" placeholder="Password (optional — auto-generated if blank)" class="w-full px-3 py-2 border rounded-lg">
@@ -3502,17 +3509,22 @@ window.addUserModal = async () => {
       ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control (login window)</div>${scheduleEditor('nu', {}, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
     </div>
     <div class="flex gap-2 mt-4"><button onclick="doAddUser()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create User</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
-  $('nu_role').onchange = () => refreshPermissionChecklist('nu_perm', 'nu_role', !allowCustomPerms)
+  if (!lockRole) $('nu_role').onchange = () => refreshPermissionChecklist('nu_perm', 'nu_role', !allowCustomPerms)
 }
 window.doAddUser = async () => {
   try {
-    const body = { full_name: $('nu_name').value, phone: $('nu_phone').value, email: $('nu_email').value, role: $('nu_role').value, label: $('nu_label').value, region: $('nu_region').value }
+    const role = $('nu_role').value
+    const body = { full_name: $('nu_name').value, phone: $('nu_phone').value, email: $('nu_email').value, role, label: $('nu_label').value, region: $('nu_region').value }
     if ($('nu_pwd').value) body.password = $('nu_pwd').value
     if (state.user.role === 'super_admin') { body.permissions = selectedPermissions('nu_perm'); Object.assign(body, collectSchedule('nu')) }
     const { data } = await api.post('/users', body)
     closeModal()
     showCredential('User Created', body.full_name, body.phone, data.password, data.password_was_set_by_admin)
-    viewUsers()
+    // Return to the section that matches the created role so the new account is
+    // immediately visible where the admin was working.
+    if (role === 'agent') viewAgents()
+    else if (role === 'customer') viewCustomers()
+    else viewUsers()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 window.editUserModal = async (id) => {

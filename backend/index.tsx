@@ -3106,11 +3106,13 @@ app.post('/api/agents', requireAuth, requireRole('admin', 'super_admin'), async 
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
   const provided = b.password && String(b.password).length >= 4
-  // Multi-user onboarding: unless an explicit password is set, verify the new
-  // user's phone via OTP, then issue a temporary (must-change, 3h-expiry) one.
-  if (!provided) {
+  // Admin-driven onboarding — the creating admin is already authenticated, so we
+  // never block on a phone OTP (mirrors POST /users). Password supplied → use it;
+  // blank → auto-generate a temporary (must-change) one and SMS it. An OTP is only
+  // consumed if the caller explicitly supplies one.
+  if (!provided && b.otp_code) {
     const v = await verifyOtp(c, p, String(b.otp_code || ''), 'onboard')
-    if (!v.ok) return c.json({ error: v.error || 'Phone verification required', otp_required: true }, 400)
+    if (!v.ok) return c.json({ error: v.error || 'Phone verification failed', otp_required: true }, 400)
   }
   const pwd = provided ? String(b.password) : genPassword()
   const perms = await permissionsForRole(c, 'agent', b.permissions || {})
