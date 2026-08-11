@@ -24,6 +24,14 @@ A demo lending platform for agriculture & livestock. Customers buy farm inputs
 - **Pay Later (Murabaha Financing)** quoting, application, approval, repayment tracking
 - **M-Pesa Daraja STK Push** payments (live when keys set, simulated otherwise)
 - Admin CRUD for users, agents, and inventory (edit / activate / deactivate / delete)
+- **Super-Admin credential access control**: viewing, editing, or modifying
+  **Super-Admin** accounts (profile, phone, email, password, status, role) is
+  restricted **exclusively to Super-Admins**. Lower-tier roles — **Admin, Agent,
+  Support** — are blocked (`403`) from viewing, editing, resetting the password
+  of, suspending, deleting, creating, or promoting a Super-Admin across every
+  `/api/users*` endpoint. A plain Admin cannot even see Super-Admin rows in
+  `GET /api/users` (they are withheld from the list). Enforced in
+  `backend/index.tsx` via `isSuperAdmin()` / `guardSuperAdminTarget()`.
 - Role-aware dashboards & analytics
 - **Financing & Markup Settings** (Super Admin → *Financing Settings*): configure
   default markup percentages and a flexible **Processing Fee** — either a

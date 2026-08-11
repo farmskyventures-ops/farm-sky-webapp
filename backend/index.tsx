@@ -735,6 +735,43 @@ function requirePermission(...perms: string[]) {
     await next()
   }
 }
+// ----------------------------------------------------------------------------
+// SUPER-ADMIN CREDENTIAL ACCESS CONTROL
+//
+// Viewing, editing, or modifying Super-Admin credentials/profile data is
+// restricted EXCLUSIVELY to users with the Super-Admin role. Lower-tier roles
+// (admin, agent, operations_finance, support, …) must be blocked from viewing,
+// accessing, or editing Super-Admin accounts. Historically the /api/users*
+// endpoints admitted plain `admin` (requireRole('admin','super_admin')), which
+// let an Admin read, edit, re-password, create, suspend or otherwise modify a
+// Super-Admin. These helpers close that gap.
+// ----------------------------------------------------------------------------
+function isSuperAdmin(user: SessionUser | undefined | null): boolean {
+  return !!user && String(user.role || '').toLowerCase() === 'super_admin'
+}
+/** True if the target user row (by id) is a Super-Admin. */
+async function targetIsSuperAdmin(c: any, id: string | number): Promise<boolean> {
+  const row = await c.env.DB.prepare(`SELECT role FROM users WHERE id=?`).bind(id).first<any>()
+  return String(row?.role || '').toLowerCase() === 'super_admin'
+}
+/**
+ * Guard a mutation whose TARGET is a specific user: if that target is a
+ * Super-Admin, only a Super-Admin caller may proceed. Returns a 403 JSON
+ * Response to short-circuit, or null when the caller is allowed to continue.
+ * Also blocks a non-super caller from ASSIGNING the super_admin role
+ * (privilege escalation) when `attemptedRole` is supplied.
+ */
+async function guardSuperAdminTarget(c: any, id: string | number, attemptedRole?: string): Promise<Response | null> {
+  const caller = c.get('user') as SessionUser
+  if (isSuperAdmin(caller)) return null
+  if (await targetIsSuperAdmin(c, id)) {
+    return c.json({ error: 'Forbidden — only a Super Admin may view or modify Super Admin credentials' }, 403)
+  }
+  if (attemptedRole && String(attemptedRole).toLowerCase() === 'super_admin') {
+    return c.json({ error: 'Forbidden — only a Super Admin may grant the Super Admin role' }, 403)
+  }
+  return null
+}
 async function audit(c: any, userId: string | number | null, action: string, entity: string, detail: string) {
   try {
     await c.env.DB.prepare(`INSERT INTO audit_logs (user_id, action, entity, detail) VALUES (?,?,?,?)`)
@@ -3200,7 +3237,11 @@ app.post('/api/users/:id/reset-password', requireAuth, requireRole('admin', 'sup
   const id = c.req.param('id')
   const target = await c.env.DB.prepare(`SELECT id, full_name, phone, role FROM users WHERE id=?`).bind(id).first<any>()
   if (!target) return c.json({ error: 'User not found' }, 404)
-  if (target.role === 'super_admin' && String(id) !== String(c.get('user').id)) return c.json({ error: 'Cannot reset another Super Admin password' }, 400)
+  // Super-Admin credentials (incl. password) may be reset only by a Super-Admin.
+  // A non-super caller (admin) is fully blocked from any Super-Admin target.
+  if (String(target.role || '').toLowerCase() === 'super_admin' && !isSuperAdmin(c.get('user'))) {
+    return c.json({ error: 'Forbidden — only a Super Admin may reset a Super Admin password' }, 403)
+  }
   const body = await c.req.json().catch(() => ({}))
   const provided = body?.password && String(body.password).length >= 4
   // Admin-triggered reset. When no explicit password is supplied (the normal
@@ -3248,9 +3289,15 @@ app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), asy
 // USER ACCOUNTS (admin) - create, edit, activate/deactivate, delete
 // ----------------------------------------------------------------------------
 app.get('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const caller = c.get('user') as SessionUser
+  const callerIsSuper = isSuperAdmin(caller)
   const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, email, role, label, permissions, status, region, schedule_enabled, access_days, access_start, access_end, created_at FROM users ORDER BY id`).all()
   const usersWithPerms = [] as any[]
   for (const u of results as any[]) {
+    // Super-Admin credential/profile data is visible ONLY to Super-Admins.
+    // A non-super caller (e.g. admin) may still see their OWN row, but every
+    // OTHER Super-Admin account is withheld entirely.
+    if (String(u.role || '').toLowerCase() === 'super_admin' && !callerIsSuper && String(u.id) !== String(caller.id)) continue
     const fallback = await loadRoleTemplate(c, u.role)
     usersWithPerms.push({ ...u, email: isPlaceholderEmail(u.email) ? '' : u.email, permissions: parsePermissions(u.permissions, u.role, fallback), access_days: safeJson(u.access_days, []) })
   }
@@ -3260,6 +3307,10 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
   const b = await c.req.json()
   const p = normalizePhone(b.phone || '')
   if (!b.full_name || !p || !b.role) return c.json({ error: 'Name, phone and role are required' }, 400)
+  // Only a Super-Admin may create another Super-Admin (block privilege escalation).
+  if (String(b.role).toLowerCase() === 'super_admin' && !isSuperAdmin(c.get('user'))) {
+    return c.json({ error: 'Forbidden — only a Super Admin may create a Super Admin account' }, 403)
+  }
   const dup = await c.env.DB.prepare(`SELECT id FROM users WHERE phone=?`).bind(p).first<any>()
   if (dup) return c.json({ error: 'A user with this phone already exists' }, 409)
   const provided = b.password && String(b.password).length >= 4
@@ -3310,6 +3361,10 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
 app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const id = c.req.param('id')
   const b = await c.req.json()
+  // Super-Admin credentials are editable only by Super-Admins; also blocks a
+  // non-super caller from promoting any user to super_admin.
+  const denied = await guardSuperAdminTarget(c, id, b.role)
+  if (denied) return denied
   const perms = await permissionsForRole(c, String(b.role), b.permissions || {})
   const schedEnabled = boolInt(b.schedule_enabled, false) ? 1 : 0
   const schedDays = Array.isArray(b.access_days) ? JSON.stringify(b.access_days) : null
@@ -3335,6 +3390,9 @@ app.put('/api/users/:id/status', requireAuth, requireRole('admin', 'super_admin'
   const id = c.req.param('id')
   const { status } = await c.req.json()
   if (String(id) === String(c.get('user').id)) return c.json({ error: 'You cannot change your own status' }, 400)
+  // Only a Super-Admin may suspend/activate another Super-Admin account.
+  const denied = await guardSuperAdminTarget(c, id)
+  if (denied) return denied
   await c.env.DB.prepare(`UPDATE users SET status=? WHERE id=?`).bind(status, id).run()
   if (status === 'suspended') await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(id).run()
   await audit(c, c.get('user').id, status === 'active' ? 'activate' : 'deactivate', 'user', String(id))
@@ -3344,7 +3402,11 @@ app.delete('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), a
   const id = c.req.param('id')
   if (String(id) === String(c.get('user').id)) return c.json({ error: 'You cannot delete your own account' }, 400)
   const u = await c.env.DB.prepare(`SELECT role FROM users WHERE id=?`).bind(id).first<any>()
-  if (u?.role === 'super_admin') return c.json({ error: 'Cannot delete a Super Admin account' }, 400)
+  // A Super-Admin account may be deleted only by a Super-Admin; a non-super
+  // caller (admin) is blocked from touching Super-Admin accounts entirely.
+  if (String(u?.role || '').toLowerCase() === 'super_admin' && !isSuperAdmin(c.get('user'))) {
+    return c.json({ error: 'Forbidden — only a Super Admin may delete a Super Admin account' }, 403)
+  }
   await c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = CAST(? AS TEXT)`).bind(id).run()
   await c.env.DB.prepare(`DELETE FROM agents WHERE user_id=?`).bind(id).run()
   await c.env.DB.prepare(`DELETE FROM users WHERE id=?`).bind(id).run()
