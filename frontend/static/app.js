@@ -311,10 +311,47 @@ window.submitChangeRequest = async (entityType, entityId) => {
 // ---------------------------------------------------------------------------
 // AUTH
 // ---------------------------------------------------------------------------
+// Fetch /cross/config resiliently. Bug #1 root-cause: a single transient
+// network failure (e.g. immediately after a hard reload / cache clear, before
+// cookies are re-attached) used to null `state.crossApp`, which made every
+// Score-gated view render the false "Score is not configured" banner even
+// though the backend env vars (SCORE_APP_URL & CROSS_APP_HMAC_SECRET) were set.
+//
+// The fix: (1) retry with a short backoff, (2) NEVER null a previously-good
+// cached config on a transient failure — we only ever replace state.crossApp
+// with a fresh authoritative response from the backend. The banner is now
+// shown ONLY when the backend genuinely reports score_configured:false.
+async function loadCrossConfig({ retries = 3, delayMs = 400 } = {}) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const cfg = await api.get('/cross/config')
+      if (cfg && cfg.data && typeof cfg.data === 'object') {
+        state.crossApp = cfg.data              // authoritative — replace cache
+        return state.crossApp
+      }
+    } catch (err) {
+      // A 401 here is not a config problem (session/probe) — stop retrying and
+      // keep whatever we already knew. Any other error is treated as transient.
+      const status = err?.response?.status
+      if (status === 401) break
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, delayMs * (attempt + 1)))
+        continue
+      }
+    }
+  }
+  // All attempts exhausted (or a 401). Do NOT clobber a previously-good config.
+  // If we never had one, fall back to an "unknown" object that does NOT trigger
+  // the not-configured banner (score_configured is left undefined, and views
+  // distinguish undefined = unknown/transient from false = truly unconfigured).
+  if (!state.crossApp) state.crossApp = { _transient: true }
+  return state.crossApp
+}
+
 async function init() {
   try {
     const { data } = await api.get('/me'); state.user = data.user
-    try { const cfg = await api.get('/cross/config'); state.crossApp = cfg.data } catch (_) { state.crossApp = null }
+    await loadCrossConfig()
     renderApp()
   }
   catch { renderLogin() }
@@ -3387,8 +3424,16 @@ async function viewApiAccess() {
 // approve Production-access requests, and manage global API settings.
 // ---------------------------------------------------------------------------
 async function viewApiManagement() {
+  // Re-fetch config on demand (with retries) so a stale/transient miss from the
+  // initial page load can't leave this admin view stuck on the false banner.
+  if (!state.crossApp || state.crossApp._transient || typeof state.crossApp.score_configured === 'undefined') {
+    await loadCrossConfig()
+  }
   const cfg = state.crossApp
+  // undefined score_configured === transient/unknown (do NOT show the "not
+  // configured" banner); only an explicit `false` means truly unconfigured.
   const configured = !!(cfg && cfg.score_configured)
+  const unknown = !!(cfg && cfg._transient) || (cfg && typeof cfg.score_configured === 'undefined')
   let lenders = []
   try {
     const { data } = await api.get('/users')
@@ -3415,6 +3460,8 @@ async function viewApiManagement() {
           ${configured
             ? `<button onclick="openScoreSuperAdmin()" class="btn inline-flex items-center gap-2 bg-slate-800 hover:bg-slate-900 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-crown"></i>Open Super-Admin Portal</button>
                <button onclick="openScore()" class="btn inline-flex items-center gap-2 bg-teal-600 hover:bg-teal-700 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-up-right-from-square"></i>Open Score Console</button>`
+            : unknown
+            ? `<button onclick="viewApiManagement()" class="btn inline-flex items-center gap-2 bg-slate-200 hover:bg-slate-300 text-slate-700 px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-rotate"></i>Checking Score connection… Retry</button>`
             : `<div class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3"><i class="fas fa-triangle-exclamation mr-1"></i>Score is not configured. Set SCORE_APP_URL &amp; CROSS_APP_HMAC_SECRET.</div>`}
         </div>
       </div>

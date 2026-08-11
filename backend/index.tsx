@@ -19,6 +19,7 @@ import merchantApi from './merchant-api'
 import { mintHandoffToken, verifyHandoffToken } from './cross-app'
 import { scoreConfigured, scoreKyc, scoreIprs, scoreLiveness, scoreCreditEvaluation } from './score-client'
 import { validateImageDataUrl, validateText, validateTextFields } from './upload-validation'
+import { hmacSha256Hex } from './payments-shared'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: SessionUser } }>()
 
@@ -2954,6 +2955,98 @@ app.get('/api/buni/status', requireAuth, (c) => {
 // Public endpoint URL:  https://equipment.farmsky.africa/api/v1/payments/*
 // ----------------------------------------------------------------------------
 app.route('/api/v1/payments', paymentGateway)
+
+// ----------------------------------------------------------------------------
+// SCORE WALLET LEDGER MIRROR RECEIVER (Phase 3)
+// Score is the PRIMARY wallet ledger; every wallet transaction on Score is
+// mirrored here for cross-app audit. Score POSTs a signed JSON payload with:
+//   X-Score-Signature: sha256=<hmacSha256Hex(secret, rawBody)>
+// where secret = EQUIPMENT_LEDGER_SECRET || CROSS_APP_HMAC_SECRET (Score side).
+// Equipment verifies with SCORE_LEDGER_HMAC_SECRET || SCORE_HMAC_SECRET ||
+// CROSS_APP_HMAC_SECRET. Idempotent on score_tx_id.
+// ----------------------------------------------------------------------------
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (typeof a !== 'string' || typeof b !== 'string') return false
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
+app.post('/api/score-ledger/mirror', async (c) => {
+  // Read raw body first (needed for HMAC verification of the exact bytes signed)
+  const raw = await c.req.text()
+
+  const secret =
+    c.env.SCORE_LEDGER_HMAC_SECRET ||
+    c.env.SCORE_HMAC_SECRET ||
+    c.env.CROSS_APP_HMAC_SECRET ||
+    ''
+
+  if (!secret) {
+    console.warn('[score-ledger] mirror rejected: no HMAC secret configured')
+    return c.json({ error: 'mirror_not_configured' }, 503)
+  }
+
+  const header = c.req.header('X-Score-Signature') || c.req.header('x-score-signature') || ''
+  const provided = header.replace(/^sha256=/i, '').trim().toLowerCase()
+  if (!provided) {
+    return c.json({ error: 'missing_signature' }, 401)
+  }
+
+  const expected = (await hmacSha256Hex(secret, raw)).toLowerCase()
+  if (!timingSafeEqualHex(provided, expected)) {
+    console.warn('[score-ledger] mirror rejected: signature mismatch')
+    return c.json({ error: 'invalid_signature' }, 401)
+  }
+
+  let payload: any
+  try {
+    payload = JSON.parse(raw)
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400)
+  }
+
+  const scoreTxId = String(payload.score_tx_id ?? '').trim()
+  if (!scoreTxId) {
+    return c.json({ error: 'missing_score_tx_id' }, 400)
+  }
+
+  const orgRef = payload.org_id != null ? String(payload.org_id) : null
+  const direction = String(payload.direction ?? '').trim() || null
+  const amountKes = payload.amount_kes != null ? Number(payload.amount_kes) : null
+  const balanceAfter = payload.balance_after != null ? Number(payload.balance_after) : null
+  const kind = payload.kind != null ? String(payload.kind) : null
+  const serviceKey = payload.service_key != null ? String(payload.service_key) : null
+  const reference = payload.reference != null ? String(payload.reference) : null
+  const source = payload.source != null ? String(payload.source) : 'score'
+
+  try {
+    // Idempotency: skip if this Score tx has already been mirrored.
+    const existing = await c.env.DB.prepare(
+      `SELECT id FROM score_wallet_ledger WHERE score_tx_id = ?`
+    ).bind(scoreTxId).first<any>()
+    if (existing) {
+      return c.json({ ok: true, mirrored: false, duplicate: true, score_tx_id: scoreTxId })
+    }
+
+    await c.env.DB.prepare(
+      `INSERT INTO score_wallet_ledger
+         (score_org_ref, score_tx_id, direction, amount_kes, balance_after, kind, service_key, reference, source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(orgRef, scoreTxId, direction, amountKes, balanceAfter, kind, serviceKey, reference, source).run()
+
+    return c.json({ ok: true, mirrored: true, duplicate: false, score_tx_id: scoreTxId })
+  } catch (err: any) {
+    // If a concurrent request inserted the same score_tx_id, treat as duplicate.
+    const msg = String(err?.message || err)
+    if (/unique|duplicate/i.test(msg)) {
+      return c.json({ ok: true, mirrored: false, duplicate: true, score_tx_id: scoreTxId })
+    }
+    console.error('[score-ledger] mirror insert failed:', msg)
+    return c.json({ error: 'mirror_failed' }, 500)
+  }
+})
 
 // ----------------------------------------------------------------------------
 // PUBLIC MERCHANT API (Phase 3) — HMAC-authenticated inventory + checkout

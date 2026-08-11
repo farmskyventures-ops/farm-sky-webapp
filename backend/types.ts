@@ -20,6 +20,15 @@ export type Bindings = MpesaEnv & SmsEnv & EmailEnv & SasaPayEnv & BuniEnv & {
   SCORE_API_URL?: string            // score API base (e.g. https://score.farmsky.africa)
   SCORE_API_CLIENT?: string         // Score API client id issued to Equipment
   SCORE_API_SECRET?: string         // Score API secret (paired with the client id)
+  // Phase 3 — Score payment-gateway tenant registration (all env-driven; the
+  // credit.farmskyafrica domain must NOT be hardcoded). At boot these upsert the
+  // 'score' row in app_clients so Equipment acts as Score's central M-Pesa
+  // gateway (extending the Feed model to credit.farmskyafrica).
+  SCORE_CLIENT_KEY?: string         // gateway client_key for Score (default 'score')
+  SCORE_HMAC_SECRET?: string        // HMAC secret Score signs gateway calls with (== Score's CROSS_APP_HMAC_SECRET/EQUIPMENT_LEDGER_SECRET)
+  SCORE_ORIGIN_URL?: string         // Score public origin, e.g. https://credit.farmskyafrica  (ENV-DRIVEN, not hardcoded)
+  SCORE_CALLBACK_URL?: string       // where Equipment posts settlement callbacks (e.g. https://credit.farmskyafrica/v3/app/wallet/callback)
+  SCORE_LEDGER_HMAC_SECRET?: string // HMAC secret for the Score→Equipment mirror-ledger receiver (falls back to SCORE_HMAC_SECRET/CROSS_APP_HMAC_SECRET)
   // Phase 4 — standardized auth hashing (must match Feed values)
   AUTH_HASH_ITERATIONS?: string
   AUTH_HASH_KEYLEN?: string

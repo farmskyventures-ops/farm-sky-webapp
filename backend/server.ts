@@ -83,6 +83,16 @@ const ENV = {
   // API Management SSO never appeared even when SCORE_APP_URL was set on Render.
   SCORE_APP_URL: process.env.SCORE_APP_URL,
   CROSS_APP_HMAC_SECRET: process.env.CROSS_APP_HMAC_SECRET,
+  SCORE_API_URL: process.env.SCORE_API_URL,
+  SCORE_API_CLIENT: process.env.SCORE_API_CLIENT,
+  SCORE_API_SECRET: process.env.SCORE_API_SECRET,
+  // Phase 3 — Score payment-gateway tenant (env-driven; credit.farmskyafrica
+  // must not be hardcoded).
+  SCORE_CLIENT_KEY: process.env.SCORE_CLIENT_KEY,
+  SCORE_HMAC_SECRET: process.env.SCORE_HMAC_SECRET,
+  SCORE_ORIGIN_URL: process.env.SCORE_ORIGIN_URL,
+  SCORE_CALLBACK_URL: process.env.SCORE_CALLBACK_URL,
+  SCORE_LEDGER_HMAC_SECRET: process.env.SCORE_LEDGER_HMAC_SECRET,
   AUTH_HASH_ITERATIONS: process.env.AUTH_HASH_ITERATIONS,
   AUTH_HASH_KEYLEN: process.env.AUTH_HASH_KEYLEN,
   AUTH_PEPPER: process.env.AUTH_PEPPER,
@@ -142,9 +152,36 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
   // accepts connections immediately on cold start, eliminating the connection-level
   // timeout that caused SasaPay "Max retries exceeded" callback failures.
   initializeDatabase(raw, PROJECT_ROOT)
-    .then(() => {
+    .then(async () => {
       dbReady = true
       console.log(`PostgreSQL ready: ${DATABASE_URL.replace(/:[^:@/]+@/, ':***@')}`)
+      // Phase 3 — env-driven registration of the Score (credit.farmskyafrica)
+      // payment-gateway tenant. Keeps client_key/hmac_secret/origin/callback in
+      // sync with env WITHOUT hardcoding the credit.farmskyafrica domain.
+      try {
+        const clientKey = process.env.SCORE_CLIENT_KEY || 'score'
+        const secret = process.env.SCORE_HMAC_SECRET || process.env.CROSS_APP_HMAC_SECRET || ''
+        const origin = process.env.SCORE_ORIGIN_URL || process.env.SCORE_APP_URL || ''
+        const callback = process.env.SCORE_CALLBACK_URL
+          || (origin ? `${origin.replace(/\/+$/, '')}/v3/app/wallet/callback` : '')
+        if (secret) {
+          await raw.query(
+            `INSERT INTO app_clients (client_key, display_name, origin_url, hmac_secret, callback_url, is_active)
+             VALUES ($1, $2, $3, $4, $5, 1)
+             ON CONFLICT (client_key) DO UPDATE SET
+               origin_url = COALESCE(NULLIF(EXCLUDED.origin_url, ''), app_clients.origin_url),
+               hmac_secret = EXCLUDED.hmac_secret,
+               callback_url = COALESCE(NULLIF(EXCLUDED.callback_url, ''), app_clients.callback_url),
+               is_active = 1`,
+            [clientKey, 'Farmsky Score', origin || 'https://credit.farmskyafrica', secret, callback]
+          )
+          console.log(`Score gateway client '${clientKey}' registered (origin ${origin || 'default'}).`)
+        } else {
+          console.warn('Score gateway client NOT registered: SCORE_HMAC_SECRET / CROSS_APP_HMAC_SECRET unset.')
+        }
+      } catch (e: any) {
+        console.warn('Score gateway client registration skipped:', e?.message || e)
+      }
     })
     .catch((err: any) => {
       dbInitError = err?.message || String(err)
