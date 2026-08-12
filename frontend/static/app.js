@@ -3445,8 +3445,8 @@ async function viewApiManagement() {
     <div class="card p-6 mb-4">
       <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
         <div>
-          <h2 class="text-lg font-bold text-slate-800"><i class="fas fa-plug text-emerald-600 mr-2"></i>Farmsky Score — API Management</h2>
-          <p class="text-sm text-slate-600 mt-1">Govern platform API consumption: pricing tiers &amp; rates, Production-access approvals, and global settings. These controls live in the Score Super-Admin portal; open it below via secure single sign-on.</p>
+          <h2 class="text-lg font-bold text-slate-800"><i class="fas fa-plug text-emerald-600 mr-2"></i>API Management</h2>
+          <p class="text-sm text-slate-600 mt-1">Manage all API Operations</p>
         </div>
         <div class="flex flex-wrap gap-3">
           ${configured
@@ -3464,12 +3464,12 @@ async function viewApiManagement() {
       <div class="card p-4"><div class="text-slate-500 text-xs uppercase tracking-wide">Production approvals</div><div class="text-2xl font-bold text-slate-800 mt-1">In Super-Admin</div></div>
     </div>
     <div class="card p-5 mb-4">
-      <h3 class="font-semibold text-slate-800 mb-2 text-sm">What you can manage in the Super-Admin portal</h3>
+      <h3 class="font-semibold text-slate-800 mb-2 text-sm">Manage</h3>
       <ul class="list-disc pl-5 space-y-1 text-sm text-slate-600">
-        <li><strong>Pricing tiers &amp; rates</strong> — monthly fee, per-check price, included checks, production eligibility.</li>
-        <li><strong>Production access</strong> — approve or deny requests to move a lender from Sandbox to Production.</li>
-        <li><strong>Global settings</strong> — OTP channel, public lender sign-up, default tier and platform controls.</li>
-        <li><strong>Per-lender API access</strong> — enable/disable APIs and assign a tier for any organization.</li>
+        <li><strong>Pricing tiers &amp; rates</strong> - monthly fee, per-check price, included checks, production eligibility.</li>
+        <li><strong>Production access</strong> - approve or deny requests to move a lender from Sandbox to Production.</li>
+        <li><strong>Global settings</strong> - OTP channel, public lender sign-up, default tier and platform controls.</li>
+        <li><strong>Per-lender API access</strong> - enable/disable APIs and assign a tier for any organization.</li>
       </ul>
     </div>
     <div class="card table-card">
