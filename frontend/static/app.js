@@ -4395,7 +4395,6 @@ async function refreshBackups() {
         <div class="flex items-center justify-between flex-wrap gap-2">
           <div>
             <h3 class="font-bold text-slate-800"><i class="fas fa-shield-halved text-teal-600 mr-2"></i>Automated System Backups</h3>
-            <p class="text-xs text-slate-500 mt-1">Regular automated snapshots of all user profiles, transactional records and system-wide data. Automatic backups run every ${data.interval_hours || 24} hours.</p>
           </div>
           <button id="bkNowBtn" onclick="runBackupNow()" class="btn brand-bg text-white px-4 py-2 rounded-lg text-sm"><i class="fas fa-play mr-1"></i>Back up now</button>
         </div>
