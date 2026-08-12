@@ -3347,12 +3347,6 @@ async function viewUsers() {
         <i class="fas fa-plug text-emerald-600 mt-1"></i>
         <div class="text-sm text-slate-700">
           <div class="font-semibold text-slate-800 mb-1">API Access &amp; the "Use APIs" action</div>
-          <p class="mb-1"><strong>Lender-tier</strong> accounts see a <span class="text-emerald-700 font-medium">Use APIs</span> button in the top bar. It lets a lender opt in to consuming the Farmsky Score verification &amp; credit APIs and hands them off (single sign-on, no re-login) to the Score console's <em>API Access</em> area, where they enable the feature, manage keys, and request Production access.</p>
-          <ul class="list-disc pl-5 space-y-0.5 text-slate-600">
-            <li><strong>Who can use it:</strong> only users whose role is <em>Lender</em>. Other roles never see the button and are blocked server-side (403).</li>
-            <li><strong>Permission control:</strong> the opt-in is recorded in the audit log; API enablement, sandbox/production mode, and pricing tier are governed on the Score side and approved by a Farmsky Super-Admin.</li>
-            <li><strong>Manual vs. public lenders:</strong> lenders added here in Equipment and lenders who self-register on Score receive identical features, permissions, and dashboards.</li>
-          </ul>
         </div>
       </div>
     </div>
