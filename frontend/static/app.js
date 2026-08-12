@@ -4487,7 +4487,7 @@ async function renderImportHome() {
   $('im_wrap').innerHTML = `
     <div class="bg-white rounded-2xl border border-slate-200 p-5 mb-4">
       <h3 class="font-bold text-slate-800 mb-1"><i class="fas fa-file-arrow-up text-teal-600 mr-2"></i>Upload a categorized file</h3>
-      <p class="text-xs text-slate-500 mb-3">Import Farmers, Agents or Partners from CSV/XLSX. Columns are auto-mapped to standard fields (Full Name, Phone, National ID, Location, Value Chain). Rows missing required fields are flagged for you to complete before onboarding is dispatched.</p>
+      <p class="text-xs text-slate-500 mb-3">Import Farmers, Agents or Partners from CSV/XLSX</p>
       <div class="grid gap-3 sm:grid-cols-3">
         <select id="im_category" class="px-3 py-2 border rounded-lg text-sm">
           <option value="farmers">Farmers</option><option value="agents">Agents</option><option value="partners">Partners</option>
