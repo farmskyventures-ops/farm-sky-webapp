@@ -3390,13 +3390,13 @@ async function viewApiAccess() {
           <div class="w-12 h-12 rounded-xl bg-emerald-100 flex items-center justify-center text-emerald-600 text-xl"><i class="fas fa-plug"></i></div>
           <div class="flex-1">
             <h2 class="text-lg font-bold text-slate-800">Farmsky Score APIs</h2>
-            <p class="text-sm text-slate-600 mt-1">As a <strong>Lender</strong>, you can consume Farmsky's identity verification, credit scoring and workflow APIs directly. Enabling this hands you off (no second login) to the Score console's <strong>API Access</strong> area, where you generate keys, run in Sandbox, and request Production access.</p>
+            <p class="text-sm text-slate-600 mt-1">Consume<strong>Farmsky's</strong>, IPRS,KYB and AI Credit Evaluation APIs.</p>
           </div>
         </div>
         <div class="mt-5 flex flex-wrap gap-3">
           ${configured
-            ? `<button onclick="openUseApis()" class="btn inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-plug"></i>Use APIs — Enable &amp; Open Console</button>`
-            : `<div class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3"><i class="fas fa-triangle-exclamation mr-1"></i>API access is not yet configured for this platform. Please contact your Farmsky administrator.</div>`}
+            ? `<button onclick="openUseApis()" class="btn inline-flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-lg text-sm font-medium"><i class="fas fa-plug"></i>Open API Console</button>`
+            : `<div class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3"><i class="fas fa-triangle-exclamation mr-1"></i>Loading.</div>`}
         </div>
       </div>
       <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
@@ -3407,13 +3407,11 @@ async function viewApiAccess() {
       <div class="card p-5">
         <h3 class="font-semibold text-slate-800 mb-2 text-sm">How it works</h3>
         <ol class="list-decimal pl-5 space-y-1 text-sm text-slate-600">
-          <li>Click <strong>Use APIs</strong>. We record your opt-in and open the Score console via secure single sign-on.</li>
-          <li>In the console's <strong>API Access</strong> tab, toggle the APIs on to generate your Sandbox keys.</li>
-          <li>Test freely in Sandbox, then <strong>request Production</strong> access — a Farmsky Super-Admin reviews and approves it.</li>
-          <li>Your pricing tier &amp; rate limits are shown in the console and managed by Farmsky.</li>
+          <li>Click <strong>Use APIs</strong></li>
+          <li>Test freely in Sandbox, then <strong>request Production</strong> to go Live.</li>
+          <li>Your pricing are shown, In Production, always ensure your Wallet is funded at all times to avoid service interuption.</li>
         </ol>
-        <p class="text-xs text-slate-400 mt-3">Lenders added by an Admin here and lenders who self-register on Score receive identical API features and permissions.</p>
-      </div>
+     </div>
     </div>`
 }
 
