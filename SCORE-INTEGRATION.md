@@ -75,3 +75,19 @@ SCORE_API_URL=https://score.farmsky.africa
 SCORE_API_CLIENT=<API client id Score issued to Equipment>
 SCORE_API_SECRET=<paired secret>
 ```
+
+---
+
+## 6. Credit tenant — metered wallet billing (payment gateway)
+
+The Score app (**credit.farmsky.africa**) is also a **payment tenant** of this Equipment gateway. In addition to the SSO / scoring integration above, it delegates its **pay-as-you-go API-call billing** and **wallet deductions** to the central master wallet documented in `PAYMENT-GATEWAY-INTEGRATION.md §8–§9`.
+
+- **Provisioning:** register Score as a tenant via the `/admin/tenants` dashboard **or** the env-var overrides:
+  ```
+  TENANT_CREDIT_CLIENT_KEY="credit"          # or "score" — must match Score's PAYMENT_CLIENT_KEY
+  TENANT_CREDIT_HMAC_SECRET="<256-bit hex>"  # must match Score's PAYMENT_HMAC_SECRET
+  TENANT_CREDIT_WEBHOOK_URL="https://credit.farmsky.africa/api/v1/payment-webhook"
+  ```
+- **Debit:** Score calls `POST /api/v1/wallet/debit` per billable live API call (atomic, idempotent). A shortfall returns HTTP **402 `INSUFFICIENT_WALLET_BALANCE`**, which Score surfaces to its user as **402 `PAYMENT_REQUIRED`** with a `top_up_url`.
+- **Low-balance alerts:** after each debit the gateway fires a signed `WALLET_LOW_BALANCE` webhook to Score's `/api/v1/payment-webhook`, plus SMS + email, honouring the user's thresholds synced via `PUT /api/v1/settings/thresholds`.
+- **Coexistence:** this is **non-breaking** — the existing `POST /api/score-ledger/mirror` receiver (Score is the primary local ledger; movements are mirrored here for audit) continues to work unchanged. The master-wallet path is opt-in on the Score side (`PAYMENT_CENTRAL_WALLET=1`).

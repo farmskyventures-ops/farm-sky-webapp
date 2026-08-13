@@ -176,3 +176,11 @@ grid, assign, earning rules, single & batch payouts, analytics).
 * ✅ Wallet: assign, earning rules, payouts; running balance & `balance_after` correct.
 * ✅ Ledger immutability (UPDATE/DELETE rejected).
 * ✅ Analytics scope: agent=self, admin=global.
+
+---
+
+## Payment tenants & central master wallet (admin-gated)
+
+The `/admin/tenants` **Payment Tenants** dashboard and its API (`/api/v1/admin/tenants*`) are gated to **`admin` / `super_admin`** only (`requireAuth` + `requireRole('admin','super_admin')`). Operators can register tenants, rotate HMAC secrets (revealed once) and toggle status without a restart.
+
+The **central master wallet** (`/api/v1/wallet/debit|credit|balance`) is authenticated per-request by the tenant's HMAC secret (`X-Farmsky-*`), NOT by an operator session — it is a machine-to-machine surface. Debits are atomic and idempotent; the ledger (`tenant_wallet_ledger`) is append-only by convention (every row records `balance_after`). See `PAYMENT-GATEWAY-INTEGRATION.md §8–§9`.

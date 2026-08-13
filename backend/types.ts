@@ -29,6 +29,15 @@ export type Bindings = MpesaEnv & SmsEnv & EmailEnv & SasaPayEnv & BuniEnv & {
   SCORE_ORIGIN_URL?: string         // Score public origin, e.g. https://credit.farmskyafrica  (ENV-DRIVEN, not hardcoded)
   SCORE_CALLBACK_URL?: string       // where Equipment posts settlement callbacks (e.g. https://credit.farmskyafrica/v3/app/wallet/callback)
   SCORE_LEDGER_HMAC_SECRET?: string // HMAC secret for the Score→Equipment mirror-ledger receiver (falls back to SCORE_HMAC_SECRET/CROSS_APP_HMAC_SECRET)
+  // Generic multi-tenant provisioning (Infrastructure-as-Code fallback for the
+  // /admin/tenants dashboard). At boot, any TENANT_<NAME>_CLIENT_KEY present is
+  // upserted into app_clients with its secret / webhook. Example (Credit):
+  //   TENANT_CREDIT_CLIENT_KEY="credit_farmsky_key"
+  //   TENANT_CREDIT_HMAC_SECRET="..."
+  //   TENANT_CREDIT_WEBHOOK_URL="https://credit.farmsky.africa/api/v1/payment-webhook"
+  // These are read dynamically from process.env by name; declared here loosely
+  // via an index signature so the typed Bindings stay non-breaking.
+  [key: `TENANT_${string}`]: string | undefined
   // Phase 4 — standardized auth hashing (must match Feed values)
   AUTH_HASH_ITERATIONS?: string
   AUTH_HASH_KEYLEN?: string

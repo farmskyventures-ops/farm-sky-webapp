@@ -250,3 +250,117 @@ The **revenue matrix** is how a single settlement statement from the one shortco
 - [ ] Set the mazao `hmac_secret` (`UPDATE app_clients SET hmac_secret=… WHERE client_key='mazao';`)
 - [ ] Deploy the gateway as a separate Render service using the `payment_api_user` `DATABASE_URL`
 - [ ] Schedule `backend/sql/02_payment_security_audits.sql` (or poll the two admin endpoints)
+
+---
+
+## 8. Central Master Wallet — metered (pay-as-you-go) API billing
+
+Beyond one-off checkout, the gateway now hosts a **central master wallet + ledger** so client tenants (e.g. the **Credit / Score** app at `credit.farmsky.africa`) can delegate **usage-based API-call billing** and **wallet deductions** to this app. Equipment is the **single host + ledger engine**; tenants never keep their own authoritative money ledger.
+
+### 8.1 Endpoints (same `X-Farmsky-*` HMAC scheme as §2)
+
+| Purpose | Method | URL |
+|---|---|---|
+| Metered per-call debit | `POST` | `https://equipment.farmsky.africa/api/v1/wallet/debit` |
+| Record a top-up / settlement | `POST` | `https://equipment.farmsky.africa/api/v1/wallet/credit` |
+| Read master-wallet balance | `GET`  | `https://equipment.farmsky.africa/api/v1/wallet/balance?user_id=<ref>` |
+| Read alert thresholds | `GET`  | `https://equipment.farmsky.africa/api/v1/settings/thresholds?user_id=<ref>` |
+| Upsert alert thresholds | `PUT`  | `https://equipment.farmsky.africa/api/v1/settings/thresholds` |
+
+All calls carry the standard headers: `Content-Type`, `X-Farmsky-Client`, `X-Farmsky-Timestamp`, `X-Farmsky-Nonce`, `X-Farmsky-Signature`, and (for mutating calls) `Idempotency-Key`. Replay protection reuses the shared `payment_nonces` table.
+
+### 8.2 Debit request / response
+
+`POST /api/v1/wallet/debit`
+```json
+{ "user_id": "<org/user ref>", "amount": 12, "currency": "KES",
+  "origin_reference": "SVC-credit_check-...", "idempotency_key": "SVC-credit_check-...",
+  "description": "Metered credit_check API call", "metadata": { } }
+```
+
+**Success (HTTP 200):**
+```json
+{ "success": true, "transaction_ref": "DEBIT_EQ_…", "debited_amount": 12,
+  "remaining_wallet_balance": 488, "status": "COMPLETED",
+  "low_balance_alert": { "dispatched": true, "level": "warning" } }
+```
+
+**Insufficient funds (HTTP 402):**
+```json
+{ "success": false, "error_code": "INSUFFICIENT_WALLET_BALANCE",
+  "required_amount": 12, "current_balance": 4, "currency": "KES" }
+```
+
+The debit is **atomic** (a conditional `UPDATE … WHERE balance_kes >= amount`) so concurrent calls can never drive the balance negative. `Idempotency-Key` (recorded as `tenant_wallet_ledger.transaction_ref`) makes retries safe — the original result is replayed.
+
+### 8.3 User-configurable low-balance alerts
+
+After **every** debit the gateway evaluates the post-debit balance against the tenant user's **custom thresholds** (`tenant_alert_settings`):
+
+- `balance <= critical_threshold` → **critical**
+- `balance <= warning_threshold` → **warning**
+
+An alert fires at most **once per level per 24h** (`tenant_alert_state` cooldown); the state resets when a `credit` clears the warning threshold. Dispatch is multi-channel and per-channel-toggleable:
+
+1. **Signed webhook** `WALLET_LOW_BALANCE` → the tenant's `webhook_url` (falls back to `callback_url`), signed with the tenant's own `hmac_secret` using the same `X-Farmsky-*` scheme.
+2. **SMS** to `notify_phone` (via `backend/sms.ts`).
+3. **Email** to `notify_email` (via `backend/email.ts`).
+
+`WALLET_LOW_BALANCE` webhook body:
+```json
+{ "event": "WALLET_LOW_BALANCE", "event_id": "evt_lowbal_…", "timestamp": "…",
+  "data": { "user_id": "…", "organization_name": "Farmsky Credit",
+            "alert_level": "WARNING", "current_balance": 800,
+            "user_configured_threshold": 1000, "currency": "KES",
+            "recommended_topup_amount": 5000 } }
+```
+
+### 8.4 Thresholds sync (`/api/v1/settings/thresholds`)
+
+The Credit dashboard lets a user set `warning_threshold`, `critical_threshold` and channel toggles; it `PUT`s them here so the gateway evaluates them on each debit:
+```json
+{ "user_id": "<ref>", "warning_threshold": 1000, "critical_threshold": 250,
+  "channels": { "email_enabled": true, "sms_enabled": true, "webhook_enabled": true },
+  "notify_email": "owner@org", "notify_phone": "2547…" }
+```
+
+### 8.5 Data model (migration `0031_tenant_wallet_and_thresholds.sql`)
+
+- `tenant_wallets(client_key, user_ref, balance_kes, currency)` — master balances, `UNIQUE(client_key,user_ref)`.
+- `tenant_wallet_ledger(direction, amount_kes, balance_after, origin_reference, transaction_ref UNIQUE, meta)` — every movement.
+- `tenant_alert_settings(warning_threshold, critical_threshold, *_enabled, notify_email, notify_phone)` — per-user thresholds.
+- `tenant_alert_state(alert_level, last_sent_at, cleared)` — 24h cooldown / dedup.
+- `app_clients` gains `webhook_url`, `secret_rotated_at`, `provisioned_via`, `updated_at`.
+
+All statements are additive/idempotent (`CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`) — **non-breaking** to the existing gateway.
+
+---
+
+## 9. Tenant management (dynamic provisioning)
+
+A tenant is a row in **`app_clients`**. There are two ways to provision one; both are non-breaking and can coexist.
+
+### 9.1 Option A — Admin Dashboard (`/admin/tenants`)
+
+Signed-in **admin / super_admin** operators get a **Payment Tenants** page (Equipment console → sidebar → *Payment Tenants*) backed by:
+
+| Purpose | Method | URL |
+|---|---|---|
+| List tenants (secrets masked) | `GET`  | `/api/v1/admin/tenants` |
+| Create / update a tenant | `POST` | `/api/v1/admin/tenants` |
+| Rotate HMAC secret | `POST` | `/api/v1/admin/tenants/:client_key/rotate-secret` |
+| Enable / disable a tenant | `PUT`  | `/api/v1/admin/tenants/:client_key/status` |
+
+The full `hmac_secret` is returned **only** at the moment it is minted or rotated (shown once in a copy-to-clipboard modal); every list view masks it. Editing a tenant updates its display name, origin URL, webhook URL and active status **without a restart**.
+
+### 9.2 Option B — Environment-variable overrides (boot-time)
+
+At startup `backend/server.ts` scans for `TENANT_<NAME>_CLIENT_KEY` and upserts each into `app_clients` with `provisioned_via='env'`:
+
+```
+TENANT_CREDIT_CLIENT_KEY="credit"
+TENANT_CREDIT_HMAC_SECRET="<256-bit hex>"
+TENANT_CREDIT_WEBHOOK_URL="https://credit.farmsky.africa/api/v1/payment-webhook"
+```
+
+This is the recommended way to pin the Credit tenant in production; the dashboard can still rotate its secret afterwards.

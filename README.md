@@ -23,6 +23,16 @@ A demo lending platform for agriculture & livestock. Customers buy farm inputs
 - Inventory with **product images** (shown to buyers) + stock movements
 - **Pay Later (Murabaha Financing)** quoting, application, approval, repayment tracking
 - **M-Pesa Daraja STK Push** payments (live when keys set, simulated otherwise)
+- **Central Payment Gateway + Master Wallet** — the single host & ledger engine for all
+  Farmsky tenants. Beyond one-off checkout it now offers **metered (pay-as-you-go) wallet
+  debits** (`/api/v1/wallet/debit`, atomic + idempotent, HTTP 402 `INSUFFICIENT_WALLET_BALANCE`
+  on shortfall), **top-ups** (`/credit`), **balance reads** (`/balance`), and
+  **user-configurable low-balance alerts** (warning/critical thresholds, 24h cooldown, signed
+  `WALLET_LOW_BALANCE` webhook + SMS + email). Client tenants (e.g. Credit / Score) delegate
+  their financial transactions here. See `PAYMENT-GATEWAY-INTEGRATION.md §8`.
+- **Payment Tenant management** (`/admin/tenants`, admin/super_admin only) — dynamically
+  register client apps, rotate HMAC secrets (shown once), update webhooks and toggle status
+  **without a restart**; or provision at boot via `TENANT_<NAME>_*` env vars. See §9.
 - Admin CRUD for users, agents, and inventory (edit / activate / deactivate / delete)
 - **Super-Admin credential access control**: viewing, editing, or modifying
   **Super-Admin** accounts (profile, phone, email, password, status, role) is

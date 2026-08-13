@@ -12,6 +12,7 @@ import {
 } from './sasapay'
 import { buniStkPush, buniQuery, buniConfigured } from './buni'
 import paymentGateway from './payment-gateway'
+import walletGateway, { settings as walletSettings } from './wallet-gateway'
 import { sendSms, smsConfigured, generateOtp } from './sms'
 import { sendEmail, emailConfigured } from './email'
 import { hashPassword, verifyPassword, isHashed } from './password'
@@ -2955,6 +2956,112 @@ app.get('/api/buni/status', requireAuth, (c) => {
 // Public endpoint URL:  https://equipment.farmsky.africa/api/v1/payments/*
 // ----------------------------------------------------------------------------
 app.route('/api/v1/payments', paymentGateway)
+
+// ----------------------------------------------------------------------------
+// CENTRAL MASTER WALLET GATEWAY (metered API-call billing for client tenants)
+// Public endpoint URLs:
+//   https://equipment.farmsky.africa/api/v1/wallet/{debit,credit,balance}
+//   https://equipment.farmsky.africa/api/v1/settings/thresholds
+// Same X-Farmsky-* HMAC discipline as /api/v1/payments/*. Used by the Credit
+// app (credit.farmsky.africa) to debit the master wallet per scoring call and
+// to sync low-balance alert thresholds. See backend/wallet-gateway.ts.
+// ----------------------------------------------------------------------------
+app.route('/api/v1/wallet', walletGateway)
+app.route('/api/v1/settings', walletSettings)
+
+// ----------------------------------------------------------------------------
+// TENANT MANAGEMENT DASHBOARD API (Option A — dynamic provisioning)
+// Admin-only CRUD over app_clients so operators can register / edit client
+// tenants, rotate HMAC secrets and toggle status WITHOUT a service restart.
+// Backs the /admin/tenants dashboard page. HMAC secrets are never returned in
+// full — only a masked preview — except at the moment of rotation.
+// ----------------------------------------------------------------------------
+function maskSecret(s: string | null | undefined): string {
+  const v = String(s || '')
+  if (!v) return ''
+  if (v.length <= 8) return '••••'
+  return `${v.slice(0, 4)}••••${v.slice(-4)}`
+}
+function genTenantSecret(): string {
+  // 256-bit hex secret.
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+app.get('/api/v1/admin/tenants', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const { results } = await c.env.DB.prepare(
+    `SELECT client_key, display_name, origin_url, callback_url, webhook_url, is_active, provisioned_via, secret_rotated_at, updated_at
+       FROM app_clients ORDER BY client_key`
+  ).all().catch(() => ({ results: [] as any[] }))
+  const rows = (results || []).map((r: any) => ({
+    client_key: r.client_key,
+    display_name: r.display_name,
+    origin_url: r.origin_url,
+    callback_url: r.callback_url,
+    webhook_url: r.webhook_url || r.callback_url || null,
+    is_active: Number(r.is_active) !== 0,
+    provisioned_via: r.provisioned_via || 'seed',
+    secret_rotated_at: r.secret_rotated_at || null,
+    updated_at: r.updated_at || null,
+  }))
+  return c.json({ success: true, tenants: rows })
+})
+
+app.post('/api/v1/admin/tenants', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const b = await c.req.json().catch(() => ({}))
+  const clientKey = String(b.client_key || '').trim()
+  if (!clientKey) return c.json({ success: false, error: 'client_key is required' }, 400)
+  const displayName = String(b.display_name || clientKey).slice(0, 120)
+  const originUrl = String(b.origin_url || '').replace(/\/+$/, '')
+  const callbackUrl = b.callback_url ? String(b.callback_url) : null
+  const webhookUrl = b.webhook_url ? String(b.webhook_url) : null
+  // Use supplied secret or mint a fresh 256-bit one.
+  const secret = String(b.hmac_secret || '').trim() || genTenantSecret()
+  const isActive = b.is_active === false ? 0 : 1
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO app_clients (client_key, display_name, origin_url, hmac_secret, callback_url, webhook_url, is_active, provisioned_via, secret_rotated_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'admin_ui', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+       ON CONFLICT (client_key) DO UPDATE SET
+         display_name = EXCLUDED.display_name,
+         origin_url = COALESCE(NULLIF(EXCLUDED.origin_url, ''), app_clients.origin_url),
+         callback_url = COALESCE(EXCLUDED.callback_url, app_clients.callback_url),
+         webhook_url = COALESCE(EXCLUDED.webhook_url, app_clients.webhook_url),
+         is_active = EXCLUDED.is_active,
+         provisioned_via = 'admin_ui',
+         updated_at = CURRENT_TIMESTAMP`
+    ).bind(clientKey, displayName, originUrl || 'https://example.invalid', secret, callbackUrl, webhookUrl, isActive).run()
+  } catch (e: any) {
+    return c.json({ success: false, error: e?.message || 'Failed to save tenant' }, 500)
+  }
+  // Return the secret ONLY on create/rotate so the operator can copy it.
+  const created = String(b.hmac_secret || '').trim() ? undefined : secret
+  return c.json({ success: true, client_key: clientKey, hmac_secret_new: created, hmac_secret_masked: maskSecret(secret) })
+})
+
+app.post('/api/v1/admin/tenants/:client_key/rotate-secret', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const clientKey = c.req.param('client_key')
+  const existing = await c.env.DB.prepare(`SELECT client_key FROM app_clients WHERE client_key = ?`).bind(clientKey).first<any>()
+  if (!existing) return c.json({ success: false, error: 'Tenant not found' }, 404)
+  const secret = genTenantSecret()
+  await c.env.DB.prepare(
+    `UPDATE app_clients SET hmac_secret = ?, secret_rotated_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE client_key = ?`
+  ).bind(secret, clientKey).run()
+  return c.json({ success: true, client_key: clientKey, hmac_secret_new: secret, hmac_secret_masked: maskSecret(secret), note: 'Update the tenant app with this new secret immediately.' })
+})
+
+app.put('/api/v1/admin/tenants/:client_key/status', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
+  const clientKey = c.req.param('client_key')
+  const b = await c.req.json().catch(() => ({}))
+  const isActive = b.is_active === false ? 0 : 1
+  const res = await c.env.DB.prepare(
+    `UPDATE app_clients SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE client_key = ?`
+  ).bind(isActive, clientKey).run()
+  const changed = Number((res as any)?.meta?.changes ?? (res as any)?.changes ?? 1)
+  if (!changed) return c.json({ success: false, error: 'Tenant not found' }, 404)
+  return c.json({ success: true, client_key: clientKey, is_active: isActive !== 0 })
+})
 
 // ----------------------------------------------------------------------------
 // SCORE WALLET LEDGER MIRROR RECEIVER (Phase 3)

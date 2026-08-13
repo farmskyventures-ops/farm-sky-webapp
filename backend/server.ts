@@ -182,6 +182,48 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
       } catch (e: any) {
         console.warn('Score gateway client registration skipped:', e?.message || e)
       }
+
+      // Phase 4 — GENERIC multi-tenant provisioning (Option B, Infrastructure-
+      // as-Code fallback for the /admin/tenants dashboard). Any environment
+      // variable named TENANT_<NAME>_CLIENT_KEY provisions a client tenant in
+      // app_clients, using TENANT_<NAME>_HMAC_SECRET and TENANT_<NAME>_WEBHOOK_URL.
+      // Example (Credit):
+      //   TENANT_CREDIT_CLIENT_KEY="credit_farmsky_key"
+      //   TENANT_CREDIT_HMAC_SECRET="..."
+      //   TENANT_CREDIT_WEBHOOK_URL="https://credit.farmsky.africa/api/v1/payment-webhook"
+      // Existing admin-UI edits are preserved: the secret is only overwritten
+      // from env when it actually changed, and webhook/origin fall back to the
+      // stored value when the env var is blank. Non-breaking and idempotent.
+      try {
+        const tenantKeys = Object.keys(process.env).filter((k) => /^TENANT_[A-Z0-9]+_CLIENT_KEY$/.test(k))
+        for (const keyVar of tenantKeys) {
+          const name = keyVar.replace(/^TENANT_/, '').replace(/_CLIENT_KEY$/, '')
+          const clientKey = String(process.env[keyVar] || '').trim()
+          const secret = String(process.env[`TENANT_${name}_HMAC_SECRET`] || '').trim()
+          const webhook = String(process.env[`TENANT_${name}_WEBHOOK_URL`] || '').trim()
+          const origin = String(process.env[`TENANT_${name}_ORIGIN_URL`] || '').trim()
+          const display = String(process.env[`TENANT_${name}_DISPLAY_NAME`] || `Farmsky ${name.charAt(0)}${name.slice(1).toLowerCase()}`).trim()
+          if (!clientKey || !secret) {
+            console.warn(`Tenant '${name}' NOT provisioned: TENANT_${name}_CLIENT_KEY / _HMAC_SECRET missing.`)
+            continue
+          }
+          await raw.query(
+            `INSERT INTO app_clients (client_key, display_name, origin_url, hmac_secret, callback_url, webhook_url, is_active, provisioned_via)
+             VALUES ($1, $2, $3, $4, $5, $5, 1, 'env')
+             ON CONFLICT (client_key) DO UPDATE SET
+               display_name = EXCLUDED.display_name,
+               origin_url = COALESCE(NULLIF(EXCLUDED.origin_url, ''), app_clients.origin_url),
+               hmac_secret = EXCLUDED.hmac_secret,
+               webhook_url = COALESCE(NULLIF(EXCLUDED.webhook_url, ''), app_clients.webhook_url),
+               callback_url = COALESCE(NULLIF(EXCLUDED.callback_url, ''), app_clients.callback_url),
+               is_active = 1`,
+            [clientKey, display, origin || webhook.replace(/\/api\/.*$/, '') || 'https://example.invalid', secret, webhook || null]
+          )
+          console.log(`Tenant '${name}' provisioned via env (client_key '${clientKey}').`)
+        }
+      } catch (e: any) {
+        console.warn('Env-driven tenant provisioning skipped:', e?.message || e)
+      }
     })
     .catch((err: any) => {
       dbInitError = err?.message || String(err)
