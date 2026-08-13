@@ -44,7 +44,10 @@ session:
    account by **email**, issues a Score session, and drops the user straight
    into the Score console — no re-login.
 
-The shared `CROSS_APP_HMAC_SECRET` must be identical on both apps.
+The Score↔Equipment `SCORE_CROSS_APP_HMAC_SECRET` must be identical on both apps
+(legacy `CROSS_APP_HMAC_SECRET` is still read as a fallback). This is the
+dedicated Score channel secret, independent of the generic Feed/Inputs/
+Marketplace `CROSS_APP_HMAC_SECRET`.
 
 ## 4. Consuming Score's APIs for verification + credit
 
@@ -69,7 +72,8 @@ completes.
 ## 5. Environment variables
 
 ```
-CROSS_APP_HMAC_SECRET=<shared with Score>
+SCORE_CROSS_APP_HMAC_SECRET=<shared with Score — direct Score↔Equipment channel>
+# CROSS_APP_HMAC_SECRET=<legacy fallback / generic Feed⇄Equipment SSO>
 SCORE_APP_URL=https://score.farmsky.africa
 SCORE_API_URL=https://score.farmsky.africa
 SCORE_API_CLIENT=<API client id Score issued to Equipment>

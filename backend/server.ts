@@ -83,6 +83,7 @@ const ENV = {
   // API Management SSO never appeared even when SCORE_APP_URL was set on Render.
   SCORE_APP_URL: process.env.SCORE_APP_URL,
   CROSS_APP_HMAC_SECRET: process.env.CROSS_APP_HMAC_SECRET,
+  SCORE_CROSS_APP_HMAC_SECRET: process.env.SCORE_CROSS_APP_HMAC_SECRET,
   SCORE_API_URL: process.env.SCORE_API_URL,
   SCORE_API_CLIENT: process.env.SCORE_API_CLIENT,
   SCORE_API_SECRET: process.env.SCORE_API_SECRET,
@@ -160,7 +161,7 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
       // sync with env WITHOUT hardcoding the credit.farmskyafrica domain.
       try {
         const clientKey = process.env.SCORE_CLIENT_KEY || 'score'
-        const secret = process.env.SCORE_HMAC_SECRET || process.env.CROSS_APP_HMAC_SECRET || ''
+        const secret = process.env.SCORE_HMAC_SECRET || process.env.SCORE_CROSS_APP_HMAC_SECRET || process.env.CROSS_APP_HMAC_SECRET || ''
         const origin = process.env.SCORE_ORIGIN_URL || process.env.SCORE_APP_URL || ''
         const callback = process.env.SCORE_CALLBACK_URL
           || (origin ? `${origin.replace(/\/+$/, '')}/v3/app/wallet/callback` : '')
@@ -177,7 +178,7 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
           )
           console.log(`Score gateway client '${clientKey}' registered (origin ${origin || 'default'}).`)
         } else {
-          console.warn('Score gateway client NOT registered: SCORE_HMAC_SECRET / CROSS_APP_HMAC_SECRET unset.')
+          console.warn('Score gateway client NOT registered: SCORE_HMAC_SECRET / SCORE_CROSS_APP_HMAC_SECRET / CROSS_APP_HMAC_SECRET unset.')
         }
       } catch (e: any) {
         console.warn('Score gateway client registration skipped:', e?.message || e)

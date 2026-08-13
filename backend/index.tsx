@@ -3068,9 +3068,9 @@ app.put('/api/v1/admin/tenants/:client_key/status', requireAuth, requireRole('ad
 // Score is the PRIMARY wallet ledger; every wallet transaction on Score is
 // mirrored here for cross-app audit. Score POSTs a signed JSON payload with:
 //   X-Score-Signature: sha256=<hmacSha256Hex(secret, rawBody)>
-// where secret = EQUIPMENT_LEDGER_SECRET || CROSS_APP_HMAC_SECRET (Score side).
+// where secret = EQUIPMENT_LEDGER_SECRET || SCORE_CROSS_APP_HMAC_SECRET (Score side).
 // Equipment verifies with SCORE_LEDGER_HMAC_SECRET || SCORE_HMAC_SECRET ||
-// CROSS_APP_HMAC_SECRET. Idempotent on score_tx_id.
+// SCORE_CROSS_APP_HMAC_SECRET || CROSS_APP_HMAC_SECRET. Idempotent on score_tx_id.
 // ----------------------------------------------------------------------------
 function timingSafeEqualHex(a: string, b: string): boolean {
   if (typeof a !== 'string' || typeof b !== 'string') return false
@@ -3087,6 +3087,7 @@ app.post('/api/score-ledger/mirror', async (c) => {
   const secret =
     c.env.SCORE_LEDGER_HMAC_SECRET ||
     c.env.SCORE_HMAC_SECRET ||
+    c.env.SCORE_CROSS_APP_HMAC_SECRET ||
     c.env.CROSS_APP_HMAC_SECRET ||
     ''
 

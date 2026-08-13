@@ -108,7 +108,8 @@ Lenders on the Equipment platform can enable and begin consuming the Farmsky
 Score verification & credit APIs directly:
 
 - **"Use APIs" button** — shown in the top bar **only** to users whose role is
-  `lender` (and only when `SCORE_APP_URL` + `CROSS_APP_HMAC_SECRET` are set).
+  `lender` (and only when `SCORE_APP_URL` + the Score↔Equipment HMAC secret
+  `SCORE_CROSS_APP_HMAC_SECRET` — legacy `CROSS_APP_HMAC_SECRET` fallback — are set).
   Clicking it records the lender's opt-in (`POST /api/cross/use-apis`, lender-only,
   audited) then performs a single sign-on handoff to the Score console's
   **API Access** tab (`GET /api/cross/handoff?target=score&dest=api-access`) — no
@@ -130,7 +131,7 @@ Set these so the Equipment ⇄ Score handoff works with **no second login**:
 
 | Variable | Where | Value |
 |---|---|---|
-| `CROSS_APP_HMAC_SECRET` | **Both** Equipment *and* Score services | The **same** random secret on both — Score's `/sso` verifies the handoff token with it. A mismatch shows *"sign-in link could not be verified"*. |
+| `SCORE_CROSS_APP_HMAC_SECRET` | **Both** Equipment *and* Score services | The **same** random secret on both for the direct Score↔Equipment channel — Score's `/sso` verifies the handoff token with it (legacy `CROSS_APP_HMAC_SECRET` still honored as a fallback). A mismatch shows *"sign-in link could not be verified"*. Independent of the Feed/Inputs/Marketplace `CROSS_APP_HMAC_SECRET`. |
 | `SCORE_APP_URL` | Equipment service | `https://score.farmsky.africa` — without it `score_configured` is `false` and the buttons never appear. |
 
 > The Score side must also be migrated/deployed (its `0000_repair` migration builds
