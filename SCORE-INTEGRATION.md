@@ -39,7 +39,11 @@ session:
 
 1. Equipment `GET /api/cross/handoff?target=score` mints a short-lived (2 min)
    HMAC-signed token carrying `{phone, email, name}` and returns
-   `${SCORE_APP_URL}/sso?token=...`.
+   `${SCORE_APP_URL}/sso?token=...`. For `target=score` the token is signed with
+   the **Score-channel** secret `SCORE_CROSS_APP_HMAC_SECRET` (legacy
+   `CROSS_APP_HMAC_SECRET` fallback); other targets (Feed) use the generic
+   `CROSS_APP_HMAC_SECRET`. Signing with the wrong secret is what produces a
+   `GET /sso … 401` on Score.
 2. Score's `GET /sso` verifies the HMAC + freshness, resolves/creates the
    account by **email**, issues a Score session, and drops the user straight
    into the Score console — no re-login.

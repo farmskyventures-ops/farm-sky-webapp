@@ -3195,8 +3195,16 @@ app.get('/api/ledger', requireAuth, requireRole('admin', 'super_admin'), async (
 // Signed-in user requests a handoff URL to the sibling app.
 app.get('/api/cross/handoff', requireAuth, async (c) => {
   const user = c.get('user') as SessionUser
-  const secret = c.env.CROSS_APP_HMAC_SECRET || ''
   const target = String(c.req.query('target') || '')
+  // Secret selection is per-channel:
+  //  - target 'score'  -> the DEDICATED Score↔Equipment secret
+  //    (SCORE_CROSS_APP_HMAC_SECRET, legacy CROSS_APP_HMAC_SECRET fallback).
+  //    This must match Score's /sso verifier (SCORE_CROSS_APP_HMAC_SECRET).
+  //  - any other target -> the generic Feed⇄Equipment SSO secret
+  //    (CROSS_APP_HMAC_SECRET), untouched by the Score-channel rename.
+  const secret = (target === 'score'
+    ? (c.env.SCORE_CROSS_APP_HMAC_SECRET || c.env.CROSS_APP_HMAC_SECRET)
+    : c.env.CROSS_APP_HMAC_SECRET) || ''
   // Choose the destination origin by target: 'score' -> SCORE_APP_URL,
   // anything else -> the configured sibling marketplace (Feed/Equipment).
   const siblingUrl = (target === 'score'
@@ -3265,9 +3273,10 @@ app.get('/api/cross/config', requireAuth, (c) => {
     app_type: String(c.env.APP_TYPE || 'equipment'),
     cross_app_configured: !!(c.env.CROSS_APP_HMAC_SECRET && c.env.CROSS_APP_URL),
     cross_app_url: c.env.CROSS_APP_URL || null,
-    // Score SSO button is shown when the shared handoff secret AND the
+    // Score SSO button is shown when the Score-channel handoff secret AND the
     // Score origin are configured. Reuses the same session (no re-login).
-    score_configured: !!(c.env.CROSS_APP_HMAC_SECRET && c.env.SCORE_APP_URL),
+    // Score channel uses SCORE_CROSS_APP_HMAC_SECRET (legacy fallback).
+    score_configured: !!((c.env.SCORE_CROSS_APP_HMAC_SECRET || c.env.CROSS_APP_HMAC_SECRET) && c.env.SCORE_APP_URL),
     score_url: c.env.SCORE_APP_URL || null
   })
 })
