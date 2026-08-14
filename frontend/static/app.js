@@ -364,7 +364,7 @@ async function shopCrossApp() {
   } catch (e) { toast('Cross-app navigation unavailable', true) }
 }
 
-// Header button: open Farmsky Score (score.farmsky.africa) with the SAME
+// Header button: open Farmsky Score (credit.farmsky.africa) with the SAME
 // session — a short-lived HMAC handoff token means no second login. Score's
 // /sso endpoint verifies it and drops the user straight into their console.
 function scoreHeaderButton() {
@@ -491,38 +491,55 @@ async function viewLedger() {
   window._rerender_ledger = () => {
     const rows = _ledger.filter(t => rowMatchesFilters('ledger', t, {
       text: ['transaction_ref', 'phone', 'description'],
-      selects: { inventory_type: 'inventory_type', origin_platform: 'origin_platform', status: 'status', method: 'payment_method' },
+      selects: { source: 'source', inventory_type: 'inventory_type', origin_platform: 'origin_platform', status: 'status', method: 'payment_method' },
       date: 'created_at'
     }))
     const total = rows.reduce((s, t) => s + (t.status === 'SUCCESS' ? Number(t.amount) : 0), 0)
     $('ledgerBody').innerHTML = rows.map(t => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3">${sourceBadge(t.source || t.origin_app)}</td>
       <td class="px-4 py-3 font-mono text-xs">${esc(t.transaction_ref)}</td>
-      <td class="px-4 py-3"><span class="px-2 py-0.5 rounded text-xs ${t.inventory_type === 'equipment' ? 'bg-blue-50 text-blue-600' : 'bg-emerald-50 text-emerald-600'}">${esc(t.inventory_type || '—')}</span></td>
+      <td class="px-4 py-3">${categoryBadge(t.inventory_type)}</td>
       <td class="px-4 py-3 text-xs">${esc(t.origin_platform || t.origin_app || '—')}</td>
       <td class="px-4 py-3 uppercase text-xs">${esc(t.payment_method || '')}</td>
       <td class="px-4 py-3">${esc(t.phone || '')}</td>
       <td class="px-4 py-3 text-right font-semibold">${fmt(t.amount)}</td>
       <td class="px-4 py-3">${ledgerStatusBadge(t.status)}</td>
       <td class="px-4 py-3 text-xs text-slate-500">${esc(String(t.created_at || '').slice(0, 16))}</td>
-    </tr>`).join('') || '<tr><td colspan="8" class="text-center py-8 text-slate-400">No matching transactions</td></tr>'
+    </tr>`).join('') || '<tr><td colspan="9" class="text-center py-8 text-slate-400">No matching transactions</td></tr>'
     const cnt = $('ledgerCount'); if (cnt) cnt.textContent = `${rows.length} txn(s) · KES ${total.toLocaleString()} settled`
   }
   $('content').innerHTML = `
-    <div class="text-sm text-slate-500 mb-4"><i class="fas fa-book text-teal-600 mr-1"></i>Unified across Equipment &amp; Feed · <span id="ledgerCount"></span></div>
+    <div class="text-sm text-slate-500 mb-4"><i class="fas fa-book text-teal-600 mr-1"></i>Unified across Score, Equipment &amp; Feed · <span id="ledgerCount"></span></div>
     ${filterToolbar('ledger', { search: true, dates: true, selects: [
-      { key: 'inventory_type', label: 'Category', options: [{ v: 'equipment', t: 'Equipment' }, { v: 'feed', t: 'Feed' }] },
-      { key: 'origin_platform', label: 'Origin', options: [{ v: 'equipment_app', t: 'Equipment App' }, { v: 'feed_app', t: 'Feed App' }] },
+      { key: 'source', label: 'Source', options: [{ v: 'score', t: 'Score' }, { v: 'equipment', t: 'Equipment' }, { v: 'feed', t: 'Feed' }] },
+      { key: 'inventory_type', label: 'Category', options: [{ v: 'equipment', t: 'Equipment' }, { v: 'feed', t: 'Feed' }, { v: 'score', t: 'Score' }] },
+      { key: 'origin_platform', label: 'Origin', options: [{ v: 'equipment_app', t: 'Equipment App' }, { v: 'feed_app', t: 'Feed App' }, { v: 'score_app', t: 'Score App' }] },
       { key: 'status', label: 'Status', options: [{ v: 'SUCCESS', t: 'Success' }, { v: 'PENDING', t: 'Pending' }, { v: 'FAILED', t: 'Failed' }] },
-      { key: 'method', label: 'Method', options: [{ v: 'mpesa', t: 'M-Pesa' }, { v: 'sasapay', t: 'SasaPay' }, { v: 'buni', t: 'Buni' }] }
+      { key: 'method', label: 'Method', options: [{ v: 'mpesa', t: 'M-Pesa' }, { v: 'sasapay', t: 'SasaPay' }, { v: 'buni', t: 'Buni' }, { v: 'wallet', t: 'Wallet' }] }
     ] })}
     <div class="card table-card"><table class="w-full text-sm">
       <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
-        <th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Category</th><th class="text-left px-4 py-3">Origin</th>
+        <th class="text-left px-4 py-3">Source</th><th class="text-left px-4 py-3">Ref</th><th class="text-left px-4 py-3">Category</th><th class="text-left px-4 py-3">Origin</th>
         <th class="text-left px-4 py-3">Method</th><th class="text-left px-4 py-3">Phone</th><th class="text-right px-4 py-3">Amount</th>
         <th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Created</th></tr></thead>
       <tbody id="ledgerBody"></tbody>
     </table></div>`
   window._rerender_ledger()
+}
+// Origin-source tag for the Unified Payment Ledger (Score / Equipment / Feed).
+function sourceBadge(s) {
+  const key = String(s || '').toLowerCase()
+  const m = {
+    score: 'bg-indigo-50 text-indigo-600', equipment: 'bg-blue-50 text-blue-600',
+    feed: 'bg-emerald-50 text-emerald-600', feed_app: 'bg-emerald-50 text-emerald-600', equipment_app: 'bg-blue-50 text-blue-600'
+  }
+  const label = key === 'feed_app' ? 'feed' : (key === 'equipment_app' ? 'equipment' : (key || '—'))
+  return `<span class="px-2 py-0.5 rounded text-xs font-medium ${m[key] || 'bg-slate-100 text-slate-500'}">${esc(label)}</span>`
+}
+function categoryBadge(inv) {
+  const key = String(inv || '').toLowerCase()
+  const m = { equipment: 'bg-blue-50 text-blue-600', feed: 'bg-emerald-50 text-emerald-600', score: 'bg-indigo-50 text-indigo-600' }
+  return `<span class="px-2 py-0.5 rounded text-xs ${m[key] || 'bg-slate-100 text-slate-500'}">${esc(inv || '—')}</span>`
 }
 function ledgerStatusBadge(s) {
   const m = { SUCCESS: 'bg-emerald-50 text-emerald-600', PENDING: 'bg-amber-50 text-amber-600', FAILED: 'bg-red-50 text-red-600', EXPIRED: 'bg-slate-100 text-slate-500' }
@@ -2458,13 +2475,149 @@ async function viewWallets() {
       <tbody>${rows || '<tr><td colspan="5" class="text-center py-8 text-slate-400">No wallets assigned</td></tr>'}</tbody>
     </table>
   </div>
-  <div class="card table-card">
+  <div class="card table-card mb-6">
     <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-chart-pie text-teal-600 mr-2"></i>Earning analytics by category</div>
     <table class="w-full text-sm">
       <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Category</th><th class="text-left px-4 py-3">Type</th><th class="text-right px-4 py-3">Entries</th><th class="text-right px-4 py-3">Total</th></tr></thead>
       <tbody>${catRows || '<tr><td colspan="4" class="text-center py-8 text-slate-400">No ledger activity yet</td></tr>'}</tbody>
     </table>
+  </div>
+  <!-- Lender API / Score wallets (real-time from credit.farmsky.africa) -->
+  <div class="card table-card">
+    <div class="px-4 py-3 border-b flex items-center justify-between">
+      <div class="font-semibold text-slate-700"><i class="fas fa-building-columns text-indigo-600 mr-2"></i>Lender API Wallets <span class="text-xs font-normal text-slate-400">· Farmsky Score</span></div>
+      <span id="scoreWalletsMeta" class="text-xs text-slate-400">Loading…</span>
+    </div>
+    <table class="w-full text-sm">
+      <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+        <th class="text-left px-4 py-3">Lender / Org</th><th class="text-right px-4 py-3">Balance</th>
+        <th class="text-center px-4 py-3">Plan</th><th class="text-center px-4 py-3">API Keys</th>
+        <th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Last activity</th><th></th></tr></thead>
+      <tbody id="scoreWalletsBody"><tr><td colspan="7" class="text-center py-8 text-slate-400">Loading Score wallets…</td></tr></tbody>
+    </table>
   </div>`
+  loadScoreWallets()
+}
+
+// ---------------------------------------------------------------------------
+// LENDER API / SCORE WALLETS — real-time visibility (Wallets & Payouts 1.1)
+// Lists every Score (credit.farmsky.africa) lender API wallet with live
+// balances + metadata synced from the Score service engine. Each row drills
+// down (viewScoreWallet) into a per-wallet ledger + API/service consumption.
+// ---------------------------------------------------------------------------
+let _scoreWallets = []
+async function loadScoreWallets() {
+  const body = $('scoreWalletsBody'); const meta = $('scoreWalletsMeta')
+  if (!body) return
+  let data
+  try { const res = await api.get('/score-wallets'); data = res.data }
+  catch (err) {
+    body.innerHTML = '<tr><td colspan="7" class="text-center py-8 text-slate-400">Score wallet sync is not available. Configure SCORE_API_URL / SCORE_API_CLIENT / SCORE_API_SECRET to surface lender wallets here.</td></tr>'
+    if (meta) meta.textContent = ''
+    return
+  }
+  _scoreWallets = data.wallets || []
+  if (meta) {
+    const live = data.source === 'score_live'
+    meta.innerHTML = live
+      ? `<span class="text-emerald-600"><i class="fas fa-circle text-[8px] mr-1"></i>Live · synced ${esc(String(data.synced_at || '').slice(11, 16))} UTC</span>`
+      : `<span class="text-amber-600"><i class="fas fa-triangle-exclamation mr-1"></i>Mirror fallback (Score engine unreachable)</span>`
+  }
+  const statusPill = (s) => {
+    const m = { active: 'bg-emerald-50 text-emerald-600', low: 'bg-amber-50 text-amber-600', empty: 'bg-red-50 text-red-600' }
+    return `<span class="px-2 py-0.5 rounded text-xs ${m[s] || 'bg-slate-100 text-slate-500'}">${esc(s || 'active')}</span>`
+  }
+  body.innerHTML = _scoreWallets.map(w => `<tr class="border-t border-slate-100 hover:bg-indigo-50/40 cursor-pointer" onclick="viewScoreWallet('${esc(w.org_id)}')">
+      <td class="px-4 py-3"><div class="font-medium">${esc(w.display_name)}</div><div class="text-xs text-slate-500 font-mono">${esc(String(w.org_id).slice(0, 12))}…</div></td>
+      <td class="px-4 py-3 text-right font-medium text-indigo-700">${fmt(w.balance_kes)}</td>
+      <td class="px-4 py-3 text-center text-xs">${esc(w.plan || '—')}</td>
+      <td class="px-4 py-3 text-center">${w.active_keys != null ? w.active_keys : '—'}</td>
+      <td class="px-4 py-3">${statusPill(w.status)}</td>
+      <td class="px-4 py-3 text-xs text-slate-500">${esc(String(w.last_activity_at || '').slice(0, 16) || '—')}</td>
+      <td class="px-4 py-3 text-right text-indigo-500"><i class="fas fa-chevron-right"></i></td>
+    </tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No Score lender wallets yet</td></tr>'
+}
+
+// Drill-down: one Score lender API wallet — snapshot, time-stamped transaction
+// ledger (credits / debits / holds / settlements) and API & service
+// consumption tracking (endpoints, frequency, status, usage-based fees).
+window.viewScoreWallet = async (orgId) => {
+  $('pageTitle').textContent = 'Lender API Wallet'
+  $('content').innerHTML = '<div class="text-slate-400">Loading wallet detail…</div>'
+  let d
+  try { const res = await api.get('/score-wallets/' + encodeURIComponent(orgId)); d = res.data }
+  catch (err) { $('content').innerHTML = `<div class="card p-6 text-slate-500">Failed to load wallet detail. <button onclick="go('wallets')" class="text-teal-600 underline">Back to Wallets</button></div>`; return }
+  const w = d.wallet || {}
+  const ledger = d.ledger || []
+  const cons = d.consumption || { endpoints: [], service_fees: [] }
+  const live = d.source === 'score_live'
+
+  const catPill = (cat) => {
+    const m = { settlement: 'bg-emerald-50 text-emerald-600', debit: 'bg-slate-100 text-slate-600', hold: 'bg-amber-50 text-amber-600' }
+    return `<span class="px-2 py-0.5 rounded text-xs ${m[cat] || 'bg-slate-100 text-slate-500'}">${esc(cat)}</span>`
+  }
+  const dirArrow = (dir) => dir === 'credit'
+    ? '<i class="fas fa-arrow-down text-emerald-600" title="incoming credit"></i>'
+    : '<i class="fas fa-arrow-up text-slate-500" title="outgoing debit"></i>'
+
+  const ledgerRows = ledger.map(t => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3 text-xs text-slate-500">${esc(String(t.created_at || '').slice(0, 19).replace('T', ' '))}</td>
+      <td class="px-4 py-3 text-center">${dirArrow(t.direction)}</td>
+      <td class="px-4 py-3">${catPill(t.category)}</td>
+      <td class="px-4 py-3 text-xs">${esc(t.kind || '')}</td>
+      <td class="px-4 py-3 font-mono text-xs">${esc(t.reference || t.id || '')}</td>
+      <td class="px-4 py-3 text-right font-medium ${t.direction === 'credit' ? 'text-emerald-700' : 'text-slate-700'}">${t.direction === 'credit' ? '+' : '−'}${fmt(t.amount_kes)}</td>
+      <td class="px-4 py-3 text-right text-xs text-slate-500">${t.balance_after != null ? fmt(t.balance_after) : '—'}</td>
+    </tr>`).join('') || '<tr><td colspan="7" class="text-center py-8 text-slate-400">No ledger entries</td></tr>'
+
+  const epRows = (cons.endpoints || []).map(e => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3 font-mono text-xs">${esc(e.endpoint)}</td>
+      <td class="px-4 py-3 text-right">${e.calls}</td>
+      <td class="px-4 py-3 text-right">${e.success_rate}%</td>
+      <td class="px-4 py-3 text-right text-xs">${e.avg_latency_ms} ms</td>
+      <td class="px-4 py-3 text-xs text-slate-500">${esc(String(e.last_called_at || '').slice(0, 16))}</td>
+    </tr>`).join('') || '<tr><td colspan="5" class="text-center py-6 text-slate-400">No API calls recorded</td></tr>'
+
+  const feeRows = (cons.service_fees || []).map(f => `<tr class="border-t border-slate-100">
+      <td class="px-4 py-3"><div class="font-medium text-sm">${esc(f.service_name)}</div><div class="text-xs text-slate-400 font-mono">${esc(f.service_key)}</div></td>
+      <td class="px-4 py-3 text-xs">${esc(f.category || '')}</td>
+      <td class="px-4 py-3 text-right">${f.units}</td>
+      <td class="px-4 py-3 text-right text-xs">${f.unit_price_kes != null ? fmt(f.unit_price_kes) : '—'}</td>
+      <td class="px-4 py-3 text-right font-medium text-slate-700">${fmt(f.total_fee_kes)}</td>
+    </tr>`).join('') || '<tr><td colspan="5" class="text-center py-6 text-slate-400">No billable service usage</td></tr>'
+
+  $('content').innerHTML = `
+    <button onclick="go('wallets')" class="btn text-sm text-slate-500 mb-4"><i class="fas fa-arrow-left mr-1"></i>Back to Wallets &amp; Payouts</button>
+    <div class="responsive-grid cols-3 mb-6">
+      <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Wallet balance</div><div class="text-2xl font-bold text-indigo-700">${fmt(w.balance_kes)}</div><div class="text-xs text-slate-400 mt-1">${esc(w.currency || 'KES')} · ${esc(w.status || 'active')}</div></div>
+      <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Lender / Org</div><div class="text-lg font-semibold truncate">${esc(w.display_name || 'Lender')}</div><div class="text-xs text-slate-400 font-mono mt-1">${esc(w.org_id || '')}</div></div>
+      <div class="card p-5"><div class="text-xs text-slate-500 mb-1">Data source</div><div class="text-lg font-semibold ${live ? 'text-emerald-600' : 'text-amber-600'}">${live ? 'Live · Score engine' : 'Mirror fallback'}</div><div class="text-xs text-slate-400 mt-1">${esc(String(d.synced_at || '').slice(0, 19).replace('T', ' '))}</div></div>
+    </div>
+    <div class="card table-card mb-6">
+      <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-list text-indigo-600 mr-2"></i>Transaction ledger <span class="text-xs font-normal text-slate-400">· credits · debits · holds · settlements</span></div>
+      <table class="w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr>
+          <th class="text-left px-4 py-3">Timestamp</th><th class="text-center px-4 py-3">Dir</th><th class="text-left px-4 py-3">Type</th>
+          <th class="text-left px-4 py-3">Kind</th><th class="text-left px-4 py-3">Reference</th><th class="text-right px-4 py-3">Amount</th><th class="text-right px-4 py-3">Balance after</th></tr></thead>
+        <tbody>${ledgerRows}</tbody>
+      </table>
+    </div>
+    <div class="responsive-grid cols-2">
+      <div class="card table-card">
+        <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-plug text-indigo-600 mr-2"></i>API consumption <span class="text-xs font-normal text-slate-400">· endpoints &amp; execution</span></div>
+        <table class="w-full text-sm">
+          <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Endpoint</th><th class="text-right px-4 py-3">Calls</th><th class="text-right px-4 py-3">Success</th><th class="text-right px-4 py-3">Avg</th><th class="text-left px-4 py-3">Last</th></tr></thead>
+          <tbody>${epRows}</tbody>
+        </table>
+      </div>
+      <div class="card table-card">
+        <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-coins text-indigo-600 mr-2"></i>Service consumption &amp; fees <span class="text-xs font-normal text-slate-400">· usage-based</span></div>
+        <table class="w-full text-sm">
+          <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Service</th><th class="text-left px-4 py-3">Category</th><th class="text-right px-4 py-3">Units</th><th class="text-right px-4 py-3">Unit</th><th class="text-right px-4 py-3">Total</th></tr></thead>
+          <tbody>${feeRows}</tbody>
+        </table>
+      </div>
+    </div>`
 }
 window.assignWalletModal = async () => {
   let users = []

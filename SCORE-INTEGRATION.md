@@ -1,4 +1,4 @@
-# Farmsky Score Integration (score.farmsky.africa)
+# Farmsky Score Integration (credit.farmsky.africa)
 
 Equipment is the **central host** for Farmsky Score's data and payments, and
 consumes Score's APIs for identity + credit decisioning.
@@ -73,13 +73,34 @@ completes.
 > <https://docs.metamap.com>. Equipment itself does **not** call MetaMap
 > directly — it delegates to Score.
 
+## 4a. Read-only wallet & ledger sync — `GET /v3/equipment-sync/*`
+
+Score exposes a dedicated **read-only** sync surface that Equipment polls to
+render lender/API wallet visibility, drill-down auditing, and the unified
+ledger. It reuses the same auth as §4 (`Authorization: Bearer <client_id>:<secret>`
++ optional HMAC signing) and is guarded by `apiGuard('credit:read')` — **no new
+secret is introduced**. `backend/score-client.ts` (`scoreWallets`,
+`scoreWalletDetail`, `scoreTransactions`) speaks this scheme and degrades to
+`{ live: false }` when Score is unconfigured/unreachable.
+
+| Method & path | Returns |
+|---|---|
+| `GET /v3/equipment-sync/wallets` | All orgs LEFT JOIN wallets → wallet list with metadata, balance, currency, low-threshold, status (`active`/`low`/`empty`), active API keys, last-activity timestamp. |
+| `GET /v3/equipment-sync/wallets/:orgId?limit=` | Wallet snapshot + time-stamped ledger (`wallet_transactions`, category `settlement`/`debit`/`hold`) + `consumption` = { `endpoints` (from `api_telemetry` aggregated by path+method+status class) , `service_fees` (verification debits × `service_pricing`) }. |
+| `GET /v3/equipment-sync/transactions?limit=&since=` | Normalized transaction stream: status → `SUCCESS`/`PENDING`/`FAILED`, `source: "score"`, `origin_platform: "score_app"`, `inventory_type: "score"` — shaped to match Equipment's `central_transactions` for the unified ledger. |
+
+On the Equipment side these back `GET /api/score-wallets`,
+`GET /api/score-wallets/:orgId`, and the Score stream of `GET /api/ledger`
+(see the Equipment README → "Lender API / Score wallet visibility"). When Score
+is down, Equipment falls back to the mirrored `score_wallet_ledger` table.
+
 ## 5. Environment variables
 
 ```
 SCORE_CROSS_APP_HMAC_SECRET=<shared with Score — direct Score↔Equipment channel>
 # CROSS_APP_HMAC_SECRET=<legacy fallback / generic Feed⇄Equipment SSO>
-SCORE_APP_URL=https://score.farmsky.africa
-SCORE_API_URL=https://score.farmsky.africa
+SCORE_APP_URL=https://credit.farmsky.africa
+SCORE_API_URL=https://credit.farmsky.africa
 SCORE_API_CLIENT=<API client id Score issued to Equipment>
 SCORE_API_SECRET=<paired secret>
 ```

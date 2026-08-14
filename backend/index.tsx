@@ -18,7 +18,7 @@ import { sendEmail, emailConfigured } from './email'
 import { hashPassword, verifyPassword, isHashed } from './password'
 import merchantApi from './merchant-api'
 import { mintHandoffToken, verifyHandoffToken } from './cross-app'
-import { scoreConfigured, scoreKyc, scoreIprs, scoreLiveness, scoreCreditEvaluation } from './score-client'
+import { scoreConfigured, scoreKyc, scoreIprs, scoreLiveness, scoreCreditEvaluation, scoreWallets, scoreWalletDetail, scoreTransactions } from './score-client'
 import { validateImageDataUrl, validateText, validateTextFields } from './upload-validation'
 import { hmacSha256Hex } from './payments-shared'
 
@@ -1664,7 +1664,7 @@ app.delete('/api/customers/:id', requireAuth, requireRole('admin', 'super_admin'
   return c.json({ ok: true })
 })
 // Verification engine — ID verification, liveness, IPRS and credit
-// evaluation are delegated to Farmsky Score (score.farmsky.africa) when
+// evaluation are delegated to Farmsky Score (credit.farmsky.africa) when
 // configured; otherwise a deterministic local simulation is used.
 app.post('/api/customers/:id/verify', requireAuth, async (c) => {
   const id = c.req.param('id')
@@ -1687,7 +1687,7 @@ app.post('/api/customers/:id/verify', requireAuth, async (c) => {
 
   // ---------------------------------------------------------------------
   // Farmsky Score integration.
-  // When Score (score.farmsky.africa) is configured, ID verification,
+  // When Score (credit.farmsky.africa) is configured, ID verification,
   // liveness, IPRS and the full credit evaluation are performed by Score's
   // APIs. Every Score response is mirrored into this database's DEDICATED
   // score_* tables. If Score is unreachable / not configured we fall back
@@ -3168,10 +3168,11 @@ app.route('/api', merchantApi)
 // (inventory_type) + origin_platform. RBAC: admin/super_admin only.
 // ----------------------------------------------------------------------------
 app.get('/api/ledger', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
-  const invType = c.req.query('inventory_type') || ''      // 'equipment' | 'feed'
-  const origin = c.req.query('origin_platform') || ''      // 'equipment_app' | 'feed_app'
+  const invType = c.req.query('inventory_type') || ''      // 'equipment' | 'feed' | 'score'
+  const origin = c.req.query('origin_platform') || ''      // 'equipment_app' | 'feed_app' | 'score_app'
   const status = c.req.query('status') || ''
   const method = c.req.query('method') || ''
+  const source = c.req.query('source') || ''               // 'equipment' | 'feed' | 'score' (origin category)
   const q = c.req.query('q') || ''
   const filters: string[] = []
   const binds: any[] = []
@@ -3181,12 +3182,85 @@ app.get('/api/ledger', requireAuth, requireRole('admin', 'super_admin'), async (
   if (method) { filters.push('payment_method = ?'); binds.push(method) }
   if (q) { filters.push('(transaction_ref LIKE ? OR phone LIKE ? OR description LIKE ?)'); binds.push(`%${q}%`, `%${q}%`, `%${q}%`) }
   const where = filters.length ? 'WHERE ' + filters.join(' AND ') : ''
+
+  // (a) Equipment + Feed streams from the central transaction ledger. Tag each
+  //     row with a normalized `source` (origin category) for the unified view.
   const rows = await withAdminContext(c, async () => await c.env.DB.prepare(
     `SELECT transaction_ref, origin_app, origin_platform, inventory_type, payment_method, phone,
             amount, currency, status, description, created_at, completed_at
        FROM central_transactions ${where} ORDER BY created_at DESC LIMIT 500`
   ).bind(...binds).all<any>())
-  return c.json({ transactions: rows.results || [] })
+  const central = (rows.results || []).map((t: any) => ({
+    ...t,
+    source: t.inventory_type === 'feed' ? 'feed' : 'equipment',
+  }))
+
+  // (b) Score stream — normalized into the SAME row shape (feature parity +
+  //     visual consistency). Prefer a LIVE pull from the Score engine; fall
+  //     back to the locally-mirrored score_wallet_ledger when Score is not
+  //     reachable. Non-breaking: any failure yields an empty Score slice.
+  let score: any[] = []
+  try {
+    const live = await scoreTransactions(c.env, { limit: 500 })
+    if (live.live && Array.isArray(live.transactions)) {
+      score = live.transactions.map((t: any) => ({
+        transaction_ref: t.reference || t.score_tx_id,
+        origin_app: 'score',
+        origin_platform: 'score_app',
+        inventory_type: 'score',
+        payment_method: t.kind === 'topup' ? 'mpesa' : 'wallet',
+        phone: t.phone || '',
+        amount: t.amount_kes,
+        currency: 'KES',
+        status: t.status,                       // already SUCCESS | PENDING | FAILED
+        description: `${t.kind || 'topup'}${t.org_name ? ' · ' + t.org_name : ''}`,
+        created_at: t.created_at,
+        completed_at: t.status === 'SUCCESS' ? t.created_at : null,
+        source: 'score',
+      }))
+    } else {
+      const mirror = await withAdminContext(c, async () => await c.env.DB.prepare(
+        `SELECT score_tx_id, direction, amount_kes, kind, reference, created_at
+           FROM score_wallet_ledger ORDER BY created_at DESC LIMIT 500`
+      ).bind().all<any>())
+      score = (mirror.results || []).map((t: any) => ({
+        transaction_ref: t.reference || t.score_tx_id,
+        origin_app: 'score',
+        origin_platform: 'score_app',
+        inventory_type: 'score',
+        payment_method: t.kind === 'topup' ? 'mpesa' : 'wallet',
+        phone: '',
+        amount: Number(t.amount_kes) || 0,
+        currency: 'KES',
+        status: 'SUCCESS',
+        description: t.kind || 'topup',
+        created_at: t.created_at,
+        completed_at: t.created_at,
+        source: 'score',
+      }))
+    }
+  } catch { /* Score slice stays empty on any error — non-breaking */ }
+
+  // Apply the same client-supplied filters to the Score slice so filtering is
+  // consistent across all streams, then merge + sort by created_at (desc).
+  const scoreFiltered = score.filter((t) => {
+    if (invType && t.inventory_type !== invType) return false
+    if (origin && t.origin_platform !== origin) return false
+    if (status && t.status !== status) return false
+    if (method && t.payment_method !== method) return false
+    if (q) {
+      const hay = `${t.transaction_ref} ${t.phone} ${t.description}`.toLowerCase()
+      if (!hay.includes(q.toLowerCase())) return false
+    }
+    return true
+  })
+
+  let all = [...central, ...scoreFiltered]
+  if (source) all = all.filter((t) => t.source === source)   // origin-category filter (Score | Equipment | Feed)
+  all.sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')))
+  all = all.slice(0, 500)
+
+  return c.json({ transactions: all })
 })
 
 // ----------------------------------------------------------------------------
@@ -4488,6 +4562,103 @@ app.get('/api/wallets', requireAuth, requirePermission('manage_wallets'), async 
   })
   return c.json({ wallets: rows })
 })
+
+// ---------------------------------------------------------------------------
+// SCORE LENDER / API WALLETS  (Wallets & Payouts Module 1.1 + 1.2)
+// ---------------------------------------------------------------------------
+// Equipment is the central host + ledger engine; Score (credit.farmsky.africa)
+// owns the PRIMARY lender API wallets. The Wallets & Payouts dashboard shows
+// these alongside Equipment's own holder wallets. Balances + metadata are
+// synced in REAL TIME from the Score service engine (score-client.scoreWallets
+// → GET /v3/equipment-sync/wallets). When Score is not reachable/configured we
+// fall back to the locally-mirrored score_wallet_ledger so the section still
+// renders (degraded, from the last mirror push).
+app.get('/api/score-wallets', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  // 1) Preferred: live pull from Score.
+  const live = await scoreWallets(c.env)
+  if (live.live && live.wallets.length >= 0 && live.error == null && live.synced_at) {
+    return c.json({ wallets: live.wallets, source: 'score_live', synced_at: live.synced_at })
+  }
+  // 2) Fallback: reconstruct a wallet list from the mirrored ledger so the
+  //    dashboard still shows Score activity when the live sync is unavailable.
+  const rows = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT score_org_ref AS org_id,
+            COUNT(*) AS entries,
+            MAX(created_at) AS last_activity_at,
+            COALESCE(
+              (SELECT balance_after FROM score_wallet_ledger s2
+                WHERE s2.score_org_ref = s.score_org_ref AND s2.balance_after IS NOT NULL
+                ORDER BY s2.created_at DESC LIMIT 1), 0) AS balance_kes
+       FROM score_wallet_ledger s
+      WHERE score_org_ref IS NOT NULL
+      GROUP BY score_org_ref
+      ORDER BY last_activity_at DESC`
+  ).all<any>())
+  const wallets = (rows.results || []).map((r: any) => ({
+    org_id: String(r.org_id),
+    display_name: `Lender ${String(r.org_id).slice(0, 8)}`,
+    legal_name: null,
+    merchant_id: null,
+    plan: null,
+    currency: 'KES',
+    balance_kes: Number(r.balance_kes) || 0,
+    low_threshold: 0,
+    status: (Number(r.balance_kes) || 0) <= 0 ? 'empty' : 'active',
+    active_keys: null,
+    balance_updated_at: r.last_activity_at || null,
+    last_activity_at: r.last_activity_at || null,
+    entries: Number(r.entries) || 0,
+  }))
+  return c.json({ wallets, source: 'mirror_fallback', error: live.error || null })
+})
+
+// Drill-down for one Score lender API wallet: snapshot + time-stamped ledger
+// (incoming credits, outgoing debits, pending holds, final settlements) +
+// API & service consumption tracking (endpoint paths, call frequency, payload
+// execution status, usage-based service fees). Live from Score; falls back to
+// the mirrored ledger for the transaction list only.
+app.get('/api/score-wallets/:orgId', requireAuth, requirePermission('manage_wallets'), async (c) => {
+  const orgId = String(c.req.param('orgId') || '').trim()
+  if (!orgId) return c.json({ error: 'org_id required' }, 400)
+  const detail = await scoreWalletDetail(c.env, orgId, 300)
+  if (detail.live) {
+    return c.json({
+      source: 'score_live',
+      synced_at: detail.synced_at,
+      wallet: detail.wallet,
+      ledger: detail.ledger || [],
+      consumption: detail.consumption || { endpoints: [], service_fees: [] },
+    })
+  }
+  // Fallback: mirrored ledger rows for this org (no live consumption data).
+  const rows = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT id, direction, amount_kes, balance_after, kind, service_key, reference, source, created_at
+       FROM score_wallet_ledger WHERE score_org_ref = ? ORDER BY created_at DESC LIMIT 300`
+  ).bind(orgId).all<any>())
+  const ledger = (rows.results || []).map((t: any) => {
+    const dir = String(t.direction || '').toLowerCase()
+    return {
+      id: String(t.id),
+      direction: dir,
+      category: dir === 'credit' ? 'settlement' : 'debit',
+      amount_kes: Number(t.amount_kes) || 0,
+      balance_after: t.balance_after != null ? Number(t.balance_after) : null,
+      kind: t.kind || 'topup',
+      reference: t.reference || null,
+      status: 'completed',
+      created_at: t.created_at,
+      service_key: t.service_key || null,
+    }
+  })
+  return c.json({
+    source: 'mirror_fallback',
+    error: detail.error || null,
+    wallet: { org_id: orgId, display_name: `Lender ${orgId.slice(0, 8)}`, currency: 'KES', balance_kes: ledger[0]?.balance_after ?? 0, status: 'active' },
+    ledger,
+    consumption: { endpoints: [], service_fees: [] },
+  })
+})
+
 // Assign / create a wallet for a user (admin authorizes it).
 app.post('/api/wallets', requireAuth, requirePermission('manage_wallets'), async (c) => {
   const admin = c.get('user') as SessionUser

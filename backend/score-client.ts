@@ -1,5 +1,5 @@
 // =====================================================================
-// Farmsky Score API client  (score.farmsky.africa)
+// Farmsky Score API client  (credit.farmsky.africa)
 // ---------------------------------------------------------------------
 // Equipment consumes the Score platform's verification + credit APIs so
 // that ID verification, liveness checks, IPRS lookups and full credit
@@ -148,6 +148,68 @@ export async function scoreLiveness(env: Bindings, reference: string): Promise<{
       raw: r.data,
     }
   } catch (e: any) { return { live: false, error: String(e?.message || e) } }
+}
+
+// ---------------------------------------------------------------------
+// Wallets & Payouts real-time sync (Wallets & Payouts Module)
+// ---------------------------------------------------------------------
+// Equipment is the central host/ledger engine; Score owns the PRIMARY
+// lender API wallets. These read-only helpers pull the LIVE wallet
+// metadata + balances, per-wallet ledger + API/service consumption, and a
+// normalized transaction stream straight from the Score service engine
+// (GET /v3/equipment-sync/*), so the Equipment dashboard reflects Score
+// wallets in real time rather than relying only on the push mirror.
+//
+// All degrade gracefully: when Score is not configured (or the sync route
+// is unavailable) they return { live:false } / empty arrays so the
+// dashboard falls back to the locally-mirrored score_wallet_ledger.
+// ---------------------------------------------------------------------
+
+/** All Score lender/API wallets with metadata + current balances. */
+export async function scoreWallets(env: Bindings): Promise<{
+  live: boolean; wallets: any[]; synced_at?: string; error?: string
+}> {
+  if (!scoreConfigured(env)) return { live: false, wallets: [] }
+  try {
+    const r = await scoreFetch(env, 'GET', '/v3/equipment-sync/wallets')
+    if (!r.ok) return { live: false, wallets: [], error: r.data?.message || `Score wallets ${r.status}` }
+    return { live: true, wallets: Array.isArray(r.data?.wallets) ? r.data.wallets : [], synced_at: r.data?.synced_at }
+  } catch (e: any) { return { live: false, wallets: [], error: String(e?.message || e) } }
+}
+
+/** One Score wallet's drill-down: snapshot + ledger + API/service consumption. */
+export async function scoreWalletDetail(env: Bindings, orgId: string, limit = 200): Promise<{
+  live: boolean; wallet?: any; ledger?: any[]; consumption?: any; synced_at?: string; error?: string
+}> {
+  if (!scoreConfigured(env)) return { live: false }
+  const id = encodeURIComponent(String(orgId || ''))
+  try {
+    const r = await scoreFetch(env, 'GET', `/v3/equipment-sync/wallets/${id}?limit=${Math.max(1, Math.min(500, limit))}`)
+    if (!r.ok) return { live: false, error: r.data?.message || r.data?.error || `Score wallet ${r.status}` }
+    return {
+      live: true,
+      wallet: r.data?.wallet || null,
+      ledger: Array.isArray(r.data?.ledger) ? r.data.ledger : [],
+      consumption: r.data?.consumption || { endpoints: [], service_fees: [] },
+      synced_at: r.data?.synced_at,
+    }
+  } catch (e: any) { return { live: false, error: String(e?.message || e) } }
+}
+
+/** Normalized Score transaction stream for the Unified Payment Ledger. */
+export async function scoreTransactions(env: Bindings, opts: { limit?: number; since?: string } = {}): Promise<{
+  live: boolean; transactions: any[]; synced_at?: string; error?: string
+}> {
+  if (!scoreConfigured(env)) return { live: false, transactions: [] }
+  const q: string[] = []
+  if (opts.limit) q.push(`limit=${Math.max(1, Math.min(1000, opts.limit))}`)
+  if (opts.since) q.push(`since=${encodeURIComponent(opts.since)}`)
+  const qs = q.length ? `?${q.join('&')}` : ''
+  try {
+    const r = await scoreFetch(env, 'GET', `/v3/equipment-sync/transactions${qs}`)
+    if (!r.ok) return { live: false, transactions: [], error: r.data?.message || `Score transactions ${r.status}` }
+    return { live: true, transactions: Array.isArray(r.data?.transactions) ? r.data.transactions : [], synced_at: r.data?.synced_at }
+  } catch (e: any) { return { live: false, transactions: [], error: String(e?.message || e) } }
 }
 
 // ---------------------------------------------------------------------

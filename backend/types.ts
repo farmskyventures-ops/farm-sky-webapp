@@ -21,19 +21,19 @@ export type Bindings = MpesaEnv & SmsEnv & EmailEnv & SasaPayEnv & BuniEnv & {
   // Feed/Inputs/Marketplace. Score-channel code reads this first and falls back
   // to CROSS_APP_HMAC_SECRET when unset (non-breaking).
   SCORE_CROSS_APP_HMAC_SECRET?: string
-  // score.farmsky.africa — SSO handoff target + API consumption
-  SCORE_APP_URL?: string            // score.farmsky.africa origin (SSO "Open Score" button)
-  SCORE_API_URL?: string            // score API base (e.g. https://score.farmsky.africa)
+  // credit.farmsky.africa — SSO handoff target + API consumption
+  SCORE_APP_URL?: string            // credit.farmsky.africa origin (SSO "Open Score" button)
+  SCORE_API_URL?: string            // score API base (e.g. https://credit.farmsky.africa)
   SCORE_API_CLIENT?: string         // Score API client id issued to Equipment
   SCORE_API_SECRET?: string         // Score API secret (paired with the client id)
   // Phase 3 — Score payment-gateway tenant registration (all env-driven; the
-  // credit.farmskyafrica domain must NOT be hardcoded). At boot these upsert the
+  // credit.farmsky.africa domain must NOT be hardcoded). At boot these upsert the
   // 'score' row in app_clients so Equipment acts as Score's central M-Pesa
-  // gateway (extending the Feed model to credit.farmskyafrica).
+  // gateway (extending the Feed model to credit.farmsky.africa).
   SCORE_CLIENT_KEY?: string         // gateway client_key for Score (default 'score')
   SCORE_HMAC_SECRET?: string        // HMAC secret Score signs gateway calls with (== Score's SCORE_CROSS_APP_HMAC_SECRET/EQUIPMENT_LEDGER_SECRET)
-  SCORE_ORIGIN_URL?: string         // Score public origin, e.g. https://credit.farmskyafrica  (ENV-DRIVEN, not hardcoded)
-  SCORE_CALLBACK_URL?: string       // where Equipment posts settlement callbacks (e.g. https://credit.farmskyafrica/v3/app/wallet/callback)
+  SCORE_ORIGIN_URL?: string         // Score public origin, e.g. https://credit.farmsky.africa  (ENV-DRIVEN, not hardcoded)
+  SCORE_CALLBACK_URL?: string       // where Equipment posts settlement callbacks (e.g. https://credit.farmsky.africa/v3/app/wallet/callback)
   SCORE_LEDGER_HMAC_SECRET?: string // HMAC secret for the Score→Equipment mirror-ledger receiver (falls back to SCORE_HMAC_SECRET/SCORE_CROSS_APP_HMAC_SECRET/CROSS_APP_HMAC_SECRET)
   // Generic multi-tenant provisioning (Infrastructure-as-Code fallback for the
   // /admin/tenants dashboard). At boot, any TENANT_<NAME>_CLIENT_KEY present is

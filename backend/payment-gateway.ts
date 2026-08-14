@@ -302,7 +302,7 @@ gateway.post('/initiate', async (c) => {
     providerResult.checkout_request_id || null, phone, amount, 'KES', desc, initiated_by_user, ip
   ).run()
 
-  // Subscription payments originating from score.farmsky.africa are tracked
+  // Subscription payments originating from credit.farmsky.africa are tracked
   // in their own dedicated table so Score's billing state lives separately
   // from the shared transaction ledger. Triggered when the initiate call is
   // from the 'score' client and carries a subscription context.

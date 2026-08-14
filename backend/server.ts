@@ -87,7 +87,7 @@ const ENV = {
   SCORE_API_URL: process.env.SCORE_API_URL,
   SCORE_API_CLIENT: process.env.SCORE_API_CLIENT,
   SCORE_API_SECRET: process.env.SCORE_API_SECRET,
-  // Phase 3 — Score payment-gateway tenant (env-driven; credit.farmskyafrica
+  // Phase 3 — Score payment-gateway tenant (env-driven; credit.farmsky.africa
   // must not be hardcoded).
   SCORE_CLIENT_KEY: process.env.SCORE_CLIENT_KEY,
   SCORE_HMAC_SECRET: process.env.SCORE_HMAC_SECRET,
@@ -156,9 +156,9 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
     .then(async () => {
       dbReady = true
       console.log(`PostgreSQL ready: ${DATABASE_URL.replace(/:[^:@/]+@/, ':***@')}`)
-      // Phase 3 — env-driven registration of the Score (credit.farmskyafrica)
+      // Phase 3 — env-driven registration of the Score (credit.farmsky.africa)
       // payment-gateway tenant. Keeps client_key/hmac_secret/origin/callback in
-      // sync with env WITHOUT hardcoding the credit.farmskyafrica domain.
+      // sync with env WITHOUT hardcoding the credit.farmsky.africa domain.
       try {
         const clientKey = process.env.SCORE_CLIENT_KEY || 'score'
         const secret = process.env.SCORE_HMAC_SECRET || process.env.SCORE_CROSS_APP_HMAC_SECRET || process.env.CROSS_APP_HMAC_SECRET || ''
@@ -174,7 +174,7 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
                hmac_secret = EXCLUDED.hmac_secret,
                callback_url = COALESCE(NULLIF(EXCLUDED.callback_url, ''), app_clients.callback_url),
                is_active = 1`,
-            [clientKey, 'Farmsky Score', origin || 'https://credit.farmskyafrica', secret, callback]
+            [clientKey, 'Farmsky Score', origin || 'https://credit.farmsky.africa', secret, callback]
           )
           console.log(`Score gateway client '${clientKey}' registered (origin ${origin || 'default'}).`)
         } else {

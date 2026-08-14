@@ -132,11 +132,11 @@ Set these so the Equipment ⇄ Score handoff works with **no second login**:
 | Variable | Where | Value |
 |---|---|---|
 | `SCORE_CROSS_APP_HMAC_SECRET` | **Both** Equipment *and* Score services | The **same** random secret on both for the direct Score↔Equipment channel — Score's `/sso` verifies the handoff token with it (legacy `CROSS_APP_HMAC_SECRET` still honored as a fallback). A mismatch shows *"sign-in link could not be verified"*. Independent of the Feed/Inputs/Marketplace `CROSS_APP_HMAC_SECRET`. |
-| `SCORE_APP_URL` | Equipment service | `https://score.farmsky.africa` — without it `score_configured` is `false` and the buttons never appear. |
+| `SCORE_APP_URL` | Equipment service | `https://credit.farmsky.africa` — without it `score_configured` is `false` and the buttons never appear. |
 
 > The Score side must also be migrated/deployed (its `0000_repair` migration builds
 > the `organizations`/`users` tables the `/sso` handoff writes to). Verify Score
-> health at `GET https://score.farmsky.africa/v3/health` → `otp_deliverable: true`.
+> health at `GET https://credit.farmsky.africa/v3/health` → `otp_deliverable: true`.
 
 ### ⚠️ Sharing this database with the Score app — Score must set `DB_SCHEMA=score`
 Equipment is the **central database host**: the Score app can point at the **same**
@@ -160,6 +160,43 @@ they remain in Equipment's `public` schema and are distinct from Score's interna
 > service has `DB_SCHEMA=score` set (see the Score app's README → "Sharing ONE
 > database with the Equipment app"). Equipment's default `public` search_path is
 > correct and unchanged.
+
+## Lender API / Score wallet visibility & unified ledger
+Equipment surfaces the Score app's lender/API wallets and folds Score
+transactions into its own unified ledger, with a graceful fallback when Score
+is unreachable.
+
+### Live sync source
+- **Primary (live)** — Equipment pulls read-only data from Score's
+  `GET /v3/equipment-sync/*` endpoints, authenticated with the first-party Score
+  API key (`credit:read` scope) via `backend/score-client.ts` (`scoreWallets`,
+  `scoreWalletDetail`, `scoreTransactions`). Live only when `scoreConfigured(env)`
+  is true (`SCORE_API_URL`/`SCORE_APP_URL` + `SCORE_API_CLIENT_ID` +
+  `SCORE_API_SECRET`).
+- **Fallback (mirror)** — when Score is unconfigured/unreachable, Equipment reads
+  the locally-mirrored `score_wallet_ledger` table (populated by
+  `POST /api/score-ledger/mirror`). A `live: false` badge is shown in the UI so
+  operators know the data is mirrored rather than real-time.
+
+### API endpoints (Equipment side)
+| Method & path | Auth | Purpose |
+|---|---|---|
+| `GET /api/score-wallets` | `manage_wallets` | List all Score lender/API wallets with balance, currency, low-threshold, status (`active`/`low`/`empty`), active API keys, last activity. Live → mirror fallback. |
+| `GET /api/score-wallets/:orgId` | `manage_wallets` | Wallet drill-down: snapshot + time-stamped transaction ledger (credits/debits/holds/settlements) **and** API & service consumption (endpoint paths, call frequency, status class, usage-based service fees). Live → mirror fallback. |
+| `GET /api/ledger?source=score\|equipment\|feed` | authed | **Unified payment ledger** — merges `central_transactions` (Equipment/Feed) with the normalized Score stream into one time-sorted feed (latest 500), each row tagged with a `source`. The optional `source` query filter segments by origin. |
+
+### Dashboard views
+- **Wallets & Payouts → Lender API Wallets** — a dedicated card listing every
+  Score wallet with real-time metadata + balances; each row is clickable.
+- **Wallet drill-down** (`viewScoreWallet`) — three stat cards + a time-stamped
+  transaction ledger (directional arrows, category pills:
+  `settlement`/`debit`/`hold`) + an API-consumption table (endpoint, method, call
+  count, status class) + a service-fees table (usage-based charges). A **Back**
+  button returns to the wallets view.
+- **Unified Ledger** — adds a **Source** column with colour-coded badges
+  (Score = indigo, Equipment = blue, Feed = emerald) and a **Source** filter, so
+  streams can be segmented by origin. Header reads *"Unified across Score,
+  Equipment & Feed"*.
 
 ## Database migrations (auto-apply on boot)
 On startup the Node server runs every `migrations/*.sql` through
