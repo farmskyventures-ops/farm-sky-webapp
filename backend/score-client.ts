@@ -19,6 +19,7 @@
 // =====================================================================
 
 import type { Bindings } from './types'
+import { sanitizeUrl } from './url-utils'
 
 const encoder = new TextEncoder()
 
@@ -37,7 +38,9 @@ export function scoreConfigured(env: Bindings): boolean {
 }
 
 function scoreBase(env: Bindings): string {
-  return String(env.SCORE_API_URL || '').replace(/\/+$/, '')
+  // sanitizeUrl() guards against malformed env values (stray trailing
+  // ")." / quotes / whitespace) so the outbound fetch target is always valid.
+  return sanitizeUrl(env.SCORE_API_URL)
 }
 
 /**

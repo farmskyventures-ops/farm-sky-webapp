@@ -395,6 +395,25 @@ production databases that were created by an **older schema**:
 A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines
 (occasional `statement skipped` warnings on a shared DB are expected and benign).
 
+## Resilience & config hygiene
+- **URL sanitization (`backend/url-utils.ts`)** — every URL read from an
+  environment variable (`SCORE_APP_URL`, `SCORE_ORIGIN_URL`, `SCORE_API_URL`,
+  `CROSS_APP_URL`, `SCORE_CALLBACK_URL`, …) is passed through `sanitizeUrl()`,
+  which strips stray wrapping/trailing junk. This fixes the class of bug where a
+  value accidentally pasted from a log line — e.g.
+  `https://credit.farmsky.africa).` (note the trailing `).`) — produced a broken,
+  non-loading link. On boot the Score gateway client's stored `origin_url` /
+  `callback_url` are also **self-healed** to the sanitized value.
+- **Global error boundary (`app.onError`)** — any uncaught throw in a handler,
+  **especially a failed outbound HTTP call** (M-Pesa STK, SasaPay, Score) or a
+  JSON-parse error on a bad upstream response, is converted into a **clean JSON
+  error response** instead of an opaque 502 process crash. Network-level
+  failures (`fetch failed`, `ECONNREFUSED`, timeouts, …) return
+  `502 { success:false, error:"upstream_unavailable" }`; other errors return a
+  `500 { success:false, error:"server_error" }`. The `/api/v1/payments/initiate`
+  provider call and ledger write are additionally wrapped so a provider/DB
+  failure returns a structured error, never a crash.
+
 ## Deploy
 See **[AWS_DEPLOYMENT.md](./AWS_DEPLOYMENT.md)** for:
 - AWS EC2 (recommended easy path) — Nginx + free HTTPS

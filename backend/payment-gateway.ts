@@ -292,15 +292,21 @@ gateway.post('/initiate', async (c) => {
 
   const ip = c.req.header('CF-Connecting-IP') || c.req.header('X-Forwarded-For') || null
 
-  await c.env.DB.prepare(
-    `INSERT INTO central_transactions
-        (transaction_ref, idempotency_key, origin_app, marketplace_id, origin_reference, payment_method,
-         provider_request_id, phone, amount, currency, description, status, initiated_by_user, ip_address)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?, 'PENDING', ?, ?)`
-  ).bind(
-    transaction_ref, idempotencyKey, client_key, marketplaceId, origin_reference, method,
-    providerResult.checkout_request_id || null, phone, amount, 'KES', desc, initiated_by_user, ip
-  ).run()
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO central_transactions
+          (transaction_ref, idempotency_key, origin_app, marketplace_id, origin_reference, payment_method,
+           provider_request_id, phone, amount, currency, description, status, initiated_by_user, ip_address)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?, 'PENDING', ?, ?)`
+    ).bind(
+      transaction_ref, idempotencyKey, client_key, marketplaceId, origin_reference, method,
+      providerResult.checkout_request_id || null, phone, amount, 'KES', desc, initiated_by_user, ip
+    ).run()
+  } catch (e: any) {
+    // The provider prompt was already sent, but we could not persist the
+    // pending record. Return a clean, structured error instead of crashing.
+    return c.json({ success: false, error: 'ledger_write_failed', message: e?.message || 'Could not record the transaction.' }, 500)
+  }
 
   // Subscription payments originating from credit.farmsky.africa are tracked
   // in their own dedicated table so Score's billing state lives separately

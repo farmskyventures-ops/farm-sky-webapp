@@ -19,10 +19,37 @@ import { hashPassword, verifyPassword, isHashed } from './password'
 import merchantApi from './merchant-api'
 import { mintHandoffToken, verifyHandoffToken } from './cross-app'
 import { scoreConfigured, scoreKyc, scoreIprs, scoreLiveness, scoreCreditEvaluation, scoreWallets, scoreWalletDetail, scoreTransactions } from './score-client'
+import { sanitizeUrl } from './url-utils'
 import { validateImageDataUrl, validateText, validateTextFields } from './upload-validation'
 import { hmacSha256Hex } from './payments-shared'
 
 const app = new Hono<{ Bindings: Bindings; Variables: { user: SessionUser } }>()
+
+// ----------------------------------------------------------------------------
+// GLOBAL ERROR BOUNDARY
+//   Any uncaught throw in a handler — most importantly a failed OUTBOUND HTTP
+//   call (M-Pesa / SasaPay / Score) or a JSON-parse error on a bad upstream
+//   response — is converted into a clean JSON error response instead of
+//   bubbling up as an opaque 500/502 process error. This is the safety net
+//   that guarantees the platform "safely catches outbound HTTP errors and
+//   returns a clean JSON error response instead of a 502 process crash".
+// ----------------------------------------------------------------------------
+app.onError((err, c) => {
+  const message = (err as any)?.message || 'Unexpected server error'
+  // Network-level fetch failures surface as TypeError('fetch failed') on
+  // Node/undici; treat those (and explicit gateway/timeout errors) as a
+  // 502 Bad Gateway with a clean JSON body, everything else as a 500.
+  const isUpstream = /fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|network|timeout|socket hang up|getaddrinfo/i.test(message)
+  const status = isUpstream ? 502 : 500
+  try { console.error(`[onError] ${c.req.method} ${new URL(c.req.url).pathname} -> ${status}: ${message}`) } catch { /* noop */ }
+  return c.json({
+    success: false,
+    error: isUpstream ? 'upstream_unavailable' : 'server_error',
+    message: isUpstream
+      ? 'A payment/upstream service is temporarily unreachable. Please try again shortly.'
+      : message,
+  }, status)
+})
 
 // ----------------------------------------------------------------------------
 // ISSUE 7 — SECURITY HARDENING
@@ -3281,10 +3308,9 @@ app.get('/api/cross/handoff', requireAuth, async (c) => {
     : c.env.CROSS_APP_HMAC_SECRET) || ''
   // Choose the destination origin by target: 'score' -> SCORE_APP_URL,
   // anything else -> the configured sibling marketplace (Feed/Equipment).
-  const siblingUrl = (target === 'score'
-    ? String(c.env.SCORE_APP_URL || '')
-    : String(c.env.CROSS_APP_URL || '')
-  ).replace(/\/+$/, '')
+  const siblingUrl = sanitizeUrl(target === 'score'
+    ? c.env.SCORE_APP_URL
+    : c.env.CROSS_APP_URL)
   if (!secret || !siblingUrl) return c.json({ error: 'Cross-app navigation is not configured' }, 503)
   // The same short-lived HMAC-signed token is accepted by every Farmsky
   // app's /sso endpoint, so no second login is needed at the destination.
@@ -3346,12 +3372,12 @@ app.get('/api/cross/config', requireAuth, (c) => {
   return c.json({
     app_type: String(c.env.APP_TYPE || 'equipment'),
     cross_app_configured: !!(c.env.CROSS_APP_HMAC_SECRET && c.env.CROSS_APP_URL),
-    cross_app_url: c.env.CROSS_APP_URL || null,
+    cross_app_url: sanitizeUrl(c.env.CROSS_APP_URL) || null,
     // Score SSO button is shown when the Score-channel handoff secret AND the
     // Score origin are configured. Reuses the same session (no re-login).
     // Score channel uses SCORE_CROSS_APP_HMAC_SECRET (legacy fallback).
     score_configured: !!((c.env.SCORE_CROSS_APP_HMAC_SECRET || c.env.CROSS_APP_HMAC_SECRET) && c.env.SCORE_APP_URL),
-    score_url: c.env.SCORE_APP_URL || null
+    score_url: sanitizeUrl(c.env.SCORE_APP_URL) || null
   })
 })
 

@@ -7,6 +7,7 @@ import { Hono } from 'hono'
 import app from './index'
 import { openDatabase } from './db-postgres'
 import { initializeDatabase } from './db-init'
+import { sanitizeUrl } from './url-utils'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = join(__dirname, '..')
@@ -162,9 +163,12 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
       try {
         const clientKey = process.env.SCORE_CLIENT_KEY || 'score'
         const secret = process.env.SCORE_HMAC_SECRET || process.env.SCORE_CROSS_APP_HMAC_SECRET || process.env.CROSS_APP_HMAC_SECRET || ''
-        const origin = process.env.SCORE_ORIGIN_URL || process.env.SCORE_APP_URL || ''
-        const callback = process.env.SCORE_CALLBACK_URL
-          || (origin ? `${origin.replace(/\/+$/, '')}/v3/app/wallet/callback` : '')
+        // sanitizeUrl() defends against fat-fingered env values (e.g. a value
+        // pasted from a log line as "https://credit.farmsky.africa).") so the
+        // stored origin_url / callback_url are always clean, loadable links.
+        const origin = sanitizeUrl(process.env.SCORE_ORIGIN_URL || process.env.SCORE_APP_URL || '')
+        const callback = sanitizeUrl(process.env.SCORE_CALLBACK_URL || '')
+          || (origin ? `${origin}/v3/app/wallet/callback` : '')
         if (secret) {
           await raw.query(
             `INSERT INTO app_clients (client_key, display_name, origin_url, hmac_secret, callback_url, is_active)
@@ -175,6 +179,14 @@ serve({ fetch: root.fetch, port: PORT }, (info) => {
                callback_url = COALESCE(NULLIF(EXCLUDED.callback_url, ''), app_clients.callback_url),
                is_active = 1`,
             [clientKey, 'Farmsky Score', origin || 'https://credit.farmsky.africa', secret, callback]
+          )
+          // Also repair any previously-stored malformed origin_url/callback_url
+          // for this client so a link saved from a bad env value self-heals.
+          await raw.query(
+            `UPDATE app_clients
+               SET origin_url = $2, callback_url = COALESCE(NULLIF($3, ''), callback_url)
+             WHERE client_key = $1 AND origin_url IS DISTINCT FROM $2`,
+            [clientKey, origin || 'https://credit.farmsky.africa', callback]
           )
           console.log(`Score gateway client '${clientKey}' registered (origin ${origin || 'default'}).`)
         } else {

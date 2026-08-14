@@ -163,13 +163,21 @@ export async function stkPush(env: MpesaEnv, opts: { phone: string; amount: numb
 
 export async function stkQuery(env: MpesaEnv, checkoutRequestId: string): Promise<any> {
   if (!mpesaConfigured(env)) return { ResultCode: '0', ResultDesc: 'Simulated success' }
-  const token = await getToken(env)
-  const ts = timestamp()
-  const password = b64(`${env.MPESA_SHORTCODE}${env.MPESA_PASSKEY}${ts}`)
-  const res = await fetch(`${baseUrl(env)}/mpesa/stkpushquery/v1/query`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ BusinessShortCode: env.MPESA_SHORTCODE, Password: password, Timestamp: ts, CheckoutRequestID: checkoutRequestId })
-  })
-  return await res.json()
+  try {
+    const token = await getToken(env)
+    const ts = timestamp()
+    const password = b64(`${env.MPESA_SHORTCODE}${env.MPESA_PASSKEY}${ts}`)
+    const res = await fetch(`${baseUrl(env)}/mpesa/stkpushquery/v1/query`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ BusinessShortCode: env.MPESA_SHORTCODE, Password: password, Timestamp: ts, CheckoutRequestID: checkoutRequestId })
+    })
+    // Guard against a non-JSON / empty body so a bad gateway response never
+    // throws an unhandled error up the call stack.
+    return await res.json().catch(() => ({ ResultCode: '1', ResultDesc: 'Gateway returned a non-JSON response' }))
+  } catch (e: any) {
+    // Return a clean, structured result instead of throwing so callers can
+    // surface a JSON error rather than crashing the request with a 502.
+    return { ResultCode: '1', ResultDesc: e?.message || 'M-Pesa status query failed' }
+  }
 }
