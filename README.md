@@ -404,6 +404,36 @@ A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines
   `https://credit.farmsky.africa).` (note the trailing `).`) — produced a broken,
   non-loading link. On boot the Score gateway client's stored `origin_url` /
   `callback_url` are also **self-healed** to the sanitized value.
+- **Cross-app HMAC signature alignment (payment gateway ↔ Score)** — the
+  X-Farmsky-* request signing is **byte-for-byte identical** on both apps:
+  canonical string `` `${client_key}\n${timestamp}\n${nonce}\n${body}` ``
+  (`\n` delimiter), **HMAC-SHA256**, **lowercase hex** digest, **utf-8** via
+  `TextEncoder`. Verification runs against the **raw HTTP body buffer**
+  (`await c.req.text()`) **before** any `JSON.parse`, trimming or schema
+  validation — the payload is never mutated ahead of the signature check, and
+  verification is the first thing each gateway handler does (Hono has no global
+  body-parser that pre-consumes the stream).
+  - **`verifySignatureMulti()` (`backend/payments-shared.ts`)** — resolves the
+    user-facing **"Signature mismatch"** on Score deposits. The crypto and
+    canonical string were already identical, so a mismatch could only come from
+    **secret-precedence drift** between the two deployments' env vars (Score's
+    `PAYMENT_HMAC_SECRET` vs Equipment's registered `app_clients.hmac_secret`).
+    The verifier now tries **every legitimately-configured candidate secret** for
+    the tenant (`hmac_secret`, `SCORE_HMAC_SECRET`, `SCORE_CROSS_APP_HMAC_SECRET`,
+    `CROSS_APP_HMAC_SECRET`, `PAYMENT_HMAC_SECRET`) in constant time. A drift
+    (a fallback secret matched, `matchedIndex > 0`) emits a **`console.warn`** —
+    no secret is ever logged — so the misalignment is visible and fixable without
+    a spurious 401. Applied uniformly across **`/initiate`, `/status/:ref`,
+    `/process`, `/payout`** (`backend/payment-gateway.ts`) and the
+    **`/api/v1/wallet/debit`** path (`backend/wallet-gateway.ts`).
+  - **Payload-contract fallbacks on `/api/v1/payments/initiate`** — Score's v1
+    client sends `channel` / `method` + `reference` + `msisdn`, whereas the
+    gateway previously read only `payment_method` + `origin_reference` + `phone`,
+    so even a **valid** signature 400'd with *"payment_method must be
+    mpesa | sasapay | buni"*. The handler now accepts, additively,
+    `payment_method || method || (channel if it names a known method)`,
+    `phone || msisdn`, `origin_reference || reference`, and
+    `initiated_by_user || user_id` — legacy callers are unaffected.
 - **Global error boundary (`app.onError`)** — any uncaught throw in a handler,
   **especially a failed outbound HTTP call** (M-Pesa STK, SasaPay, Score) or a
   JSON-parse error on a bad upstream response, is converted into a **clean JSON

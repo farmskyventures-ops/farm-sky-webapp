@@ -30,7 +30,7 @@
 // =====================================================================
 
 import { Hono } from 'hono'
-import { verifySignature, signRequest } from './payments-shared'
+import { verifySignatureMulti, signRequest } from './payments-shared'
 import { sendSms } from './sms'
 import { sendEmail } from './email'
 import type { Bindings } from './types'
@@ -49,6 +49,20 @@ async function loadClient(c: any, client_key: string) {
     `SELECT id, client_key, display_name, origin_url, hmac_secret, callback_url, webhook_url, is_active
      FROM app_clients WHERE client_key = ?`
   ).bind(client_key).first<any>()
+}
+
+// Every legitimately-configured candidate secret for this tenant. Tolerates
+// secret-precedence drift between the Score and Equipment deployments so a
+// misaligned env var no longer produces a spurious "Signature mismatch".
+function candidateSecrets(c: any, client: any): string[] {
+  const env = c.env || {}
+  return [
+    client?.hmac_secret,
+    env.SCORE_HMAC_SECRET,
+    env.SCORE_CROSS_APP_HMAC_SECRET,
+    env.CROSS_APP_HMAC_SECRET,
+    env.PAYMENT_HMAC_SECRET,
+  ]
 }
 
 async function auditSecurity(
@@ -80,10 +94,13 @@ async function authenticate(c: any, rawForSig: string): Promise<{ ok: true; clie
     await auditSecurity(c, 'UNKNOWN_CLIENT', 'WARN', { originApp: client_key, detail: 'wallet call from unknown/inactive client' })
     return { ok: false, status: 401, error: 'Unknown or inactive client app' }
   }
-  const v = await verifySignature(client.hmac_secret, client_key, timestamp, nonce, rawForSig, signature)
+  const v = await verifySignatureMulti(candidateSecrets(c, client), client_key, timestamp, nonce, rawForSig, signature)
   if (!v.ok) {
     await auditSecurity(c, 'SIGNATURE_FAIL', 'CRITICAL', { originApp: client_key, detail: v.error || 'invalid HMAC on wallet call' })
     return { ok: false, status: 401, error: v.error || 'Invalid signature' }
+  }
+  if (typeof v.matchedIndex === 'number' && v.matchedIndex > 0) {
+    console.warn(`[wallet-gateway] signature matched a fallback secret (candidate index ${v.matchedIndex}) for client '${client_key}'; align SCORE_HMAC_SECRET precedence across deployments.`)
   }
   // Replay protection (shared nonce ledger with the payment gateway).
   if (nonce) {

@@ -35,13 +35,37 @@ import { Hono } from 'hono'
 import { stkPush, stkQuery, normalizePhone } from './mpesa'
 import { sasapayStkPush, sasapayQuery, sasapayProcessPayment, sasapayB2C, channelByCode } from './sasapay'
 import { buniStkPush, buniQuery } from './buni'
-import { verifySignature } from './payments-shared'
+import { verifySignatureMulti } from './payments-shared'
 import type { Bindings } from './types'
 import { getCookie } from 'hono/cookie'
 
 export type PaymentMethod = 'mpesa' | 'sasapay' | 'buni'
 
 const gateway = new Hono<{ Bindings: Bindings }>()
+
+// ----------------------------------------------------------------------------
+// HMAC candidate secrets for a tenant.
+//
+// The registered `client.hmac_secret` is the AUTHORITATIVE secret, but a client
+// tenant and this gateway can resolve their secret from different env vars (see
+// verifySignatureMulti). We therefore also offer the shared cross-app secrets
+// as fallbacks so a precedence mismatch between the two deployments does not
+// produce a spurious "Signature mismatch". All candidates are operator-set
+// secrets for THIS channel, so accepting any of them does not weaken security.
+// The stored secret is always tried FIRST.
+// ----------------------------------------------------------------------------
+function candidateSecrets(c: any, client: any): string[] {
+  const env = c.env || {}
+  return [
+    client?.hmac_secret,
+    // Score-specific first (matches the Score client's own resolution order),
+    // then the generic shared cross-app secret.
+    env.SCORE_HMAC_SECRET,
+    env.SCORE_CROSS_APP_HMAC_SECRET,
+    env.CROSS_APP_HMAC_SECRET,
+    env.PAYMENT_HMAC_SECRET,
+  ]
+}
 
 // ----------------------------------------------------------------------------
 // Phase 6 — Zero-Trust RBAC on every payment-administration endpoint.
@@ -203,10 +227,18 @@ gateway.post('/initiate', async (c) => {
   const marketplaceId = marketplace?.id ?? null
   await setTenantScope(c, marketplaceId, false)
 
-  const v = await verifySignature(client.hmac_secret, client_key, timestamp, nonce, rawBody, signature)
+  const v = await verifySignatureMulti(candidateSecrets(c, client), client_key, timestamp, nonce, rawBody, signature)
   if (!v.ok) {
-    await auditSecurity(c, 'SIGNATURE_FAIL', 'CRITICAL', { marketplaceId, originApp: client_key, detail: v.error || 'invalid HMAC signature on /initiate' })
+    // Non-secret diagnostic: whether signature material was present and the body
+    // length the gateway hashed — enough to tell "secret drift" from "body
+    // mismatch" WITHOUT ever logging a secret or the signature itself.
+    await auditSecurity(c, 'SIGNATURE_FAIL', 'CRITICAL', { marketplaceId, originApp: client_key, detail: `${v.error || 'invalid HMAC signature'} on /initiate (bodyLen=${rawBody.length}, hasTs=${!!timestamp}, hasNonce=${!!nonce}, hasSig=${!!signature})` })
     return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
+  }
+  if ((v.matchedIndex ?? 0) > 0) {
+    // Matched a FALLBACK secret, not the registered one → precedence drift.
+    // Log a WARN so operators can realign env without any user-facing failure.
+    try { console.warn(`[gateway] /initiate signature matched fallback secret #${v.matchedIndex} for client '${client_key}'. Align SCORE_HMAC_SECRET / CROSS_APP_HMAC_SECRET across Score and Equipment.`) } catch { /* noop */ }
   }
 
   if (nonce) {
@@ -233,14 +265,33 @@ gateway.post('/initiate', async (c) => {
   let body: any = {}
   try { body = rawBody ? JSON.parse(rawBody) : {} } catch { return c.json({ success: false, error: 'Body must be JSON' }, 400) }
 
-  const method = String(body.payment_method || '').toLowerCase() as PaymentMethod
+  // ---- Payment-method resolution (cross-tenant compatible) -----------------
+  // The canonical field is `payment_method` (mpesa | sasapay | buni). Client
+  // tenants historically send different aliases:
+  //   • Score's v1 client sends `method` (and mirrors it in `channel`).
+  //   • Some callers only send `channel`.
+  // Accept all three, but ONLY treat `channel` as the method when it names a
+  // real provider — otherwise `channel` keeps its SasaPay meaning (MOBILE_MONEY,
+  // etc.). This is additive: an explicit `payment_method` always wins.
+  const KNOWN_METHODS = ['mpesa', 'sasapay', 'buni']
+  const rawMethod = String(body.payment_method || body.method || '').toLowerCase().trim()
+  const channelAsMethod = KNOWN_METHODS.includes(String(body.channel || '').toLowerCase().trim())
+    ? String(body.channel).toLowerCase().trim()
+    : ''
+  const method = (rawMethod || channelAsMethod) as PaymentMethod
   const amount = Number(body.amount)
-  const phone = normalizePhone(String(body.phone || ''))
-  const origin_reference = body.origin_reference ? String(body.origin_reference) : null
+  // Accept `phone` OR `msisdn` (Score's v1 client sends both; older callers may
+  // send only one). normalizePhone tolerates 07.., 2547.., +2547.. forms.
+  const phone = normalizePhone(String(body.phone || body.msisdn || ''))
+  // Accept `origin_reference` OR `reference` as the tenant's own idempotent ref.
+  const origin_reference = (body.origin_reference || body.reference) ? String(body.origin_reference || body.reference) : null
   const description = body.description ? String(body.description).slice(0, 200) : `${client.display_name} payment`
-  const initiated_by_user = body.initiated_by_user ?? null
+  const initiated_by_user = body.initiated_by_user ?? body.user_id ?? null
 
-  const channel = body.channel || 'MOBILE_MONEY'
+  // SasaPay routing channel is DISTINCT from the payment method. When the caller
+  // used `channel` to carry the method name (handled above), fall back to the
+  // SasaPay default so we never pass a provider name where a channel is expected.
+  const channel = (body.channel && !channelAsMethod) ? body.channel : 'MOBILE_MONEY'
   const channelCode = body.channelCode || body.networkCode || undefined
   const accountNumber = body.accountNumber || undefined
 
@@ -361,7 +412,7 @@ gateway.get('/status/:ref', async (c) => {
   const marketplace = await loadMarketplace(c, client_key)
   await setTenantScope(c, marketplace?.id ?? null, false)
 
-  const v = await verifySignature(client.hmac_secret, client_key, timestamp, nonce, transaction_ref, signature)
+  const v = await verifySignatureMulti(candidateSecrets(c, client), client_key, timestamp, nonce, transaction_ref, signature)
   if (!v.ok) {
     await auditSecurity(c, 'SIGNATURE_FAIL', 'WARN', { marketplaceId: marketplace?.id ?? null, originApp: client_key, detail: 'invalid signature on /status poll' })
     return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
@@ -456,10 +507,13 @@ gateway.post('/process', async (c) => {
   const marketplaceId = marketplace?.id ?? null
   await setTenantScope(c, marketplaceId, false)
 
-  const v = await verifySignature(client.hmac_secret, client_key, timestamp, nonce, rawBody, signature)
+  const v = await verifySignatureMulti(candidateSecrets(c, client), client_key, timestamp, nonce, rawBody, signature)
   if (!v.ok) {
     await auditSecurity(c, 'SIGNATURE_FAIL', 'CRITICAL', { marketplaceId, originApp: client_key, detail: v.error || 'invalid HMAC signature on /process' })
     return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
+  }
+  if (typeof v.matchedIndex === 'number' && v.matchedIndex > 0) {
+    console.warn(`[payment-gateway] /process signature matched a fallback secret (candidate index ${v.matchedIndex}) for client '${client_key}'; align SCORE_HMAC_SECRET precedence across deployments.`)
   }
 
   let body: any = {}
@@ -524,10 +578,13 @@ gateway.post('/payout', async (c) => {
   const marketplaceId = marketplace?.id ?? null
   await setTenantScope(c, marketplaceId, false)
 
-  const v = await verifySignature(client.hmac_secret, client_key, timestamp, nonce, rawBody, signature)
+  const v = await verifySignatureMulti(candidateSecrets(c, client), client_key, timestamp, nonce, rawBody, signature)
   if (!v.ok) {
     await auditSecurity(c, 'SIGNATURE_FAIL', 'CRITICAL', { marketplaceId, originApp: client_key, detail: v.error || 'invalid HMAC signature on /payout' })
     return c.json({ success: false, error: v.error || 'Invalid signature' }, 401)
+  }
+  if (typeof v.matchedIndex === 'number' && v.matchedIndex > 0) {
+    console.warn(`[payment-gateway] /payout signature matched a fallback secret (candidate index ${v.matchedIndex}) for client '${client_key}'; align SCORE_HMAC_SECRET precedence across deployments.`)
   }
 
   // Replay protection (same nonce table as /initiate).
