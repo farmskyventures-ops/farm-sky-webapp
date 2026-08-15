@@ -3398,6 +3398,17 @@ app.get('/api/cross/handoff', requireAuth, async (c) => {
   // destination app (Score) grants the SAME Super-Admin access with the SAME
   // credentials — no second login and no separate Super-Admin config there.
   const isSuper = user.role === 'super_admin'
+  // Guard: Score is EMAIL-KEYED — it resolves/creates the account and (for a
+  // super-admin) the 2FA challenge from the email carried in the token. If we
+  // minted a super-admin handoff with a blank email, Score would build a
+  // challenge with no identity and the whole 2FA flow would dead-end. Fail fast
+  // with a clear error instead of handing off a broken token. (Non-super,
+  // phone-keyed handoffs to other siblings are unaffected.)
+  if (target === 'score' && !String(user.email || '').trim()) {
+    // eslint-disable-next-line no-console
+    console.error(`[cross/handoff] Score handoff blocked — session user has no email: userId=${user.id} role=${user.role}`)
+    return c.json({ error: 'Your account has no email on file, which is required to open Score. Please add an email to your Equipment profile and try again.' }, 422)
+  }
   const token = await mintHandoffToken(secret, normalizePhone(user.phone), {
     email: user.email,
     name: user.full_name,

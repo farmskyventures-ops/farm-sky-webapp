@@ -444,6 +444,26 @@ A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines
   provider call and ledger write are additionally wrapped so a provider/DB
   failure returns a structured error, never a crash.
 
+## Changelog — Cross-app handoff: require an email for the Score channel
+
+Log analysis of the Super-Admin transition (`GET /superadmin/verify?username=&
+password=…` on Score) confirmed the blank-`username`/loop bug was **Score-side**
+(its verify form did a native GET; fixed in the Score repo). Equipment's handoff
+already passes identity securely — a short-lived **HMAC-signed token** carrying
+`email`/`name`/`role`/`super_admin` via `/sso?token=…`, never raw credentials in
+the URL.
+
+One defensive guard was added here: Score is **email-keyed** (it builds the
+super-admin 2FA challenge from the token's email), so `GET /api/cross/handoff`
+now **blocks a Score-channel handoff when the session user has no email**,
+returning `422 { error }` with a clear "add an email to your profile" message
+and a server log — instead of minting a token with a blank email that would
+dead-end Score's 2FA flow. Non-super, phone-keyed handoffs to other siblings are
+unaffected.
+
+*File:* `backend/index.tsx` (`/api/cross/handoff`). Both build targets rebuilt
+clean; `node --check` OK.
+
 ## Changelog — Cross-app handoff diagnostics (Score Super-Admin transition)
 
 During a follow-up audit of the Equipment → Score Super-Admin cross-login, the
