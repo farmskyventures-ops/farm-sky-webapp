@@ -3378,7 +3378,17 @@ app.get('/api/cross/handoff', requireAuth, async (c) => {
   const siblingUrl = sanitizeUrl(target === 'score'
     ? c.env.SCORE_APP_URL
     : c.env.CROSS_APP_URL)
-  if (!secret || !siblingUrl) return c.json({ error: 'Cross-app navigation is not configured' }, 503)
+  if (!secret || !siblingUrl) {
+    // Observability: say WHICH piece of the Score-channel config is missing so a
+    // silent 503 (which downstream looks like "the Super-Admin cross-login just
+    // doesn't work") is actionable. The Score channel needs BOTH a shared HMAC
+    // secret (SCORE_CROSS_APP_HMAC_SECRET, legacy CROSS_APP_HMAC_SECRET) AND the
+    // destination origin (SCORE_APP_URL). Never log the secret value itself.
+    const missing = [!secret ? 'secret' : null, !siblingUrl ? 'destination_url' : null].filter(Boolean)
+    // eslint-disable-next-line no-console
+    console.error(`[cross/handoff] not configured for target=${target} — missing: ${missing.join(', ')} (Score channel needs SCORE_CROSS_APP_HMAC_SECRET + SCORE_APP_URL)`)
+    return c.json({ error: 'Cross-app navigation is not configured', missing }, 503)
+  }
   // The same short-lived HMAC-signed token is accepted by every Farmsky
   // app's /sso endpoint, so no second login is needed at the destination.
   // Email + name are carried so email-keyed apps (Score) can resolve/create

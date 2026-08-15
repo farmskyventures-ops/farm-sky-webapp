@@ -444,6 +444,35 @@ A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines
   provider call and ledger write are additionally wrapped so a provider/DB
   failure returns a structured error, never a crash.
 
+## Changelog — Cross-app handoff diagnostics (Score Super-Admin transition)
+
+During a follow-up audit of the Equipment → Score Super-Admin cross-login, the
+`GET /api/cross/handoff` route was found to return a bare
+`503 { error:"Cross-app navigation is not configured" }` whenever the Score
+channel's shared HMAC secret (`SCORE_CROSS_APP_HMAC_SECRET`, legacy
+`CROSS_APP_HMAC_SECRET`) **or** the destination origin (`SCORE_APP_URL`) was
+missing — a silent config gap that downstream looked like "the Super-Admin
+cross-login just doesn't work".
+
+The route now:
+- names the missing piece(s) in the JSON response (`missing: ["secret" |
+  "destination_url"]`), and
+- logs an explicit `console.error` identifying `target` and the missing config
+  (never logging the secret value itself),
+
+so an operator can immediately see whether Equipment's own env is the problem.
+This is purely additive — the `503` status and the existing `error` field are
+unchanged. No change to the handoff token contract or the `super_admin`
+assertion.
+
+The rest of the Super-Admin cross-login fixes in this round are **Score-side**
+(config-drift allow-list, `platform_admins` phone normalisation, OTP
+resilience, dashboard fallback rendering) — see the Score repo changelog. The
+`/api/auth/verify-password` endpoint Score calls remains as shipped previously.
+
+*File:* `backend/index.tsx` (`/api/cross/handoff`). Both build targets rebuilt
+clean (`dist-node/server.js`, `dist/_worker.js`); `node --check` OK.
+
 ## Changelog — QA audit: Score Super-Admin cross-login password endpoint
 
 **Fixed a cross-app integration gap that silently blocked Super-Admin sign-in.**
