@@ -444,6 +444,26 @@ A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines
   provider call and ledger write are additionally wrapped so a provider/DB
   failure returns a structured error, never a crash.
 
+## Changelog — verify-password: accept the shared cross-app secret (fixes Score 503 "Equipment authorization")
+
+Score's Super-Admin 2FA password step was failing with a 503 *"Super-Admin
+password verification is temporarily unavailable (Equipment authorization)"*.
+Cause: `/api/auth/verify-password` accepted only the `SCORE_APP_KEY →
+SCORE_API_SECRET → SCORE_HMAC_SECRET` Bearer chain, but Score authenticates with
+`EQUIPMENT_APP_KEY → SCORE_CROSS_APP_HMAC_SECRET → CROSS_APP_HMAC_SECRET`. A
+deploy that shared only the cross-app HMAC secret (which is what makes the `/sso`
+handoff work) therefore sent a Bearer this endpoint rejected with 401.
+
+Fix (additive, non-breaking):
+
+- `/api/auth/verify-password` now accepts **any** of `SCORE_APP_KEY`,
+  `SCORE_API_SECRET`, `SCORE_HMAC_SECRET`, `SCORE_CROSS_APP_HMAC_SECRET`,
+  `CROSS_APP_HMAC_SECRET` as the Bearer app-key — so the already-shared handoff
+  secret authorizes the password check too, with no new key provisioning.
+- Added diagnostics: on a 401 the endpoint logs **why** (no shared key
+  configured vs Bearer mismatch, including presented-key length and the count of
+  accepted keys) — never the secret values themselves.
+
 ## Changelog — Cross-app handoff: anti-hijack IP + User-Agent binding (opt-in)
 
 Following the SSO hardening review, `/api/cross/handoff` can now **bind a handoff

@@ -1070,15 +1070,38 @@ app.get('/api/me', requireAuth, (c) => c.json({ user: c.get('user') }))
 // fixes. Rate-limited by IP to blunt any credential-stuffing via this path.
 // ----------------------------------------------------------------------------
 app.post('/api/auth/verify-password', rateLimit('verify-password', 30, 60_000), async (c) => {
-  // Accept SCORE_APP_KEY, then fall back to the existing Score secrets so a
-  // deployment that never provisioned a dedicated app-key keeps working.
-  const expectedKey = (c.env.SCORE_APP_KEY || c.env.SCORE_API_SECRET || c.env.SCORE_HMAC_SECRET || '').trim()
+  // Accept ANY of the shared Score<->Equipment secrets as the Bearer app-key.
+  //
+  // WHY A MULTI-KEY CHAIN: Score's outbound key chain (src/lib/equipment.ts →
+  // equipmentAppKey) is EQUIPMENT_APP_KEY → SCORE_CROSS_APP_HMAC_SECRET →
+  // CROSS_APP_HMAC_SECRET. Previously this endpoint ONLY accepted the
+  // SCORE_APP_KEY → SCORE_API_SECRET → SCORE_HMAC_SECRET chain, so a deploy that
+  // shared only the cross-app HMAC secret (which is what makes the /sso handoff
+  // work) would send a Bearer this endpoint rejected with 401 — surfacing on
+  // Score as "Super-Admin password verification is temporarily unavailable
+  // (Equipment authorization)". We now also accept SCORE_CROSS_APP_HMAC_SECRET
+  // and CROSS_APP_HMAC_SECRET so the already-shared handoff secret authorizes
+  // the password check too — no new key needs provisioning on either app.
+  const acceptedKeys = [
+    c.env.SCORE_APP_KEY,
+    c.env.SCORE_API_SECRET,
+    c.env.SCORE_HMAC_SECRET,
+    c.env.SCORE_CROSS_APP_HMAC_SECRET,
+    c.env.CROSS_APP_HMAC_SECRET,
+  ].map((k) => String(k || '').trim()).filter(Boolean)
   const bearer = (c.req.header('Authorization') || '').replace(/^Bearer\s+/i, '').trim()
-  if (!expectedKey) {
-    // No shared secret configured → refuse rather than authenticate blindly.
+  if (acceptedKeys.length === 0) {
+    // No shared secret configured on Equipment → refuse rather than authenticate
+    // blindly. Log which envs are missing (never the values) so this is fixable.
+    // eslint-disable-next-line no-console
+    console.error('[verify-password] rejected: no shared app-key configured on Equipment (set SCORE_APP_KEY or share SCORE_CROSS_APP_HMAC_SECRET/CROSS_APP_HMAC_SECRET with Score)')
     return c.json({ valid: false, error: 'cross_app_not_configured' }, 401)
   }
-  if (!bearer || bearer !== expectedKey) {
+  // Constant-time-ish membership check (compare against every accepted key).
+  const bearerOk = bearer.length > 0 && acceptedKeys.some((k) => k.length === bearer.length && k === bearer)
+  if (!bearerOk) {
+    // eslint-disable-next-line no-console
+    console.error(`[verify-password] rejected: Bearer app-key mismatch (presented ${bearer ? 'a key of len=' + bearer.length : 'no key'}; Equipment accepts ${acceptedKeys.length} configured key(s)). Ensure Score's EQUIPMENT_APP_KEY / SCORE_CROSS_APP_HMAC_SECRET matches one of Equipment's SCORE_APP_KEY / SCORE_CROSS_APP_HMAC_SECRET / CROSS_APP_HMAC_SECRET.`)
     return c.json({ valid: false, error: 'unauthorized' }, 401)
   }
 
