@@ -1051,6 +1051,73 @@ app.post('/api/logout', async (c) => {
 app.get('/api/me', requireAuth, (c) => c.json({ user: c.get('user') }))
 
 // ----------------------------------------------------------------------------
+// SCORE SUPER-ADMIN CROSS-LOGIN — server-to-server password verification.
+//
+// The Farmsky Score Super-Admin Console validates the Equipment platform
+// password as factor #3 of its 2FA gate. Score calls this endpoint from its
+// server (src/lib/equipment.ts → verifyEquipmentPassword):
+//
+//   POST /api/auth/verify-password
+//     Authorization: Bearer {SCORE_APP_KEY}
+//     body: { email, password, source }
+//   → 200 { valid: true,  user: { email, phone, name } }   (correct password)
+//   → 200 { valid: false }                                  (wrong password)
+//   → 401 (bad app-key) / 400 (bad input)
+//
+// This is a machine-to-machine endpoint: it is gated ONLY by the shared app-key
+// Bearer, never a user session. Without it, the Super-Admin password step
+// silently 404s on Score, blocking Super-Admin access — the regression this
+// fixes. Rate-limited by IP to blunt any credential-stuffing via this path.
+// ----------------------------------------------------------------------------
+app.post('/api/auth/verify-password', rateLimit('verify-password', 30, 60_000), async (c) => {
+  // Accept SCORE_APP_KEY, then fall back to the existing Score secrets so a
+  // deployment that never provisioned a dedicated app-key keeps working.
+  const expectedKey = (c.env.SCORE_APP_KEY || c.env.SCORE_API_SECRET || c.env.SCORE_HMAC_SECRET || '').trim()
+  const bearer = (c.req.header('Authorization') || '').replace(/^Bearer\s+/i, '').trim()
+  if (!expectedKey) {
+    // No shared secret configured → refuse rather than authenticate blindly.
+    return c.json({ valid: false, error: 'cross_app_not_configured' }, 401)
+  }
+  if (!bearer || bearer !== expectedKey) {
+    return c.json({ valid: false, error: 'unauthorized' }, 401)
+  }
+
+  const body = await c.req.json().catch(() => ({}))
+  const email = String(body?.email || '').trim().toLowerCase()
+  const password = String(body?.password || '')
+  if (!email || !password) {
+    return c.json({ valid: false, error: 'email_and_password_required' }, 400)
+  }
+
+  // Look up the Equipment user by email (case-insensitive).
+  const user = await c.env.DB.prepare(
+    `SELECT id, full_name, phone, email, password, status FROM users WHERE LOWER(email) = ? LIMIT 1`
+  ).bind(email).first<any>().catch(() => null)
+
+  // Uniform "valid:false" (200) for both "no such user" and "wrong password"
+  // so this endpoint never reveals which emails exist.
+  if (!user) return c.json({ valid: false })
+  const check = await verifyPassword(String(password), user.password)
+  if (!check.ok) return c.json({ valid: false })
+  if (user.status && String(user.status) !== 'active') {
+    return c.json({ valid: false, error: 'account_inactive' })
+  }
+  // Opportunistically upgrade a legacy plaintext password to the hashed form.
+  if (check.legacy) {
+    try { await c.env.DB.prepare(`UPDATE users SET password=? WHERE id=?`).bind(await hashPassword(String(password)), user.id).run() } catch (_) {}
+  }
+
+  return c.json({
+    valid: true,
+    user: {
+      email: user.email || email,
+      phone: user.phone || null,
+      name: user.full_name || null,
+    },
+  })
+})
+
+// ----------------------------------------------------------------------------
 // SELF-SERVICE PROFILE (Instruction 3)
 //   * Farmers (role=customer): may update their own profile data EXCEPT
 //     national_id and phone/mobile. Also avatar + password.

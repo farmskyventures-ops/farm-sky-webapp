@@ -26,6 +26,11 @@ export type Bindings = MpesaEnv & SmsEnv & EmailEnv & SasaPayEnv & BuniEnv & {
   SCORE_API_URL?: string            // score API base (e.g. https://credit.farmsky.africa)
   SCORE_API_CLIENT?: string         // Score API client id issued to Equipment
   SCORE_API_SECRET?: string         // Score API secret (paired with the client id)
+  // Bearer app-key Score presents to POST /api/auth/verify-password (the
+  // Super-Admin cross-login password factor). Falls back to SCORE_API_SECRET /
+  // SCORE_HMAC_SECRET so an existing deployment keeps working without a new
+  // secret (non-breaking). When NONE are set the endpoint refuses (no open door).
+  SCORE_APP_KEY?: string
   // Phase 3 — Score payment-gateway tenant registration (all env-driven; the
   // credit.farmsky.africa domain must NOT be hardcoded). At boot these upsert the
   // 'score' row in app_clients so Equipment acts as Score's central M-Pesa

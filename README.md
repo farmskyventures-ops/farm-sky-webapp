@@ -444,6 +444,41 @@ A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines
   provider call and ledger write are additionally wrapped so a provider/DB
   failure returns a structured error, never a crash.
 
+## Changelog — QA audit: Score Super-Admin cross-login password endpoint
+
+**Fixed a cross-app integration gap that silently blocked Super-Admin sign-in.**
+
+The Farmsky Score Super-Admin Console validates the Equipment platform password
+as factor #3 of its 2FA gate by calling Equipment server-to-server. That
+endpoint (`POST /api/auth/verify-password`) did not exist here, so in production
+(where Score has an Equipment app-key) the password step received a `404` and
+Super-Admin access could never be completed. Added the endpoint:
+
+- **`POST /api/auth/verify-password`** — machine-to-machine, gated **only** by a
+  shared app-key `Authorization: Bearer` (never a user session), rate-limited by
+  IP (30/min).
+  - Auth key precedence: `SCORE_APP_KEY` -> `SCORE_API_SECRET` -> `SCORE_HMAC_SECRET`.
+    Falling back to the already-paired Score secrets means **no new secret is
+    required** for existing deployments (non-breaking). If **none** are set the
+    endpoint refuses with `401 cross_app_not_configured` — it never authenticates
+    blindly.
+  - Body `{ email, password, source }`. Looks the user up by email
+    (case-insensitive). Returns:
+    - `200 { valid: true, user: { email, phone, name } }` on a correct password,
+    - `200 { valid: false }` for both "no such user" and "wrong password" (never
+      reveals which emails exist),
+    - `200 { valid: false, error: "account_inactive" }` for suspended accounts,
+    - `401` for a bad/absent app-key, `400` for missing email/password.
+  - Verifies via the existing PBKDF2 `verifyPassword`; opportunistically
+    re-hashes a legacy plaintext password on a correct match (same discipline as
+    `/api/login`).
+- **`types.ts`**: added the optional `SCORE_APP_KEY` binding (documented fallback
+  chain).
+
+This pairs with the Score-side fix (`superadmin-verify.js`) that stops the
+verify page's native form submit from stripping the `?ch=` challenge and looping
+back to an empty password prompt.
+
 ## Deploy
 See **[AWS_DEPLOYMENT.md](./AWS_DEPLOYMENT.md)** for:
 - AWS EC2 (recommended easy path) — Nginx + free HTTPS
