@@ -17,7 +17,7 @@ import { sendSms, smsConfigured, generateOtp } from './sms'
 import { sendEmail, emailConfigured } from './email'
 import { hashPassword, verifyPassword, isHashed } from './password'
 import merchantApi from './merchant-api'
-import { mintHandoffToken, verifyHandoffToken } from './cross-app'
+import { mintHandoffToken, verifyHandoffToken, handoffClientFingerprint } from './cross-app'
 import { scoreConfigured, scoreKyc, scoreIprs, scoreLiveness, scoreCreditEvaluation, scoreWallets, scoreWalletDetail, scoreTransactions } from './score-client'
 import { sanitizeUrl } from './url-utils'
 import { validateImageDataUrl, validateText, validateTextFields } from './upload-validation'
@@ -3409,11 +3409,30 @@ app.get('/api/cross/handoff', requireAuth, async (c) => {
     console.error(`[cross/handoff] Score handoff blocked — session user has no email: userId=${user.id} role=${user.role}`)
     return c.json({ error: 'Your account has no email on file, which is required to open Score. Please add an email to your Equipment profile and try again.' }, 422)
   }
+  // Anti-hijack: bind the token to THIS browser (IP + User-Agent) so an
+  // intercepted handoff URL cannot be replayed from another client.
+  //
+  // ⚠️ Backward-compat gate: a fingerprint-bound token is ONLY accepted by a
+  // verifier that forwards the matching fingerprint. Until the destination app
+  // (Score) is confirmed to forward it, binding is OPT-IN via the
+  // CROSS_APP_BIND_FINGERPRINT env flag ('1'/'true'). Default OFF keeps the
+  // existing, working cross-login untouched. Flip it on once Score's /sso is
+  // deployed with fingerprint forwarding. Un-fingerprinted tokens keep the
+  // legacy 2-min TTL; nothing breaks when the flag is off.
+  const bindFlag = String(c.env.CROSS_APP_BIND_FINGERPRINT || '').toLowerCase()
+  const bindFingerprint = bindFlag === '1' || bindFlag === 'true' || bindFlag === 'yes'
+  let fingerprint: string | undefined
+  if (bindFingerprint) {
+    const handoffIp = c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for')?.split(',')[0].trim() || c.req.header('x-real-ip') || ''
+    const handoffUa = c.req.header('user-agent') || ''
+    fingerprint = handoffClientFingerprint(handoffIp, handoffUa)
+  }
   const token = await mintHandoffToken(secret, normalizePhone(user.phone), {
     email: user.email,
     name: user.full_name,
     role: user.role,
     super_admin: isSuper,
+    fingerprint,
   })
   // Optional deep-link: `dest` tells the destination app which view to open
   // after SSO (e.g. dest=api-access lands the lender on the Score console's

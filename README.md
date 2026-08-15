@@ -444,6 +444,29 @@ A healthy boot logs `PostgreSQL ready: …` with no `Migration … error` lines
   provider call and ledger write are additionally wrapped so a provider/DB
   failure returns a structured error, never a crash.
 
+## Changelog — Cross-app handoff: anti-hijack IP + User-Agent binding (opt-in)
+
+Following the SSO hardening review, `/api/cross/handoff` can now **bind a handoff
+token to the requesting browser** (client IP + User-Agent) so an intercepted
+handoff URL cannot be replayed from another machine. Details:
+
+- `mintHandoffToken` accepts an optional `fingerprint` (HMAC'd into the token as
+  `fp`, so the raw IP/UA is never exposed). `verifyHandoffToken` accepts an
+  `expectedFingerprint` and, **only when the token carries `fp`**, requires it to
+  match — a stolen token presented by a different client is rejected.
+- Fingerprinted tokens use a tightened **60 s** TTL (down from 2 min); legacy
+  un-fingerprinted tokens keep the 2-min window, so nothing in flight breaks.
+- Binding is **OFF by default** and enabled with the new env flag
+  `CROSS_APP_BIND_FINGERPRINT=1`. It should only be turned on once the
+  destination app (Score) is deployed with matching fingerprint verification in
+  its `/sso` (already shipped). This keeps the change 100% backward-compatible:
+  with the flag off, tokens are minted exactly as before.
+- The prior **email guard** (422 when a Score-channel session user has no email)
+  and the config-`missing[]` diagnostics remain unchanged.
+
+Session cookies issued after login already set `HttpOnly; Secure (on HTTPS);
+SameSite=Lax` — cross-subdomain-safe and unchanged by this round.
+
 ## Changelog — Cross-app handoff: require an email for the Score channel
 
 Log analysis of the Super-Admin transition (`GET /superadmin/verify?username=&

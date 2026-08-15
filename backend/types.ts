@@ -21,6 +21,11 @@ export type Bindings = MpesaEnv & SmsEnv & EmailEnv & SasaPayEnv & BuniEnv & {
   // Feed/Inputs/Marketplace. Score-channel code reads this first and falls back
   // to CROSS_APP_HMAC_SECRET when unset (non-breaking).
   SCORE_CROSS_APP_HMAC_SECRET?: string
+  // Anti-hijack: when '1'/'true', cross-app handoff tokens are bound to the
+  // requesting client's IP + User-Agent (a stolen handoff URL can't be replayed
+  // elsewhere). OFF by default so it's only enabled once the destination app's
+  // /sso verifier forwards the matching fingerprint. See backend/cross-app.ts.
+  CROSS_APP_BIND_FINGERPRINT?: string
   // credit.farmsky.africa — SSO handoff target + API consumption
   SCORE_APP_URL?: string            // credit.farmsky.africa origin (SSO "Open Score" button)
   SCORE_API_URL?: string            // score API base (e.g. https://credit.farmsky.africa)
