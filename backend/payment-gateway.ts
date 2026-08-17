@@ -96,6 +96,59 @@ function genRef(): string {
   return 'FSK-' + crypto.randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()
 }
 
+// ----------------------------------------------------------------------------
+// Decide whether a NON-ZERO provider status-query code is a GENUINELY TERMINAL
+// failure (the buyer cancelled, entered the wrong PIN, had insufficient funds,
+// or the STK request truly expired) versus a TRANSIENT "still processing"
+// reply returned while the buyer is still on the handset entering their PIN.
+//
+// Only terminal codes may flip a PENDING transaction to FAILED. Transient codes
+// MUST leave the transaction PENDING so the asynchronous provider callback (the
+// authoritative settlement channel) — or a later poll — records the true
+// outcome. This is the core of the "false failure" fix: a synchronous status
+// query is advisory, the callback is authoritative.
+//
+// M-Pesa Daraja stkpushquery result codes (the important ones):
+//   0     -> success (handled elsewhere)
+//   1032  -> Request cancelled by user (TERMINAL failure)
+//   1037  -> DS timeout / user cannot be reached (TERMINAL failure)
+//   1025 / 9999 / 1001 -> system/internal or "unable to lock subscriber" — these
+//           frequently appear WHILE the prompt is still live, so treat as transient
+//   2001  -> wrong PIN (TERMINAL failure)
+//   17    -> M-Pesa internal system error (transient)
+//   1     -> "The transaction is being processed" / generic pending (TRANSIENT)
+//   500.001.1001 -> "The transaction is being processed" (TRANSIENT)
+// Anything unmapped is treated conservatively as TRANSIENT (stay PENDING) so a
+// customer whose money may already be moving is never shown a false failure.
+// ----------------------------------------------------------------------------
+function isTerminalFailureCode(method: string, code: unknown): boolean {
+  if (code === undefined || code === null) return false
+  const s = String(code).trim()
+  if (s === '' || s === '0') return false
+
+  if (method === 'mpesa') {
+    // Explicit, well-known TERMINAL M-Pesa failure codes only.
+    const MPESA_TERMINAL = new Set(['1032', '1037', '2001', '1019', '1101'])
+    // Explicit TRANSIENT codes that must NOT fail the transaction.
+    const MPESA_TRANSIENT = new Set(['1', '17', '1025', '1001', '9999', '500.001.1001', '500.001.1019'])
+    if (MPESA_TERMINAL.has(s)) return true
+    if (MPESA_TRANSIENT.has(s)) return false
+    // Unknown non-zero code: be conservative and treat as transient (stay PENDING).
+    return false
+  }
+
+  if (method === 'buni') {
+    // Buni: '00' is success (handled elsewhere). Only a small set of explicit
+    // decline codes are terminal; unknown codes stay pending.
+    const BUNI_TERMINAL = new Set(['1032', '2001'])
+    return BUNI_TERMINAL.has(s)
+  }
+
+  // SasaPay settlement is asynchronous (callback-driven); its status query is
+  // never treated as a terminal failure here — the callback is authoritative.
+  return false
+}
+
 async function loadClient(c: any, client_key: string) {
   return await c.env.DB.prepare(
     `SELECT id, client_key, display_name, origin_url, hmac_secret, callback_url, is_active
@@ -451,7 +504,19 @@ gateway.get('/status/:ref', async (c) => {
               WHERE transaction_ref=?`
           ).bind(String(code ?? '0'), String(pr?.ResultDesc || pr?.ResultDescription || pr?.message || 'Success'), receipt, transaction_ref).run()
           tx.status = 'SUCCESS'
-        } else if (code !== undefined && code !== null && code !== 0 && code !== '0') {
+        } else if (isTerminalFailureCode(tx.payment_method, code)) {
+          // ------------------------------------------------------------------
+          // RACE-CONDITION FIX: Only mark FAILED when the provider has returned
+          // a GENUINELY TERMINAL failure code. While the buyer is still on their
+          // handset entering the PIN, Daraja's stkpushquery replies with a
+          // transient "still being processed" code (e.g. ResultCode '1',
+          // '500.001.1001', or an empty/errored body from stkQuery's own guard).
+          // Previously ANY non-zero code was written as FAILED on the FIRST poll,
+          // so Score received 'failed' → returned HTTP 402 → the UI showed
+          // "payment failed or cancelled" even though the money was later debited.
+          // We now leave the transaction PENDING for transient codes; the async
+          // provider callback (or a later poll) settles the true outcome.
+          // ------------------------------------------------------------------
           await c.env.DB.prepare(
             `UPDATE central_transactions
                 SET status='FAILED', result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
@@ -459,6 +524,8 @@ gateway.get('/status/:ref', async (c) => {
           ).bind(String(code), String(pr?.ResultDesc || pr?.message || 'Failed'), transaction_ref).run()
           tx.status = 'FAILED'
         }
+        // Any other non-zero code (transient / "still processing") => keep
+        // status PENDING and simply return it; the caller keeps polling.
       }
     } catch (_) {}
   }
@@ -692,6 +759,24 @@ async function settleCallback(c: any, method: PaymentMethod, providerReqId: stri
     return
   }
   if (tx.status !== 'PENDING') {
+    // Normally settlement is idempotent: a second callback for an already-settled
+    // transaction is just logged. EXCEPTION: a genuine SUCCESS callback (real
+    // money moved, provider receipt present) is allowed to OVERRIDE a prior
+    // FAILED that a transient status poll may have written. This guarantees a
+    // customer who was debited is never left stuck in FAILED.
+    if (success && tx.status === 'FAILED') {
+      await c.env.DB.prepare(
+        `UPDATE central_transactions
+            SET status='SUCCESS', provider_receipt=COALESCE(?, provider_receipt),
+                result_code=?, result_desc=?, updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP
+          WHERE transaction_ref=?`
+      ).bind(receipt, resultCode, resultDesc, tx.transaction_ref).run()
+      await logCallback(c, tx.transaction_ref, method, providerReqId, rawBody, true, tx.marketplace_id ?? null)
+      const client = await loadClient(c, tx.origin_app)
+      const refreshed = await c.env.DB.prepare(`SELECT * FROM central_transactions WHERE transaction_ref=?`).bind(tx.transaction_ref).first<any>()
+      if (client && refreshed) await notifyOriginApp(c, client, refreshed)
+      return
+    }
     await logCallback(c, tx.transaction_ref, method, providerReqId, rawBody, true, tx.marketplace_id ?? null)
     return
   }
