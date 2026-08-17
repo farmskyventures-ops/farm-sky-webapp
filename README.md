@@ -579,21 +579,198 @@ See **[AWS_DEPLOYMENT.md](./AWS_DEPLOYMENT.md)** for:
 - Full M-Pesa Daraja credential setup (where to copy each key)
 
 ## Tech
-- **Hono** (TypeScript) — runs on Cloudflare Workers *and* Node (`@hono/node-server`)
-- **SQLite** via `better-sqlite3` on Node / **Cloudflare D1** on the edge
-  (same SQL, via a small D1-compatible adapter in `src/db-sqlite.ts`)
-- Vanilla JS SPA (Tailwind CDN, FontAwesome, Axios)
+- **Hono** (TypeScript) — runs on Node (`@hono/node-server`, primary production runtime on Render/AWS)
+  and can also build for Cloudflare Workers/Pages via `@hono/vite-build`.
+- **PostgreSQL** via the `pg` driver (`backend/db-postgres.ts` opens a lazy connection pool;
+  a small D1-compatible adapter shim lets the same app code run against either runtime).
+- **Vanilla JS SPA** served from `frontend/static/app.js` (Tailwind compiled locally via
+  `tailwindcss`, FontAwesome, Axios).
+- **Payments**: M-Pesa Daraja, SasaPay, Co-op **Buni** — all with live-or-simulation fallback.
+- **Auth**: PBKDF2 password hashing (`backend/password.ts`), SMS/email OTP, session cookies,
+  cross-app SSO handoff (HMAC-signed) with the Farmsky **Score** platform.
 
 ## Project layout
 ```
-src/index.tsx     # Hono app (all API routes + HTML shell) — shared by both builds
-src/mpesa.ts      # M-Pesa Daraja STK Push integration
-src/server.ts     # Node entry point (AWS)
-src/db-sqlite.ts  # D1-compatible SQLite adapter for Node
-src/db-init.ts    # auto-applies migrations + seed on first boot
-public/static/    # app.js, style.css, farmsky-logo.png, favicon.png
-migrations/       # SQL schema
-seed.sql          # demo data
-Dockerfile        # for App Runner / ECS
-.env.example      # env + M-Pesa credential instructions
+backend/index.tsx          # Hono app — ALL 143+ API routes + HTML shell (shared by both builds)
+backend/server.ts          # Node entry point (Render/AWS): binds port, then migrates in background
+backend/db-postgres.ts     # PostgreSQL pool + D1-compatible adapter
+backend/db-init.ts         # auto-applies migrations/*.sql (sorted) + seed.sql on boot
+backend/payment-gateway.ts # Central Payment Gateway sub-router (/api/v1/payments/*)
+backend/wallet-gateway.ts  # Master Wallet metered-billing sub-router (/api/v1/wallet/*)
+backend/merchant-api.ts    # Merchant/checkout API sub-router (/api/v1/merchant/*, /api/v1/checkout/*)
+backend/mpesa.ts           # M-Pesa Daraja STK Push
+backend/sasapay.ts         # SasaPay STK / B2C / IPN
+backend/buni.ts            # Co-op Buni STK Push
+backend/payments-shared.ts # shared payment helpers
+backend/score-client.ts    # Farmsky Score API client (verification + credit scoring)
+backend/cross-app.ts       # cross-app SSO handoff (HMAC) with Score
+backend/password.ts        # PBKDF2 hashing + verify
+backend/sms.ts / email.ts  # OTP + notification providers (env-driven, demo fallback)
+backend/upload-validation.ts # file-upload validation
+backend/middleware/auth.ts # auth middleware
+backend/types.ts           # shared TS types
+backend/sql/*.sql          # Postgres RLS + security-audit setup scripts
+frontend/static/           # app.js, style.css, tailwind.css, logos, favicon
+migrations/                # 0000–0031 SQL schema (auto-applied, idempotent)
+seed.sql                   # demo data
+Dockerfile                 # for App Runner / ECS / Render
+.env.example               # full env surface + M-Pesa/SasaPay/Buni credential instructions
 ```
+
+---
+
+# Complete Project Reference
+
+> Consolidated, whole-project reference generated from a full source review. This
+> section documents every module, the full API surface, the data model, roles &
+> permissions, and the environment/config surface — kept in one place so the README
+> reflects the entire codebase, not just the latest changelog.
+
+## Architecture overview
+Farmsky (Equipment) is a **Sharia-compliant Murabaha agri-finance marketplace** plus a
+**central payment gateway & master wallet** that hosts and settles payments for every
+Farmsky tenant (Equipment, Score/Credit, Feeds, …). One Hono app (`backend/index.tsx`)
+serves the SPA HTML shell, all first-party APIs, and mounts three sub-routers:
+
+| Sub-router | Mount | Responsibility |
+|---|---|---|
+| `payment-gateway.ts` | `/api/v1/payments` | Multi-tenant checkout, callbacks (M-Pesa/SasaPay/Buni), payouts, admin recovery & revenue matrix |
+| `wallet-gateway.ts`  | `/api/v1/wallet`   | Metered (pay-as-you-go) wallet: credit/debit/balance + low-balance thresholds |
+| `merchant-api.ts`    | `/api`             | Merchant inventory + hosted checkout sessions (`/v1/merchant/*`, `/v1/checkout/*`) |
+
+The Node entry (`backend/server.ts`) binds the HTTP port **before** running migrations so
+inbound webhooks never hit a cold-start refusal; migrations/seed run in the background and
+a `dbReady` flag gates DB-dependent work. Liveness endpoints (`/health`, `/healthz`,
+`/api/ping`) answer instantly. A 30-min interval self-triggers 6-hourly backups + email.
+
+## Roles & permissions
+- **Roles (5):** Super Admin, Admin, Agent, Customer/Farmer, Customer Support.
+- **RBAC:** granular permission catalog (`permission_catalog`) + role templates
+  (`role_templates`) applied per user; ownership/tenant isolation enforced by Postgres
+  **Row-Level Security** (`backend/sql/03_ownership_rls_setup.sql`,
+  `04_app_scope_rls_setup.sql`). See **[RBAC-OWNERSHIP-WALLET.md](./RBAC-OWNERSHIP-WALLET.md)**.
+
+## Full API surface
+
+### Auth, session & onboarding
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/login` · `/api/login/verify-otp` | Password login + optional OTP second factor |
+| POST | `/api/logout` | End session |
+| GET  | `/api/auth/status` · `/api/me` · `/api/me/profile` | Current session / profile |
+| POST | `/api/auth/verify-password` | Cross-app password verification (Score Super-Admin SSO) |
+| POST | `/api/signup/request-otp` · `/api/signup/verify` | Customer self sign-up (SMS OTP) |
+| POST | `/api/reset-password/request-otp` · `/api/reset-password/verify` | Self-service reset |
+| POST | `/api/onboard/request-otp` · `/api/onboard/request-reset` | Agent-led onboarding |
+| PUT  | `/api/me/password` · `/api/me/avatar` · `/api/me/profile` | Self-service profile |
+
+### Users, agents, customers, permissions
+| Method | Path |
+|---|---|
+| GET/POST/PUT/DELETE | `/api/users`, `/api/users/:id`, `/api/users/:id/status`, `/api/users/:id/reset-password` |
+| GET/POST/PUT | `/api/agents`, `/api/agents/:id` |
+| GET/POST/PUT/DELETE | `/api/customers`, `/api/customers/:id`, `/api/customers/:id/status`, `/api/customers/:id/verify` |
+| GET/POST/DELETE | `/api/permissions`, `/api/permissions/:key`, `/api/role-templates`, `/api/role-templates/:key` |
+| GET/POST/PUT | `/api/change-requests`, `/api/profile-amendments`, `/api/profile-amendments/:id/decision`, `/api/profile-amendments/mine` |
+
+### Products, inventory & financing (Murabaha)
+| Method | Path |
+|---|---|
+| GET/POST/PUT/DELETE | `/api/products`, `/api/products/:id` |
+| PUT | `/api/products/:id/finance`, `/api/products/:id/stock` |
+| GET | `/api/products/finance-audit`, `/api/products/finance-queue` |
+| POST | `/api/murabaha/quote`, `/api/murabaha/apply`, `/api/murabaha/apply-bundle` |
+| GET | `/api/murabaha`, `/api/murabaha/:id`, `/api/murabaha/reminders/due` |
+| POST | `/api/murabaha/:id/decision` · `/dispatch` · `/deliver` · `/cancel` |
+| PUT | `/api/murabaha/:id` |
+| GET | `/api/repayments` |
+
+### Payments (first-party) & gateways
+| Method | Path | Gateway |
+|---|---|---|
+| POST | `/api/mpesa/stkpush` · `/confirm` · `/callback`, GET `/api/mpesa/status` | M-Pesa Daraja |
+| POST | `/api/sasapay/stkpush` · `/confirm` · `/process` · `/validate-account` · `/callback` · `/b2c-callback` · `/ipn`, GET `/api/sasapay/{status,balance,channels,callback,ipn,callback-health}` | SasaPay |
+| POST | `/api/buni/stkpush` · `/confirm` · `/callback`, GET `/api/buni/status` | Co-op Buni |
+| GET/POST | `/api/admin/payments/pending`, `/api/admin/payments/recover` | Admin reconciliation |
+
+### Central Payment Gateway — `/api/v1/payments/*`
+`POST /initiate` · `/process` · `/payout` · callbacks `/callbacks/{mpesa,sasapay,buni}` ·
+`GET /status/:ref` · admin `/admin/{summary,revenue-matrix,suspicious-activity}` ·
+`POST /admin/{recover-sasapay,recover-status}`. See **[PAYMENT-GATEWAY-INTEGRATION.md](./PAYMENT-GATEWAY-INTEGRATION.md)**.
+
+### Master Wallet (metered billing) — `/api/v1/wallet/*`
+`GET /balance` · `/thresholds` · `POST /credit` · `/debit` (atomic, idempotent, HTTP 402
+`INSUFFICIENT_WALLET_BALANCE` on shortfall) · `PUT /thresholds` (low-balance alerts).
+First-party wallet ops also at `/api/wallet/*` (`transfer`, `withdraw`, `direct-pay`,
+`payouts`, `analytics`, `withdrawals`, `lookup-recipient`) and `/api/wallets`, `/api/score-wallets`.
+
+### Merchant / hosted checkout — `/api/v1/*`
+`GET/POST/PUT/DELETE /v1/merchant/inventory[/:item_id]` · `POST /v1/checkout/equipment` ·
+`/v1/checkout/feeds` · `GET /v1/checkout/session/:ref`. Hosted checkout page at
+`GET /checkout/:ref`; KYC gate `POST /api/checkout/kyc-check`.
+
+### Cross-app SSO & Score integration
+`GET /sso`, `/api/cross/config`, `/api/cross/handoff`, `POST /api/cross/use-apis` (lender
+"Use APIs" hand-off). Score ledger mirror `POST /api/score-ledger/mirror`; Score wallet
+visibility `GET /api/score-wallets[/:orgId]`. See **[SCORE-INTEGRATION.md](./SCORE-INTEGRATION.md)**.
+
+### Multi-tenant admin, data & ops
+`GET/POST /api/v1/admin/tenants`, `POST /api/v1/admin/tenants/:client_key/rotate-secret`,
+`PUT .../status` · `GET /api/v1/payments-admin/summary` · imports
+`GET/POST /api/imports[/:id]`, `/api/imports/:id/dispatch`, `PUT /api/imports/rows/:rowId` ·
+exports `GET /api/export/datasets`, `POST /api/export/{data,download,email}` · backups
+`GET /api/backups`, `POST /api/backups`, `/api/backups/run-auto`, `GET/POST /api/backups/:id/download` ·
+settings `PUT /api/settings/{markup,financing-markup,processing-fee,withdrawal-charge,support-contact}`,
+`GET /api/settings/{financing,withdrawal}`, `POST /api/settings/quick-product` · plus
+`GET /api/{dashboard,ledger,wallet,agents,payout-accounts,earning-rules,integrations/transunion/status,security/rls-check,documents/:type/:id}`.
+
+## Data model (PostgreSQL — ~48 tables)
+Applied automatically & idempotently from `migrations/0000`→`0031` (sorted) on boot.
+
+- **Identity & RBAC:** `users`, `sessions`, `agents`, `customers`, `permission_catalog`,
+  `role_templates`, `otp_codes`, `change_requests`, `profile_amendments`, `id_verifications`,
+  `transunion_checks`, `statements`.
+- **Marketplace & financing:** `products`, `suppliers`, `stock_movements`, `invoices`,
+  `murabaha_contracts`, `repayments`, `approvals`, `earning_rules`.
+- **Payments & wallets:** `payment_intents`, `payment_audit_log`, `payment_nonces`,
+  `central_transactions`, `central_callbacks`, `transactions`, `wallets`, `wallet_ledger`,
+  `wallet_withdrawals`, `payout_accounts`, `payout_batches`.
+- **Multi-tenant gateway:** `app_clients`, `app_settings`, `marketplaces`, `merchant_keys`,
+  `merchant_checkouts`, `tenant_wallets`, `tenant_wallet_ledger`, `tenant_alert_settings`,
+  `tenant_alert_state`.
+- **Score platform:** `score_subscriptions`, `score_verifications`, `score_iprs_checks`,
+  `score_credit_evaluations`, `score_wallet_ledger`.
+- **Ops & audit:** `audit_logs`, `tickets`, `system_backups`, `import_batches`, `import_rows`.
+- **RLS/security scripts:** `backend/sql/01`–`04` set up payment RLS, security audits,
+  ownership RLS and app-scope RLS.
+
+## Environment & configuration
+Full surface in **[.env.example](./.env.example)**. Groups:
+- **Core:** `DATABASE_URL`, `PGSSLMODE`, `PORT`, `APP_TYPE`, `PUBLIC_BASE_URL`.
+- **M-Pesa Daraja:** `MPESA_CONSUMER_KEY/SECRET`, `MPESA_SHORTCODE`, `MPESA_PASSKEY`, `MPESA_ENV`, `MPESA_CALLBACK_URL`.
+- **SasaPay:** `SASAPAY_CLIENT_ID/SECRET` (or `_CONSUMER_*`), `SASAPAY_MERCHANT_CODE`, `SASAPAY_ENV`, `SASAPAY_CALLBACK_URL`, `SASAPAY_B2C_CALLBACK_URL`.
+- **Buni:** `BUNI_CLIENT_ID/SECRET`, `BUNI_API_KEY`, `BUNI_TILL_NUMBER`, `BUNI_ENV`, `BUNI_CALLBACK_URL`.
+- **SMS / Email:** `SMS_PROVIDER`, `SMS_API_URL/TOKEN`, `SMS_SENDER_ID`, `SMS_BODY_TEMPLATE`, `SMS_PHONE_FIELD`, `SMS_MESSAGE_FIELD`; `EMAIL_PROVIDER`, `EMAIL_API_URL/TOKEN`, `EMAIL_FROM`.
+- **Score / cross-app:** `SCORE_APP_URL`, `SCORE_API_URL/CLIENT/SECRET`, `SCORE_CLIENT_KEY`, `SCORE_HMAC_SECRET`, `SCORE_ORIGIN_URL`, `SCORE_CALLBACK_URL`, `SCORE_LEDGER_HMAC_SECRET`, `CROSS_APP_URL`, `CROSS_APP_HMAC_SECRET`, `SCORE_CROSS_APP_HMAC_SECRET`.
+- **Auth hashing:** `AUTH_HASH_ITERATIONS`, `AUTH_HASH_KEYLEN`, `AUTH_PEPPER`.
+- **Tenancy & ops:** `EQUIPMENT_ORG_ID`, `DEFAULT_ORG_ID`, `TENANT_<NAME>_CLIENT_KEY/HMAC_SECRET/WEBHOOK_URL/ORIGIN_URL/DISPLAY_NAME`, `BACKUP_EMAIL_TO`, `BACKUP_NOTIFY_EMAIL`, `ADMIN_TASK_TOKEN`.
+- **TransUnion:** `TRANSUNION_API_URL/KEY/CLIENT_ID/ENV`.
+
+## Build, run & test
+```bash
+npm install
+npm run db:migrate        # apply migrations to $DATABASE_URL (migrate-only)
+npm run start:dev         # dev: tsx backend/server.ts
+npm run build:node        # production bundle -> dist-node/server.js (esbuild)
+npm start                 # run dist-node/server.js
+npm run build             # Cloudflare/Vite build (tailwind + vite) -> dist/
+python smoke_test.py      # end-to-end smoke test
+```
+Liveness: `GET /health` · `GET /healthz` · `GET /api/ping`.
+
+## Companion docs
+- **[SCORE-INTEGRATION.md](./SCORE-INTEGRATION.md)** — Score SSO, shared DB schema, credit/verification APIs.
+- **[PAYMENT-GATEWAY-INTEGRATION.md](./PAYMENT-GATEWAY-INTEGRATION.md)** — central gateway, multi-tenant, metered wallet billing.
+- **[RBAC-OWNERSHIP-WALLET.md](./RBAC-OWNERSHIP-WALLET.md)** — permission matrix, ownership RLS, agent wallet.
+- **[SASAPAY-PRODUCTION.md](./SASAPAY-PRODUCTION.md)** — SasaPay channels, money flows, callbacks.
+- **[AWS_DEPLOYMENT.md](./AWS_DEPLOYMENT.md)** — AWS EC2 / App Runner / Cloudflare Pages deploy.
