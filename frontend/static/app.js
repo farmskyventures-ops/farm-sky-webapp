@@ -945,20 +945,78 @@ function authSignUpVerify(phone, name, demoOtp) {
     <form id="suvForm" class="space-y-4">
       <div><label class="text-sm font-medium text-slate-600">Verification Code</label>
         <input id="su_code" type="text" inputmode="numeric" maxlength="6" placeholder="6-digit code" value="${esc(demoOtp || '')}" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg tracking-widest" required></div>
-      <div><label class="text-sm font-medium text-slate-600">National ID Number</label>
-        <input id="su_nid" type="text" inputmode="numeric" placeholder="e.g. 12345678" class="w-full mt-1 px-4 py-2.5 border border-slate-300 rounded-lg" required></div>
       <div><label class="text-sm font-medium text-slate-600">Create Password</label>
         ${passwordField('su_pass', { placeholder: 'Choose a password', required: true })}</div>
+      <div class="pt-1"><h4 class="text-sm font-semibold text-teal-700 mb-2"><i class="fas fa-user mr-1"></i>Personal Information</h4>
+        <div class="grid grid-cols-2 gap-2 text-sm">
+          <input id="su_nid" type="text" inputmode="numeric" placeholder="National ID *" required class="px-3 py-2 border border-slate-300 rounded-lg col-span-2">
+          <label class="col-span-1 text-[11px] text-slate-500">Date of Birth<input id="su_dob" type="date" class="w-full mt-0.5 px-3 py-2 border border-slate-300 rounded-lg"></label>
+          <label class="col-span-1 text-[11px] text-slate-500">Gender<select id="su_gender" class="w-full mt-0.5 px-3 py-2 border border-slate-300 rounded-lg"><option value="">Select gender</option><option>Female</option><option>Male</option></select></label>
+          <input id="su_alt_mobile" type="tel" inputmode="tel" placeholder="Alternative Number" class="px-3 py-2 border border-slate-300 rounded-lg col-span-2">
+        </div>
+      </div>
+      <div class="pt-1"><h4 class="text-sm font-semibold text-teal-700 mb-2"><i class="fas fa-map-marker-alt mr-1"></i>Location</h4>
+        <div class="grid grid-cols-2 gap-2 text-sm">
+          <input id="su_county" placeholder="County *" required class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="su_sub_county" placeholder="Sub-county" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="su_ward" placeholder="Ward" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="su_village" placeholder="Village" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="lat" placeholder="Latitude" inputmode="decimal" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="lng" placeholder="Longitude" inputmode="decimal" class="px-3 py-2 border border-slate-300 rounded-lg">
+        </div>
+        <button type="button" onclick="captureGPS()" class="btn mt-2 text-xs bg-slate-100 px-3 py-2 rounded-lg"><i class="fas fa-location-crosshairs mr-1"></i>Allow Location</button>
+      </div>
+      <div class="pt-1"><h4 class="text-sm font-semibold text-teal-700 mb-2"><i class="fas fa-leaf mr-1"></i>Farming Profile</h4>
+        <div class="grid grid-cols-2 gap-2 text-sm">
+          <select id="vct" onchange="updateChain()" class="px-3 py-2 border border-slate-300 rounded-lg"><option value="">Value Chain Type</option><option value="crop">Crop</option><option value="livestock">Livestock</option></select>
+          <select id="vc" class="px-3 py-2 border border-slate-300 rounded-lg"><option value="">Select type first</option></select>
+          <input id="su_acreage" type="number" step="0.01" min="0" inputmode="decimal" placeholder="Acreage (e.g. 0.25, 1.50)" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="su_herd_size" type="number" min="0" inputmode="numeric" placeholder="Herd Size" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="su_farm_experience" type="number" min="0" inputmode="numeric" placeholder="Years of Experience" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <input id="su_annual_production" placeholder="Annual Production" class="px-3 py-2 border border-slate-300 rounded-lg">
+        </div>
+      </div>
+      <div class="pt-1"><h4 class="text-sm font-semibold text-teal-700 mb-2"><i class="fas fa-wallet mr-1"></i>Financial Profile</h4>
+        <div class="grid grid-cols-2 gap-2 text-sm">
+          <input id="su_existing_loans" inputmode="numeric" placeholder="Current Loan Amount" class="px-3 py-2 border border-slate-300 rounded-lg">
+          <select id="su_sacco" class="px-3 py-2 border border-slate-300 rounded-lg"><option value="no">SACCO Membership: No</option><option value="yes">SACCO Membership: Yes</option></select>
+        </div>
+      </div>
       <p class="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-2">You can shop and pay <b>cash</b> right away. To unlock <b>financing</b>, complete your KYC (ID photos, passport photo, liveliness & credit check) from <b>My Account</b> after signing up.</p>
       <button class="btn w-full brand-bg text-white py-2.5 rounded-lg font-semibold">Verify &amp; Create Account</button>
     </form>
     <button onclick="renderLogin('signup')" class="btn w-full mt-2 bg-slate-100 py-2 rounded-lg text-sm">Back</button>`
+  // Auto-activation: if location permission was already granted, fill GPS now.
+  autoCaptureGPSIfGranted()
   $('suvForm').onsubmit = async (e) => {
     e.preventDefault()
     const nid = ($('su_nid').value || '').trim()
     if (!/^[0-9]{5,12}$/.test(nid)) return toast('Enter a valid National ID number (digits only)', false)
+    const county = ($('su_county').value || '').trim()
+    if (!county) return toast('County is required', false)
     try {
-      const { data } = await api.post('/signup/verify', { phone, full_name: name, code: $('su_code').value, password: $('su_pass').value, national_id: nid })
+      const { data } = await api.post('/signup/verify', {
+        phone, full_name: name, code: $('su_code').value, password: $('su_pass').value,
+        // Standard Profile Data — identical to what an agent collects when onboarding a farmer.
+        national_id: nid,
+        date_of_birth: ($('su_dob')?.value || '').trim(),
+        gender: ($('su_gender')?.value || '').trim(),
+        alt_mobile: ($('su_alt_mobile')?.value || '').trim(),
+        county,
+        sub_county: ($('su_sub_county').value || '').trim(),
+        ward: ($('su_ward').value || '').trim(),
+        village: ($('su_village').value || '').trim(),
+        latitude: ($('lat')?.value || '').trim(),
+        longitude: ($('lng')?.value || '').trim(),
+        value_chain_type: ($('vct').value || '').trim(),
+        value_chain: ($('vc').value || '').trim(),
+        acreage: ($('su_acreage')?.value || '').trim(),
+        herd_size: ($('su_herd_size')?.value || '').trim(),
+        farm_experience: ($('su_farm_experience')?.value || '').trim(),
+        annual_production: ($('su_annual_production')?.value || '').trim(),
+        existing_loans: ($('su_existing_loans')?.value || '').trim(),
+        sacco_membership: ($('su_sacco')?.value || 'no').trim()
+      })
       state.user = data.user
       toast('Account created. Welcome, ' + data.user.full_name)
       renderApp()

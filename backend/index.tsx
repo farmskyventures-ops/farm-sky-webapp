@@ -1291,15 +1291,32 @@ app.post('/api/signup/request-otp', async (c) => {
 // completed LATER — cash purchases work without them; financed purchases are gated
 // (see /api/murabaha/apply -> kyc_required). ID number + phone must be UNIQUE.
 app.post('/api/signup/verify', async (c) => {
-  const { phone, full_name, code, password, region, national_id } = await c.req.json()
+  const b = await c.req.json()
+  const { phone, full_name, code, password, region, national_id } = b
   const p = normalizePhone(phone || '')
   const name = String(full_name || '').trim()
   const idNo = String(national_id || '').trim()
+  const county = String(b.county || '').trim()
   // ---- Input validation & sanitisation --------------------------------
   if (name.length < 2 || name.length > 120) return c.json({ error: 'Enter your full name' }, 400)
   if (!p || p.length < 9) return c.json({ error: 'Enter a valid phone number' }, 400)
   if (!/^[0-9]{5,12}$/.test(idNo)) return c.json({ error: 'Enter a valid National ID number (digits only)' }, 400)
   if (!password || String(password).length < 4 || String(password).length > 100) return c.json({ error: 'Password must be 4-100 characters' }, 400)
+  if (!county) return c.json({ error: 'County is required' }, 400)
+  // UNIFIED REGISTRATION: self-signup now collects the SAME full profile an agent
+  // captures when onboarding a farmer. Screen the free-text identity/location
+  // fields for injection / harmful content.
+  const tv = validateTextFields(b, [
+    { key: 'full_name', label: 'Full name', max: 120 },
+    { key: 'gender', label: 'Gender', max: 20 },
+    { key: 'county', label: 'County', max: 80 }, { key: 'sub_county', label: 'Sub-county', max: 80 },
+    { key: 'ward', label: 'Ward', max: 80 }, { key: 'village', label: 'Village', max: 120 },
+    { key: 'value_chain', label: 'Value chain', max: 120 }, { key: 'value_chain_type', label: 'Value chain type', max: 120 }
+  ])
+  if (!tv.ok) return c.json({ error: tv.error }, 400)
+  // SACCO membership is a Yes/No flag — normalise to the same 'yes'/'no' the
+  // agent onboarding handler (POST /api/customers) stores.
+  const saccoMember = ['yes', 'true', '1', 'on'].includes(String(b.sacco_membership || '').toLowerCase())
   const v = await verifyOtp(c, p, code, 'signup')
   if (!v.ok) return c.json({ error: v.error }, 400)
   // ---- Uniqueness: phone (users) AND national_id (customers) -----------
@@ -1327,9 +1344,20 @@ app.post('/api/signup/verify', async (c) => {
         `INSERT INTO users (full_name, phone, email, password, role, status, region, password_set, label, permissions) VALUES (?,?,?,?, ?, 'active', ?, 1, ?, ?)`
       ).bind(name, p, signupEmail, await hashPassword(String(password)), role, region || null, 'Farmer', JSON.stringify(farmerPerms)).run()
   const userId = r.meta.last_row_id
+  // Create the customer profile with the SAME full field set an agent captures
+  // when onboarding a farmer (Personal / Location / Farming / Financial).
   await c.env.DB.prepare(
-    `INSERT INTO customers (user_id, full_name, national_id, mobile, kyc_status) VALUES (?,?,?,?, 'pending')`
-  ).bind(userId, name, idNo, p).run()
+    `INSERT INTO customers (user_id, onboarded_by, full_name, national_id, date_of_birth, gender, mobile, alt_mobile, county, sub_county, ward, village, latitude, longitude, value_chain_type, value_chain, acreage, herd_size, farm_experience, annual_production, existing_loans, sacco_membership, kyc_status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending')`
+  ).bind(
+    userId, userId,
+    name, idNo, b.date_of_birth || null, b.gender || null, p, b.alt_mobile || null,
+    county, b.sub_county || null, b.ward || null, b.village || null,
+    b.latitude || null, b.longitude || null,
+    b.value_chain_type || null, b.value_chain || null,
+    b.acreage || null, b.herd_size || null, b.farm_experience || null, b.annual_production || null,
+    b.existing_loans || null, saccoMember ? 'yes' : 'no'
+  ).run()
   const user = { id: userId, full_name: name, phone: p, role, region, label: 'Farmer', permissions: farmerPerms }
   await createSession(c, user)
   await audit(c, userId, 'signup', 'user', 'customer self-registered (step 1: name/phone/ID/password)')
