@@ -970,7 +970,7 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', ledger: 'Unified Payment Ledger', amendments: 'Pending Profile Amendments', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants (Gateway Clients)' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', ledger: 'Unified Payment Ledger', amendments: 'Pending Profile Amendments', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
   const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, ledger: viewLedger, amendments: viewAmendments, imports: viewImports, backups: viewBackups, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants }
   ;(map[state.route] || viewDashboard)()
@@ -2069,7 +2069,7 @@ function productForm(prefix, p = {}) {
       <div><label class="field-label">TransUnion product code</label><input id="${prefix}_tu" ${finDis} value="${esc(p.transunion_product_code || '')}" placeholder="TransUnion product code" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">Financing model</label><select id="${prefix}_fin_model" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
         <option value="loan_interest" ${(p.financing_model || 'loan_interest') === 'loan_interest' ? 'selected' : ''}>Normal financing with interest</option>
-        <option value="paygo" ${(p.financing_model || '') === 'paygo' ? 'selected' : ''}>PAYGO (M-KOPA style)</option>
+        <option value="paygo" ${(p.financing_model || '') === 'paygo' ? 'selected' : ''}>PAYGO</option>
       </select></div>
       <div><label class="field-label">Interest / finance rate %</label><input id="${prefix}_int" ${finDis} type="number" value="${Number(p.financing_interest_pct || 0)}" placeholder="Interest rate %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div><label class="field-label">Repayment frequency</label><select id="${prefix}_freq" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
@@ -2314,7 +2314,7 @@ async function viewFinanceQueue() {
     </table>
   </div>
   <div class="card table-card">
-    <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-eye-slash text-amber-500 mr-2"></i>Hidden from storefront (audit)</div>
+    <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-eye-slash text-amber-500 mr-2"></i>Hidden from storefront</div>
     <table class="w-full text-sm">
       <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Equipment</th><th class="text-left px-4 py-3">Status</th><th class="text-left px-4 py-3">Markup</th><th class="text-left px-4 py-3">Agreement</th><th class="text-left px-4 py-3">Listed by</th></tr></thead>
       <tbody>${auditRows || '<tr><td colspan="5" class="text-center py-8 text-slate-400">No hidden products</td></tr>'}</tbody>
@@ -2423,7 +2423,7 @@ async function viewMyWallet() {
   </div>
   <div class="card p-5 mb-6"><div class="font-semibold text-slate-700 mb-2"><i class="fas fa-sliders text-teal-600 mr-2"></i>My earning criteria</div>${rulesHtml}</div>
   <div class="card table-card">
-    <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-receipt text-teal-600 mr-2"></i>Wallet statement (double-entry ledger)</div>
+    <div class="px-4 py-3 border-b font-semibold text-slate-700"><i class="fas fa-receipt text-teal-600 mr-2"></i>Wallet statement</div>
     <table class="w-full text-sm">
       <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Date</th><th class="text-left px-4 py-3">Category</th><th class="text-left px-4 py-3">Detail</th><th class="text-right px-4 py-3">Amount</th><th class="text-right px-4 py-3">Balance</th></tr></thead>
       <tbody>${ledger.map(ledgerRow).join('') || '<tr><td colspan="5" class="text-center py-8 text-slate-400">No transactions yet</td></tr>'}</tbody>
@@ -2521,7 +2521,7 @@ async function loadScoreWallets() {
     const live = data.source === 'score_live'
     meta.innerHTML = live
       ? `<span class="text-emerald-600"><i class="fas fa-circle text-[8px] mr-1"></i>Live · synced ${esc(String(data.synced_at || '').slice(11, 16))} UTC</span>`
-      : `<span class="text-amber-600"><i class="fas fa-triangle-exclamation mr-1"></i>Mirror fallback (Score engine unreachable)</span>`
+      : `<span class="text-amber-600"><i class="fas fa-triangle-exclamation mr-1"></i>Mirror fallback</span>`
   }
   const statusPill = (s) => {
     const m = { active: 'bg-emerald-50 text-emerald-600', low: 'bg-amber-50 text-amber-600', empty: 'bg-red-50 text-red-600' }
@@ -2653,7 +2653,7 @@ window.earningRulesModal = async (userId, name) => {
       <div id="er_rate_wrap"><label class="field-label">Rate %</label><input id="er_rate" type="number" value="2" class="px-3 py-2 border rounded-lg"></div>
       <div id="er_fixed_wrap" style="display:none"><label class="field-label">Fixed amount (KES)</label><input id="er_fixed" type="number" value="5000" class="px-3 py-2 border rounded-lg"></div>
       <div><label class="field-label">Applies to</label><select id="er_applies" class="px-3 py-2 border rounded-lg">
-        <option value="completed_order">Completed order (auto)</option><option value="manual">Manual / payout</option>
+        <option value="completed_order">Completed order</option><option value="manual">Manual / payout</option>
       </select></div>
       <div><label class="field-label">Description</label><input id="er_desc" placeholder="e.g. Sales commission" class="px-3 py-2 border rounded-lg"></div>
     </div>
@@ -3648,7 +3648,7 @@ function tenantFormFields(t) {
         <input id="tn_webhook_url" value="${esc(v.webhook_url || '')}" placeholder="https://credit.farmsky.africa/api/v1/payment-webhook" class="w-full px-3 py-2 border rounded-lg">
       </div>
       ${editing ? '' : `<div>
-        <label class="block text-xs font-medium text-slate-600 mb-1">HMAC secret (optional — leave blank to auto-generate a 256-bit secret)</label>
+        <label class="block text-xs font-medium text-slate-600 mb-1">HMAC secret (optional)</label>
         <input id="tn_hmac_secret" value="" placeholder="Auto-generated if empty" class="w-full px-3 py-2 border rounded-lg font-mono text-xs">
       </div>`}
       <label class="flex items-center gap-2 text-sm"><input id="tn_is_active" type="checkbox" ${v.is_active === false ? '' : 'checked'} class="rounded"> Active</label>
@@ -3805,7 +3805,7 @@ async function viewApiManagement() {
       </ul>
     </div>
     <div class="card table-card">
-      <div class="px-4 py-3 border-b border-slate-100 font-semibold text-slate-700 text-sm">Lender accounts (API-eligible)</div>
+      <div class="px-4 py-3 border-b border-slate-100 font-semibold text-slate-700 text-sm">Lender accounts</div>
       <table class="w-full text-sm">
         <thead class="bg-slate-50 text-slate-500 text-xs uppercase"><tr><th class="text-left px-4 py-3">Name</th><th class="text-left px-4 py-3">Phone</th><th class="text-left px-4 py-3">Email</th><th class="text-left px-4 py-3">Status</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
@@ -3848,7 +3848,7 @@ window.openAccessManager = async (editRoleKey = '') => {
         <div id="rt_perm_box" class="responsive-grid cols-2">${permissionChecklist('rt_perm', role?.permissions || {}, false)}</div>
       </div>
       <div class="mt-4">
-        <div class="field-label">Time-Based Access Control (login window)</div>
+        <div class="field-label">Time-Based Access Control</div>
         ${scheduleEditor('rt', { schedule_enabled: role?.schedule_enabled, access_days: role?.access_days, access_start: role?.access_start, access_end: role?.access_end }, false)}
       </div>
       <div class="flex gap-2 mt-4 flex-wrap">
@@ -3935,9 +3935,9 @@ window.addUserModal = async (opts = {}) => {
       ${roleField}
       <input id="nu_label" placeholder="Label (for example: Western Cluster Agent)" class="w-full px-3 py-2 border rounded-lg">
       <input id="nu_region" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
-      <input id="nu_pwd" placeholder="Password (optional — auto-generated if blank)" class="w-full px-3 py-2 border rounded-lg">
+      <input id="nu_pwd" placeholder="Password (optional)" class="w-full px-3 py-2 border rounded-lg">
       <div><div class="field-label">Permission check-boxes</div><div id="nu_perm_box" class="responsive-grid cols-2">${permissionChecklist('nu_perm', templatePermissions(defaultRole), !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Toggle the exact permissions to assign to this user.' : 'Only Super Admin can customize the check-box selection. Admin users see role-based defaults.'}</div></div>
-      ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control (login window)</div>${scheduleEditor('nu', {}, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
+      ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control</div>${scheduleEditor('nu', {}, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
     </div>
     <div class="flex gap-2 mt-4"><button onclick="doAddUser()" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Create User</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
   if (!lockRole) $('nu_role').onchange = () => refreshPermissionChecklist('nu_perm', 'nu_role', !allowCustomPerms)
@@ -3973,7 +3973,7 @@ window.editUserModal = async (id) => {
     <input id="eu_label" value="${esc(u.label || '')}" placeholder="Label" class="w-full px-3 py-2 border rounded-lg">
     <input id="eu_region" value="${esc(u.region || '')}" placeholder="Region" class="w-full px-3 py-2 border rounded-lg">
     <div><div class="field-label">Permission check-boxes</div><div id="eu_perm_box" class="responsive-grid cols-2">${permissionChecklist('eu_perm', u.permissions || {}, !allowCustomPerms)}</div><div class="help-text">${allowCustomPerms ? 'Update the assigned permission check-boxes, then confirm to save.' : 'Only Super Admin can customize the permission check-boxes.'}</div></div>
-    ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control (login window)</div>${scheduleEditor('eu', { schedule_enabled: u.schedule_enabled, access_days: u.access_days, access_start: u.access_start, access_end: u.access_end }, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
+    ${allowCustomPerms ? `<div><div class="field-label">Time-Based Access Control</div>${scheduleEditor('eu', { schedule_enabled: u.schedule_enabled, access_days: u.access_days, access_start: u.access_start, access_end: u.access_end }, false)}<div class="help-text">Optional. Overrides the role login window for this user.</div></div>` : ''}
     <input id="eu_pwd" placeholder="New password (leave blank to keep)" class="w-full px-3 py-2 border rounded-lg">
   </div><div class="flex gap-2 mt-4"><button onclick="doEditUser('${esc(String(id))}')" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save Changes</button><button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button></div>`)
   $('eu_role').onchange = () => refreshPermissionChecklist('eu_perm', 'eu_role', !allowCustomPerms)
