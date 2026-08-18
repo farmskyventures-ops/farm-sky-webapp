@@ -714,7 +714,111 @@ window.doRequestAdminReset = async () => {
   } catch (err) { done(); toast(err.response?.data?.error || 'Failed to send request', false) }
 }
 // ---------------------------------------------------------------------------
-// KYC helpers — gallery + camera capture for ID front, ID back, selfie
+// IMAGE COMPRESSION — downscale + re-encode any captured/selected image so the
+// stored data URL stays small while preserving readability for verification.
+// Documents (IDs) keep a larger long-edge and higher quality; selfies/products
+// can be smaller. Returns a JPEG data URL. Falls back to the original on error.
+// ---------------------------------------------------------------------------
+function compressImageDataUrl(dataUrl, { maxEdge = 1280, quality = 0.82 } = {}) {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image()
+      img.onload = () => {
+        try {
+          const longEdge = Math.max(img.width, img.height) || 1
+          const scale = Math.min(1, maxEdge / longEdge)
+          const w = Math.max(1, Math.round(img.width * scale))
+          const h = Math.max(1, Math.round(img.height * scale))
+          const canvas = document.createElement('canvas')
+          canvas.width = w; canvas.height = h
+          const ctx = canvas.getContext('2d')
+          ctx.drawImage(img, 0, 0, w, h)
+          resolve(canvas.toDataURL('image/jpeg', quality))
+        } catch (_) { resolve(dataUrl) }
+      }
+      img.onerror = () => resolve(dataUrl)
+      img.src = dataUrl
+    } catch (_) { resolve(dataUrl) }
+  })
+}
+window.compressImageDataUrl = compressImageDataUrl
+// ---------------------------------------------------------------------------
+// LIVE CAMERA CAPTURE — opens the device camera via getUserMedia (this triggers
+// the browser's native hardware permission prompt directly). Once permission is
+// granted the stream auto-starts (no extra click); if it was granted before,
+// the OS/browser skips the prompt and the camera opens immediately. Used for
+// mandatory live selfie capture (gallery upload disabled) and as an in-app
+// camera option for ID documents. Resolves with a compressed JPEG data URL, or
+// null if the user cancels.
+// ---------------------------------------------------------------------------
+function openLiveCamera({ facingMode = 'user', title = 'Camera', round = false, maxEdge = 1280, quality = 0.82 } = {}) {
+  return new Promise((resolve) => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      toast('Live camera is not supported on this device/browser.', false)
+      return resolve(null)
+    }
+    let stream = null
+    let settled = false
+    const overlay = document.createElement('div')
+    overlay.className = 'fixed inset-0 z-[70] bg-black/90 flex flex-col items-center justify-center p-4'
+    overlay.innerHTML = `
+      <div class="w-full max-w-md flex flex-col items-center">
+        <div class="text-white font-semibold mb-3"><i class="fas fa-camera mr-2"></i>${esc(title)}</div>
+        <div class="relative w-full ${round ? 'aspect-square max-w-xs' : 'aspect-[4/3]'} bg-black rounded-2xl overflow-hidden border border-white/20 flex items-center justify-center">
+          <video id="lcVideo" autoplay playsinline muted class="w-full h-full object-cover ${round ? 'rounded-2xl' : ''}"></video>
+          <div id="lcHint" class="absolute inset-0 flex items-center justify-center text-white/70 text-sm">Starting camera…</div>
+        </div>
+        <div class="flex items-center gap-3 mt-5">
+          <button id="lcCancel" class="btn bg-white/15 text-white px-5 py-2.5 rounded-lg text-sm"><i class="fas fa-xmark mr-1"></i>Cancel</button>
+          <button id="lcShot" class="btn brand-bg text-white px-6 py-2.5 rounded-lg text-sm font-semibold disabled:opacity-40" disabled><i class="fas fa-circle-dot mr-1"></i>Capture</button>
+        </div>
+        <p class="text-white/50 text-[11px] mt-3 text-center">Live capture only — take the photo directly with your camera.</p>
+      </div>`
+    document.body.appendChild(overlay)
+    const video = overlay.querySelector('#lcVideo')
+    const hint = overlay.querySelector('#lcHint')
+    const shot = overlay.querySelector('#lcShot')
+    const cancel = overlay.querySelector('#lcCancel')
+    const cleanup = () => {
+      try { if (stream) stream.getTracks().forEach(t => t.stop()) } catch (_) {}
+      try { overlay.remove() } catch (_) {}
+    }
+    const finish = (val) => { if (settled) return; settled = true; cleanup(); resolve(val) }
+    cancel.onclick = () => finish(null)
+    shot.onclick = async () => {
+      try {
+        const w = video.videoWidth || 720, h = video.videoHeight || 960
+        const canvas = document.createElement('canvas')
+        canvas.width = w; canvas.height = h
+        const ctx = canvas.getContext('2d')
+        // Mirror the front camera so the captured selfie matches the preview.
+        if (facingMode === 'user') { ctx.translate(w, 0); ctx.scale(-1, 1) }
+        ctx.drawImage(video, 0, 0, w, h)
+        const raw = canvas.toDataURL('image/jpeg', 0.92)
+        const compressed = await compressImageDataUrl(raw, { maxEdge, quality })
+        finish(compressed)
+      } catch (_) { toast('Could not capture the photo. Try again.', false) }
+    }
+    // Requesting the stream triggers the NATIVE permission prompt. On grant the
+    // <video> auto-plays immediately (auto-activation, no extra click).
+    navigator.mediaDevices.getUserMedia({ video: { facingMode }, audio: false })
+      .then(s => {
+        stream = s
+        video.srcObject = s
+        video.onloadedmetadata = () => { try { video.play() } catch (_) {}; if (hint) hint.style.display = 'none'; if (shot) shot.disabled = false }
+        if (facingMode === 'user') video.style.transform = 'scaleX(-1)'  // mirror preview for selfies
+      })
+      .catch(err => {
+        const denied = err && (err.name === 'NotAllowedError' || err.name === 'SecurityError')
+        if (hint) hint.textContent = denied ? 'Camera permission denied.' : 'Could not start the camera.'
+        toast(denied ? 'Camera permission was denied. Enable it in your browser settings to continue.' : 'Could not access the camera on this device.', false)
+        setTimeout(() => finish(null), 1200)
+      })
+  })
+}
+window.openLiveCamera = openLiveCamera
+// ---------------------------------------------------------------------------
+// KYC helpers — gallery upload (ID docs) + mandatory live camera capture
 // ---------------------------------------------------------------------------
 function kycFileToDataUrl(file) {
   return new Promise((resolve, reject) => {
@@ -730,28 +834,58 @@ window.kycOpenPicker = (inputId) => {
   input.value = ''
   input.click()
 }
+// Apply a captured/selected data URL to a KYC step (preview + hidden field +
+// status badge + advance to the next step). Shared by gallery picks and live
+// camera captures.
+function kycApplyCapture(dataUrl, hiddenId, previewId, statusId, nextSectionId = '') {
+  const hidden = $(hiddenId)
+  const preview = $(previewId)
+  const status = $(statusId)
+  if (hidden) hidden.value = dataUrl
+  if (preview) {
+    const isSelfie = previewId.toLowerCase().includes('selfie')
+    preview.innerHTML = `<img src="${dataUrl}" class="${isSelfie ? 'w-28 h-28 rounded-full' : 'w-full h-40 rounded-xl'} object-cover border border-slate-200">`
+  }
+  if (status) {
+    status.className = 'text-[11px] font-semibold px-2 py-1 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300 whitespace-nowrap'
+    status.innerHTML = `<i class="fas fa-circle-check mr-1"></i>Captured`
+  }
+  if (nextSectionId && $(nextSectionId)) {
+    $(nextSectionId).classList.remove('hidden')
+    $(nextSectionId).scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }
+}
 window.kycHandlePick = async (input, hiddenId, previewId, statusId, nextSectionId = '') => {
   const file = input?.files?.[0]
   if (!file) return
   try {
-    const dataUrl = await kycFileToDataUrl(file)
-    const hidden = $(hiddenId)
-    const preview = $(previewId)
-    const status = $(statusId)
-    if (hidden) hidden.value = dataUrl
-    if (preview) {
-      const isSelfie = previewId.toLowerCase().includes('selfie')
-      preview.innerHTML = `<img src="${dataUrl}" class="${isSelfie ? 'w-28 h-28 rounded-full' : 'w-full h-40 rounded-xl'} object-cover border border-slate-200">`
-    }
-    if (status) status.innerHTML = `<span class="text-emerald-600"><i class="fas fa-circle-check mr-1"></i>Captured</span>`
-    if (nextSectionId && $(nextSectionId)) {
-      $(nextSectionId).classList.remove('hidden')
-      $(nextSectionId).scrollIntoView({ behavior: 'smooth', block: 'center' })
-    }
+    const raw = await kycFileToDataUrl(file)
+    // Documents keep a larger long-edge for readability; compress to shrink size.
+    const dataUrl = await compressImageDataUrl(raw, { maxEdge: 1600, quality: 0.85 })
+    kycApplyCapture(dataUrl, hiddenId, previewId, statusId, nextSectionId)
   } catch { toast('Could not read the selected image', false) }
+}
+// Live in-app camera capture for a KYC step. Opens the native camera (via
+// getUserMedia) and stores the compressed live photo. Used for the mandatory
+// selfie (front camera, no gallery) and offered for ID documents (back camera).
+window.kycCaptureLive = async (hiddenId, previewId, statusId, nextSectionId = '', facing = 'environment', title = 'Camera') => {
+  const isSelfie = String(previewId).toLowerCase().includes('selfie')
+  const dataUrl = await openLiveCamera({
+    facingMode: facing, title, round: isSelfie,
+    // Selfies compress smaller; ID documents keep more detail for verification.
+    maxEdge: isSelfie ? 900 : 1600, quality: 0.85
+  })
+  if (!dataUrl) return
+  kycApplyCapture(dataUrl, hiddenId, previewId, statusId, nextSectionId)
 }
 function kycStepCard({ sectionId, title, subtitle, previewId, statusId, hiddenId, galleryId, cameraId, cameraFacing = 'environment', cameraLabel = 'Open camera', nextSectionId = '', hidden = false, value = '', previewHtml = '', statusText = 'Required' }) {
   const isSelfie = previewId.toLowerCase().includes('selfie')
+  // The status badge uses a filled colored background so "Required" / "Captured"
+  // is clearly visible against the card, rather than faint low-contrast text.
+  const isCaptured = /captured/i.test(String(statusText))
+  const badgeCls = isCaptured
+    ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+    : 'bg-amber-100 text-amber-800 border border-amber-300'
   return `
     <section id="${sectionId}" class="${hidden ? 'hidden ' : ''}border border-slate-200 rounded-xl p-4 bg-slate-50">
       <div class="flex items-start justify-between gap-3 mb-3">
@@ -759,18 +893,25 @@ function kycStepCard({ sectionId, title, subtitle, previewId, statusId, hiddenId
           <div class="text-sm font-semibold text-slate-800">${title}</div>
           <div class="text-xs text-slate-500">${subtitle}</div>
         </div>
-        <div id="${statusId}" class="text-xs text-amber-600">${statusText}</div>
+        <div id="${statusId}" class="text-[11px] font-semibold px-2 py-1 rounded-full ${badgeCls} whitespace-nowrap">${statusText}</div>
       </div>
       <div id="${previewId}" class="${isSelfie ? 'w-28 h-28 rounded-full' : 'w-full h-40 rounded-xl'} overflow-hidden bg-slate-200 flex items-center justify-center mx-auto border border-dashed border-slate-300">
         ${previewHtml || `<i class="fas ${isSelfie ? 'fa-user' : 'fa-id-card'} text-3xl text-slate-400"></i>`}
       </div>
       <input id="${hiddenId}" type="hidden" value="${esc(value || '')}">
       <input id="${galleryId}" type="file" accept="image/*" class="hidden" onchange="kycHandlePick(this,'${hiddenId}','${previewId}','${statusId}','${nextSectionId}')">
-      <input id="${cameraId}" type="file" accept="image/*" capture="${cameraFacing}" class="hidden" onchange="kycHandlePick(this,'${hiddenId}','${previewId}','${statusId}','${nextSectionId}')">
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3">
-        <button type="button" onclick="kycOpenPicker('${galleryId}')" class="btn bg-white border border-slate-300 px-3 py-2 rounded-lg text-sm"><i class="fas fa-image mr-1"></i>Upload from gallery</button>
-        <button type="button" onclick="kycOpenPicker('${cameraId}')" class="btn brand-bg text-white px-3 py-2 rounded-lg text-sm"><i class="fas fa-camera mr-1"></i>${cameraLabel}</button>
-      </div>
+      ${isSelfie
+        // MANDATORY LIVE SELFIE: gallery/file upload is disabled for liveness —
+        // the photo must be taken live through the in-app camera.
+        ? `<div class="mt-3">
+        <button type="button" onclick="kycCaptureLive('${hiddenId}','${previewId}','${statusId}','${nextSectionId}','user','${esc(cameraLabel)}')" class="btn w-full bg-teal-600 hover:bg-teal-700 text-white border border-teal-700 px-3 py-2 rounded-lg text-sm font-semibold shadow-sm"><i class="fas fa-camera mr-1"></i>${cameraLabel}</button>
+        <p class="text-[11px] text-slate-500 mt-2 text-center"><i class="fas fa-shield-halved mr-1"></i>Live capture only — gallery upload is disabled for the liveness selfie.</p>
+      </div>`
+        // ID DOCUMENTS: allow gallery upload OR live in-app camera capture.
+        : `<div class="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-3">
+        <button type="button" onclick="kycOpenPicker('${galleryId}')" class="btn bg-sky-600 hover:bg-sky-700 text-white border border-sky-700 px-3 py-2 rounded-lg text-sm font-semibold shadow-sm"><i class="fas fa-image mr-1"></i>Upload from gallery</button>
+        <button type="button" onclick="kycCaptureLive('${hiddenId}','${previewId}','${statusId}','${nextSectionId}','${cameraFacing}','${esc(cameraLabel)}')" class="btn bg-teal-600 hover:bg-teal-700 text-white border border-teal-700 px-3 py-2 rounded-lg text-sm font-semibold shadow-sm"><i class="fas fa-camera mr-1"></i>${cameraLabel}</button>
+      </div>`}
     </section>`
 }
 
@@ -2211,23 +2352,15 @@ async function viewInventory() {
     <tbody>${rows.map(p => invRow(p, canInv, canFin, isDelete)).join('') || `<tr><td colspan="7" class="text-center py-8 text-slate-400">No products in ${esc(active.t)} yet</td></tr>`}</tbody>
   </table></div>`
 }
-window.pickImage = (input, targetId, previewId) => {
+window.pickImage = async (input, targetId, previewId) => {
   const file = input.files[0]; if (!file) return
-  const reader = new FileReader()
-  reader.onload = (e) => {
-    const img = new Image()
-    img.onload = () => {
-      const max = 600, scale = Math.min(1, max / Math.max(img.width, img.height))
-      const canvas = document.createElement('canvas')
-      canvas.width = img.width * scale; canvas.height = img.height * scale
-      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height)
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.8)
-      $(targetId).value = dataUrl
-      $(previewId).innerHTML = `<img src="${dataUrl}" class="w-16 h-16 rounded-lg object-cover">`
-    }
-    img.src = e.target.result
-  }
-  reader.readAsDataURL(file)
+  try {
+    const raw = await kycFileToDataUrl(file)
+    // Compress + optimize the product image while preserving clarity.
+    const dataUrl = await compressImageDataUrl(raw, { maxEdge: 900, quality: 0.82 })
+    if ($(targetId)) $(targetId).value = dataUrl
+    if ($(previewId)) $(previewId).innerHTML = `<img src="${dataUrl}" class="w-16 h-16 rounded-lg object-cover">`
+  } catch (_) { toast('Could not read the selected image', false) }
 }
 // Open the "Add product" modal, optionally pre-targeting a marketplace section
 // and a source platform (e.g. the Merchant Marketplace destination button lists
@@ -3367,7 +3500,7 @@ function viewOnboard() {
         <div class="form-field"><label class="field-label">Latitude</label><input name="latitude" id="lat" inputmode="decimal"></div>
         <div class="form-field"><label class="field-label">Longitude</label><input name="longitude" id="lng" inputmode="decimal"></div>
       </div>
-      <button type="button" onclick="captureGPS()" class="btn mt-3 text-xs bg-slate-100 px-3 py-2 rounded-lg"><i class="fas fa-location-crosshairs mr-1"></i>Auto-capture GPS</button></div>
+      <button type="button" onclick="captureGPS()" class="btn mt-3 text-xs bg-slate-100 px-3 py-2 rounded-lg"><i class="fas fa-location-crosshairs mr-1"></i>Allow Location</button></div>
     <div><h3 class="section-title"><i class="fas fa-leaf"></i>Farming Profile</h3>
       <div class="form-grid">
         <div class="form-field"><label class="field-label">Value Chain Type</label><select name="value_chain_type" id="vct" onchange="updateChain()"><option value="">Select value chain type</option><option value="crop">Crop</option><option value="livestock">Livestock</option></select></div>
@@ -3385,6 +3518,9 @@ function viewOnboard() {
     <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-700"><i class="fas fa-info-circle mr-1"></i>ID upload and manual selfie capture now happen during "Complete User Registration" — run it from the Customers page after onboarding.</div>
     <button class="btn brand-bg text-white px-6 py-2.5 rounded-lg text-sm"><i class="fas fa-paper-plane mr-1"></i>Submit Onboarding</button>
   </form></div>`
+  // Auto-activation: if location permission was already granted, capture GPS now
+  // without requiring the user to click "Allow Location" again.
+  autoCaptureGPSIfGranted()
   $('onbForm').onsubmit = async (e) => {
     e.preventDefault()
     const fd = new FormData(e.target); const body = Object.fromEntries(fd.entries())
@@ -3392,11 +3528,26 @@ function viewOnboard() {
     catch (err) { toast(err.response?.data?.error || 'Failed', false) }
   }
 }
-window.captureGPS = () => {
-  if (!navigator.geolocation) { $('lat').value = '-0.7167'; $('lng').value = '36.4333'; return toast('Geolocation unavailable, using demo coords') }
+// Retrieve the device location. Calling getCurrentPosition triggers the browser's
+// NATIVE location permission prompt directly; on grant the coordinates are
+// fetched immediately (auto-retrieve, no extra click). If permission was already
+// granted in a prior session the OS/browser skips the prompt and returns at once.
+function fetchGPS(silent = false) {
+  if (!navigator.geolocation) { if ($('lat')) $('lat').value = '-0.7167'; if ($('lng')) $('lng').value = '36.4333'; if (!silent) toast('Geolocation unavailable, using demo coords'); return }
   navigator.geolocation.getCurrentPosition(
-    p => { $('lat').value = p.coords.latitude.toFixed(4); $('lng').value = p.coords.longitude.toFixed(4); toast('GPS captured') },
-    () => { $('lat').value = '-0.7167'; $('lng').value = '36.4333'; toast('Using demo coords (permission denied)') })
+    p => { if ($('lat')) $('lat').value = p.coords.latitude.toFixed(4); if ($('lng')) $('lng').value = p.coords.longitude.toFixed(4); if (!silent) toast('Location captured') },
+    () => { if ($('lat')) $('lat').value = '-0.7167'; if ($('lng')) $('lng').value = '36.4333'; if (!silent) toast('Using demo coords (permission denied)') },
+    { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 })
+}
+window.captureGPS = () => fetchGPS(false)
+// Auto-activation: if location permission was ALREADY granted, retrieve it
+// immediately without waiting for a button click (respects existing settings).
+window.autoCaptureGPSIfGranted = () => {
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({ name: 'geolocation' }).then(st => { if (st.state === 'granted') fetchGPS(true) }).catch(() => {})
+    }
+  } catch (_) {}
 }
 window.updateChain = () => {
   const crops = ['Maize', 'Beans', 'Wheat', 'Rice', 'Sorghum', 'Tomatoes', 'Onion', 'Avocado', 'Mango', 'Coffee', 'Tea', 'Other']
@@ -4143,21 +4294,20 @@ async function loadMyAmendments() {
     }).join('')
   } catch (err) { box.innerHTML = '' }
 }
-window.pickAvatarFile = (input) => {
+window.pickAvatarFile = async (input) => {
   const file = input.files?.[0]
   if (!file) return
   const okTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
   if (!okTypes.includes(file.type)) { toast('Please choose a JPEG, PNG, WebP or GIF image.', false); input.value = ''; return }
   if (file.size > 8 * 1024 * 1024) { toast('Image is too large (max 8 MB).', false); input.value = ''; return }
-  const reader = new FileReader()
-  reader.onload = () => {
-    const dataUrl = reader.result
+  try {
+    const raw = await kycFileToDataUrl(file)
+    const dataUrl = await compressImageDataUrl(raw, { maxEdge: 512, quality: 0.85 })
     if ($('pf_avatar')) $('pf_avatar').value = dataUrl
     if ($('pf_avatar_name')) $('pf_avatar_name').textContent = file.name
     const box = $('avatarPreview')
     if (box) box.innerHTML = `<img src="${dataUrl}" class="h-24 w-24 rounded-full object-cover border-2 border-teal-200">`
-  }
-  reader.readAsDataURL(file)
+  } catch (_) { toast('Could not read the image file.', false) }
 }
 window.saveAvatar = async () => {
   try {
