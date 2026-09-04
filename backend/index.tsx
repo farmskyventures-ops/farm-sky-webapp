@@ -336,7 +336,13 @@ const DEFAULT_FINANCING_MARKUP = {
   default_credit_markup_pct: 20,
   cash_markup_pct: 10,
   cash_terms_text: '',
-  product_ids: [] as number[]
+  product_ids: [] as number[],
+  // Default pricing-mode rules applied when a product does not override them.
+  // These power the "Admin Controls: default markup rules" requirement.
+  default_cash_price_mode: 'percentage',   // percentage | fixed | manual
+  default_cash_markup_amount: 0,
+  default_credit_price_mode: 'percentage',
+  default_credit_markup_amount: 0
 }
 function normalizeFinancingMarkup(raw: any) {
   const cfg: any = { ...DEFAULT_FINANCING_MARKUP, ...(raw && typeof raw === 'object' ? raw : {}) }
@@ -355,6 +361,11 @@ function normalizeFinancingMarkup(raw: any) {
   cfg.default_credit_markup_pct = cfg.mode === 'percentage' ? cfg.percentage_rate : numberVal(cfg.default_credit_markup_pct, 20)
   cfg.default_cash_markup_pct = cfg.cash_markup_pct
   cfg.product_ids = normalizeProductIds(cfg.product_ids)
+  // Default pricing-mode rules (percentage | fixed | manual).
+  cfg.default_cash_price_mode = ['percentage', 'fixed', 'manual'].includes(String(cfg.default_cash_price_mode)) ? String(cfg.default_cash_price_mode) : 'percentage'
+  cfg.default_credit_price_mode = ['percentage', 'fixed', 'manual'].includes(String(cfg.default_credit_price_mode)) ? String(cfg.default_credit_price_mode) : 'percentage'
+  cfg.default_cash_markup_amount = numberVal(cfg.default_cash_markup_amount, 0)
+  cfg.default_credit_markup_amount = numberVal(cfg.default_credit_markup_amount, 0)
   return cfg
 }
 // Compute the processing fee applied to a borrowed (financed) amount.
@@ -478,12 +489,39 @@ async function resolveAccessWindow(c: any, user: any): Promise<{ enabled: boolea
   } catch (_) {}
   return { enabled: false, days: [], start: '', end: '' }
 }
+// Selling price for a given pricing mode.
+//   percentage → buying * (1 + markupPct/100)
+//   fixed      → buying + markupAmount
+//   manual     → the explicitly entered price (markup ignored)
+function computeSellingPrice(mode: string, buying: number, markupPct: number, markupAmount: number, manualPrice: any, fallbackPct: number): number {
+  const m = ['percentage', 'fixed', 'manual'].includes(String(mode)) ? String(mode) : 'percentage'
+  if (m === 'manual') {
+    const explicit = numberVal(manualPrice, NaN)
+    if (Number.isFinite(explicit) && explicit > 0) return roundMoney(explicit)
+    // Fall back to percentage if a manual mode is chosen with no explicit price.
+    return roundMoney(buying * (1 + (Number.isFinite(markupPct) ? markupPct : fallbackPct) / 100))
+  }
+  if (m === 'fixed') return roundMoney(buying + numberVal(markupAmount, 0))
+  return roundMoney(buying * (1 + (Number.isFinite(markupPct) ? markupPct : fallbackPct) / 100))
+}
 function normalizeProductPayload(b: any) {
   const buying = numberVal(b.buying_price)
   const cashMarkup = numberVal(b.cash_markup_pct, 10)
   const creditMarkup = numberVal(b.credit_markup_pct, 20)
-  const cashPrice = numberVal(b.cash_price, roundMoney(buying * (1 + cashMarkup / 100)))
-  const creditPrice = numberVal(b.credit_price, roundMoney(buying * (1 + creditMarkup / 100)))
+  // Pricing modes: percentage | fixed | manual (default percentage for back-compat).
+  const cashMode = ['percentage', 'fixed', 'manual'].includes(String(b.cash_price_mode)) ? String(b.cash_price_mode) : 'percentage'
+  const creditMode = ['percentage', 'fixed', 'manual'].includes(String(b.credit_price_mode)) ? String(b.credit_price_mode) : 'percentage'
+  const cashMarkupAmount = numberVal(b.cash_markup_amount, 0)
+  const creditMarkupAmount = numberVal(b.credit_markup_amount, 0)
+  const cashPrice = computeSellingPrice(cashMode, buying, cashMarkup, cashMarkupAmount, b.cash_price, 10)
+  const creditPrice = computeSellingPrice(creditMode, buying, creditMarkup, creditMarkupAmount, b.credit_price, 20)
+  // Flexible tenure parameters: monthly | yearly | custom.
+  const tenureUnit = ['monthly', 'yearly', 'custom'].includes(String(b.financing_tenure_unit)) ? String(b.financing_tenure_unit) : 'monthly'
+  const ratePerCycle = numberVal(b.financing_rate_per_cycle, 0)
+  const amountPerCycle = numberVal(b.financing_amount_per_cycle, 0)
+  const cycleCount = Math.max(0, Math.round(numberVal(b.financing_cycle_count, 0)))
+  const cycleLengthDays = Math.max(1, Math.round(numberVal(b.financing_cycle_length_days, 30)))
+  const financingTypeKey = cleanText(b.financing_type_key, 60)
   const paymentMode = b.payment_option_mode || (boolInt(b.cash_enabled, true) && boolInt(b.financing_enabled, true) ? 'both' : boolInt(b.cash_enabled, true) ? 'cash' : 'financing')
   // Storefront section (marketplace) + permanent source tag. `marketplace` is the
   // shopping section a product shows under (equipment | feeds | inputs); it is
@@ -508,6 +546,10 @@ function normalizeProductPayload(b: any) {
     credit_markup_pct: creditMarkup,
     cash_price: cashPrice,
     credit_price: creditPrice,
+    cash_price_mode: cashMode,
+    cash_markup_amount: cashMarkupAmount,
+    credit_price_mode: creditMode,
+    credit_markup_amount: creditMarkupAmount,
     quantity: numberVal(b.quantity, 0),
     unit: b.unit || 'unit',
     reorder_threshold: numberVal(b.reorder_threshold, 10),
@@ -526,7 +568,12 @@ function normalizeProductPayload(b: any) {
     financing_terms_text: b.financing_terms_text || null,
     cash_terms_doc_url: b.cash_terms_doc_url || null,
     financing_terms_doc_url: b.financing_terms_doc_url || null,
-    transunion_product_code: b.transunion_product_code || null
+    financing_tenure_unit: tenureUnit,
+    financing_rate_per_cycle: ratePerCycle,
+    financing_amount_per_cycle: amountPerCycle,
+    financing_cycle_count: cycleCount,
+    financing_cycle_length_days: cycleLengthDays,
+    financing_type_key: financingTypeKey
   }
 }
 function financingQuote(p: any, quantity: any, paymentType: string, termMonths: any, processingFeeCfg?: any) {
@@ -558,47 +605,90 @@ function financingQuote(p: any, quantity: any, paymentType: string, termMonths: 
       terms_document_url: p.cash_terms_doc_url || null
     }
   }
-  const term = Math.max(numberVal(p.financing_term_min_months, 3), Math.min(numberVal(termMonths, numberVal(p.financing_term_min_months, 3)), numberVal(p.financing_term_max_months, 12)))
   const principalBase = roundMoney(numberVal(p.credit_price || p.cash_price) * qty)
   const deposit_pct = numberVal(p.financing_deposit_pct, 10)
   const deposit_amount = roundMoney(principalBase * deposit_pct / 100)
   const finance_principal = roundMoney(principalBase - deposit_amount)
   const interestRate = numberVal(p.financing_interest_pct, 0)
   const model = p.financing_model || 'loan_interest'
+  // ---- Flexible tenure resolution ------------------------------------------
+  // The new tenure model (migration 0033) lets an admin describe repayment as
+  //   monthly : rate/amount per month + total months
+  //   yearly  : rate/amount per year  + total years
+  //   custom  : rate/amount per cycle + length of each cycle (days)
+  // A per-cycle rate (%) or amount (money) drives the finance charge. When the
+  // product carries no tenure config we fall back to the legacy month-based
+  // interest model so existing inventory keeps working unchanged.
+  const tenureUnit = ['monthly', 'yearly', 'custom'].includes(String(p.financing_tenure_unit)) ? String(p.financing_tenure_unit) : 'monthly'
+  const ratePerCycle = numberVal(p.financing_rate_per_cycle, 0)
+  const amountPerCycle = numberVal(p.financing_amount_per_cycle, 0)
+  const cfgCycleCount = Math.max(0, Math.round(numberVal(p.financing_cycle_count, 0)))
+  const cycleLengthDays = Math.max(1, Math.round(numberVal(p.financing_cycle_length_days, tenureUnit === 'yearly' ? 365 : 30)))
+  const usesTenureModel = (ratePerCycle > 0 || amountPerCycle > 0) && cfgCycleCount > 0
   const frequency = p.financing_frequency || (model === 'paygo' ? 'daily' : 'monthly')
-  const installment_count = frequency === 'daily' ? term * 30 : frequency === 'weekly' ? term * 4 : term
-  const financing_charge = model === 'loan_interest'
-    ? roundMoney(finance_principal * (interestRate / 100) * (term / 12))
-    : roundMoney(finance_principal * (interestRate / 100) * (term / 12))
+
+  let cycle_count: number
+  let financing_charge: number
+  let term: number          // legacy "term in months" for back-compat / display
+  let payment_frequency: string
+  if (usesTenureModel) {
+    cycle_count = cfgCycleCount
+    // Total charge across all cycles: percentage of principal per cycle, plus
+    // any fixed money per cycle.
+    financing_charge = roundMoney(finance_principal * (ratePerCycle / 100) * cycle_count + amountPerCycle * cycle_count)
+    term = tenureUnit === 'yearly' ? cycle_count * 12
+      : tenureUnit === 'custom' ? Math.max(1, Math.round((cycle_count * cycleLengthDays) / 30))
+      : cycle_count
+    payment_frequency = tenureUnit === 'yearly' ? 'yearly' : tenureUnit === 'custom' ? 'custom' : 'monthly'
+  } else {
+    // Legacy month-based model.
+    term = Math.max(numberVal(p.financing_term_min_months, 3), Math.min(numberVal(termMonths, numberVal(p.financing_term_min_months, 3)), numberVal(p.financing_term_max_months, 12)))
+    cycle_count = frequency === 'daily' ? term * 30 : frequency === 'weekly' ? term * 4 : term
+    financing_charge = roundMoney(finance_principal * (interestRate / 100) * (term / 12))
+    payment_frequency = frequency
+  }
+  const installment_count = cycle_count
   // Processing fee is calculated on the amount borrowed (finance principal),
   // scoped to the product when the fee structure targets specific products.
   const processing_fee = computeProcessingFee(processingFeeCfg, finance_principal, p.id)
   const financed_total = roundMoney(finance_principal + financing_charge + processing_fee)
   const installment_amount = installment_count > 0 ? roundMoney(financed_total / installment_count) : financed_total
   const total_payable = roundMoney(deposit_amount + financed_total)
+  const cycleWord = usesTenureModel
+    ? (tenureUnit === 'yearly' ? 'year' : tenureUnit === 'custom' ? `${cycleLengthDays}-day cycle` : 'month')
+    : (payment_frequency === 'daily' ? 'day' : payment_frequency === 'weekly' ? 'week' : 'month')
   return {
     quantity: qty,
     supplier_cost,
     payment_type: 'financing',
     financing_model: model,
+    financing_type_key: p.financing_type_key || model,
     markup_pct: interestRate,
     amount_due_now: deposit_amount,
     deposit_pct,
     deposit_amount,
     finance_principal,
     processing_fee,
+    financing_charge,
     interest_rate_pct: interestRate,
+    tenure_unit: usesTenureModel ? tenureUnit : 'legacy',
+    rate_per_cycle: ratePerCycle,
+    amount_per_cycle: amountPerCycle,
+    cycle_count,
+    cycle_length_days: cycleLengthDays,
     term_months: term,
-    payment_frequency: frequency,
+    payment_frequency,
     installment_count,
     installment_amount,
-    monthly_payment: frequency === 'monthly' ? installment_amount : roundMoney(financed_total / Math.max(term, 1)),
+    monthly_payment: payment_frequency === 'monthly' ? installment_amount : roundMoney(financed_total / Math.max(term, 1)),
     total_price: principalBase,
     total_payable,
     outstanding_after_deposit: financed_total,
     disclosure_note: (model === 'paygo'
       ? 'PAYGO financing uses an upfront deposit and scheduled unlock payments similar to M-KOPA, adapted for agricultural equipment.'
-      : 'Normal financing applies the configured flat interest across the selected term.')
+      : usesTenureModel
+        ? `Financing is repaid over ${cycle_count} ${cycleWord}${cycle_count === 1 ? '' : 's'} at ${installment_amount.toLocaleString()} per ${cycleWord}.`
+        : 'Normal financing applies the configured flat interest across the selected term.')
       + (processing_fee > 0 ? ` A processing fee of ${processing_fee.toLocaleString()} applies to the financed amount.` : ''),
     terms_text: p.financing_terms_text || null,
     terms_document_url: p.financing_terms_doc_url || null
@@ -1481,14 +1571,14 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
   const financeSetBy = canFinance ? user.id : null
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,subcategory,marketplace,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code,created_by,finance_status,finance_set_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,subcategory,marketplace,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,created_by,finance_status,finance_set_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       p.sku, p.name, p.category, p.subcategory, p.marketplace, sourcePlatform, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
-      p.cash_price, p.credit_price, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
-      p.payment_option_mode, p.financing_model, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
-      p.financing_term_max_months, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-      p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code, user.id, financeStatus, financeSetBy
+      p.cash_price, p.credit_price, p.cash_price_mode, p.cash_markup_amount, p.credit_price_mode, p.credit_markup_amount, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
+      p.payment_option_mode, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
+      p.financing_term_max_months, p.financing_tenure_unit, p.financing_rate_per_cycle, p.financing_amount_per_cycle, p.financing_cycle_count, p.financing_cycle_length_days, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
+      p.cash_terms_doc_url, p.financing_terms_doc_url, user.id, financeStatus, financeSetBy
     ).run()
     await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus}, ${p.marketplace}/${sourcePlatform})`)
     return c.json({ id: r.meta.last_row_id, finance_status: financeStatus, marketplace: p.marketplace, source_platform: sourcePlatform })
@@ -1529,39 +1619,41 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
   // PERMANENT origin tag and is never editable.)
   const coreCols = canInv ? {
     sku: p.sku, name: p.name, category: p.category, subcategory: p.subcategory, marketplace: p.marketplace, description: p.description, product_type: p.product_type,
-    buying_price: p.buying_price, cash_markup_pct: p.cash_markup_pct, cash_price: p.cash_price,
+    buying_price: p.buying_price, cash_markup_pct: p.cash_markup_pct, cash_price: p.cash_price, cash_price_mode: p.cash_price_mode, cash_markup_amount: p.cash_markup_amount,
     quantity: p.quantity, unit: p.unit, reorder_threshold: p.reorder_threshold, image: p.image || existing.image,
     cash_enabled: p.cash_enabled, cash_deposit_pct: p.cash_deposit_pct, cash_terms_text: p.cash_terms_text, cash_terms_doc_url: p.cash_terms_doc_url
   } : {
     sku: existing.sku, name: existing.name, category: existing.category, subcategory: existing.subcategory, marketplace: existing.marketplace, description: existing.description, product_type: existing.product_type,
-    buying_price: existing.buying_price, cash_markup_pct: existing.cash_markup_pct, cash_price: existing.cash_price,
+    buying_price: existing.buying_price, cash_markup_pct: existing.cash_markup_pct, cash_price: existing.cash_price, cash_price_mode: existing.cash_price_mode, cash_markup_amount: existing.cash_markup_amount,
     quantity: existing.quantity, unit: existing.unit, reorder_threshold: existing.reorder_threshold, image: existing.image,
     cash_enabled: existing.cash_enabled, cash_deposit_pct: existing.cash_deposit_pct, cash_terms_text: existing.cash_terms_text, cash_terms_doc_url: existing.cash_terms_doc_url
   }
   const finCols = canFinance ? {
-    credit_markup_pct: p.credit_markup_pct, credit_price: p.credit_price, financing_enabled: p.financing_enabled,
-    financing_model: p.financing_model, financing_interest_pct: p.financing_interest_pct, financing_frequency: p.financing_frequency,
+    credit_markup_pct: p.credit_markup_pct, credit_price: p.credit_price, credit_price_mode: p.credit_price_mode, credit_markup_amount: p.credit_markup_amount, financing_enabled: p.financing_enabled,
+    financing_model: p.financing_model, financing_type_key: p.financing_type_key, financing_interest_pct: p.financing_interest_pct, financing_frequency: p.financing_frequency,
     financing_term_min_months: p.financing_term_min_months, financing_term_max_months: p.financing_term_max_months,
+    financing_tenure_unit: p.financing_tenure_unit, financing_rate_per_cycle: p.financing_rate_per_cycle, financing_amount_per_cycle: p.financing_amount_per_cycle,
+    financing_cycle_count: p.financing_cycle_count, financing_cycle_length_days: p.financing_cycle_length_days,
     financing_deposit_pct: p.financing_deposit_pct, financing_terms_text: p.financing_terms_text, financing_terms_doc_url: p.financing_terms_doc_url,
-    transunion_product_code: p.transunion_product_code,
     payment_option_mode: p.payment_option_mode, finance_status: 'published', finance_set_by: user.id
   } : {
-    credit_markup_pct: existing.credit_markup_pct, credit_price: existing.credit_price, financing_enabled: existing.financing_enabled,
-    financing_model: existing.financing_model, financing_interest_pct: existing.financing_interest_pct, financing_frequency: existing.financing_frequency,
+    credit_markup_pct: existing.credit_markup_pct, credit_price: existing.credit_price, credit_price_mode: existing.credit_price_mode, credit_markup_amount: existing.credit_markup_amount, financing_enabled: existing.financing_enabled,
+    financing_model: existing.financing_model, financing_type_key: existing.financing_type_key, financing_interest_pct: existing.financing_interest_pct, financing_frequency: existing.financing_frequency,
     financing_term_min_months: existing.financing_term_min_months, financing_term_max_months: existing.financing_term_max_months,
+    financing_tenure_unit: existing.financing_tenure_unit, financing_rate_per_cycle: existing.financing_rate_per_cycle, financing_amount_per_cycle: existing.financing_amount_per_cycle,
+    financing_cycle_count: existing.financing_cycle_count, financing_cycle_length_days: existing.financing_cycle_length_days,
     financing_deposit_pct: existing.financing_deposit_pct, financing_terms_text: existing.financing_terms_text, financing_terms_doc_url: existing.financing_terms_doc_url,
-    transunion_product_code: existing.transunion_product_code,
     payment_option_mode: existing.payment_option_mode, finance_status: existing.finance_status, finance_set_by: existing.finance_set_by
   }
   try {
     await c.env.DB.prepare(
-      `UPDATE products SET sku=?, name=?, category=?, subcategory=?, marketplace=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, transunion_product_code=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
+      `UPDATE products SET sku=?, name=?, category=?, subcategory=?, marketplace=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, cash_price_mode=?, cash_markup_amount=?, credit_price_mode=?, credit_markup_amount=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_type_key=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, financing_tenure_unit=?, financing_rate_per_cycle=?, financing_amount_per_cycle=?, financing_cycle_count=?, financing_cycle_length_days=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
     ).bind(
       coreCols.sku, coreCols.name, coreCols.category, coreCols.subcategory, coreCols.marketplace, coreCols.description, coreCols.product_type, coreCols.buying_price, coreCols.cash_markup_pct, finCols.credit_markup_pct,
-      coreCols.cash_price, finCols.credit_price, coreCols.quantity, coreCols.unit, coreCols.reorder_threshold, coreCols.image || null, coreCols.cash_enabled, finCols.financing_enabled,
-      finCols.payment_option_mode, finCols.financing_model, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
-      finCols.financing_term_max_months, coreCols.cash_deposit_pct, finCols.financing_deposit_pct, coreCols.cash_terms_text, finCols.financing_terms_text,
-      coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, finCols.transunion_product_code, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
+      coreCols.cash_price, finCols.credit_price, coreCols.cash_price_mode, coreCols.cash_markup_amount, finCols.credit_price_mode, finCols.credit_markup_amount, coreCols.quantity, coreCols.unit, coreCols.reorder_threshold, coreCols.image || null, coreCols.cash_enabled, finCols.financing_enabled,
+      finCols.payment_option_mode, finCols.financing_model, finCols.financing_type_key, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
+      finCols.financing_term_max_months, finCols.financing_tenure_unit, finCols.financing_rate_per_cycle, finCols.financing_amount_per_cycle, finCols.financing_cycle_count, finCols.financing_cycle_length_days, coreCols.cash_deposit_pct, finCols.financing_deposit_pct, coreCols.cash_terms_text, finCols.financing_terms_text,
+      coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
     ).run()
   } catch (err: any) {
     const msg = String(err?.message || err)
@@ -1968,7 +2060,7 @@ app.post('/api/murabaha/apply', requireAuth, async (c) => {
   if (normalizedPaymentType === 'financing' && custRow?.kyc_status !== 'verified') {
     return c.json({
       error: 'kyc_required',
-      message: 'Complete registration (TransUnion credit check, ID upload, and liveness verification) before equipment financing purchases.',
+      message: 'Complete registration (credit assessment, ID upload, and liveness verification) before equipment financing purchases.',
       customer_id: custId
     }, 412)
   }
@@ -2096,11 +2188,11 @@ app.post('/api/murabaha/apply-bundle', requireAuth, async (c) => {
     // be enabled for cash items, financing enabled for financed items.
     if (ptype === 'cash' && p.cash_enabled === 0) return c.json({ error: `"${p.name}" cannot be bought with cash` }, 400)
     if (ptype === 'financing' && p.financing_enabled === 0) return c.json({ error: `"${p.name}" is not available on financing` }, 400)
-    // Financing requires a verified farmer (TransUnion/KYC), same as single apply.
+    // Financing requires a verified farmer (credit assessment/KYC), same as single apply.
     if (ptype === 'financing' && custRow?.kyc_status !== 'verified') {
       return c.json({
         error: 'kyc_required',
-        message: 'Complete registration (TransUnion credit check, ID upload, and liveness verification) before equipment financing purchases.',
+        message: 'Complete registration (credit assessment, ID upload, and liveness verification) before equipment financing purchases.',
         customer_id: custId,
         product_name: p.name
       }, 412)
@@ -2206,6 +2298,94 @@ app.get('/api/murabaha/:id', requireAuth, async (c) => {
   const { results: repayments } = await c.env.DB.prepare(`SELECT * FROM repayments WHERE contract_id=? ORDER BY installment_no`).bind(id).all()
   const { results: txns } = await c.env.DB.prepare(`SELECT * FROM transactions WHERE contract_id=? ORDER BY id`).bind(id).all()
   return c.json({ contract, repayments, transactions: txns })
+})
+// ----------------------------------------------------------------------------
+// AGREEMENT RENDER  (Feature 2b / 2c)
+//   Assemble a fully-populated, styled sale agreement for a specific contract:
+//     • resolves the correct template by the contract's payment path
+//       (cash | financing type_key)
+//     • auto-populates the Transaction Details table from the farmer's
+//       registration data + the checkout / contract summary
+//     • returns the overview header, details rows, and terms body plus the
+//       default styling so the client can render + export a PDF.
+//   Readable by the owning farmer, the placing agent, and authorized staff.
+// ----------------------------------------------------------------------------
+app.get('/api/murabaha/:id/agreement', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const id = c.req.param('id')
+  const contract = await withAdminContext(c, async () => await c.env.DB.prepare(
+    `SELECT mc.*, p.name AS product_name, p.unit, p.sku, p.financing_type_key AS product_financing_type_key,
+            cu.full_name AS customer_name, cu.national_id, cu.county, cu.mobile AS customer_mobile, cu.user_id AS customer_user_id
+       FROM murabaha_contracts mc
+       JOIN products p ON p.id = mc.product_id
+       JOIN customers cu ON cu.id = mc.customer_id
+      WHERE mc.id = ?`
+  ).bind(id).first<any>())
+  if (!contract) return c.json({ error: 'Not found' }, 404)
+  // Access control: farmer who owns it, the placing agent, or authorized staff.
+  const isOwnerFarmer = user.role === 'customer' && String(contract.customer_user_id) === String(user.id)
+  const isPlacingAgent = user.role === 'agent' && String(contract.agent_id) === String(user.id)
+  const isStaff = ['admin', 'super_admin', 'operations_finance'].includes(user.role) ||
+    hasVisibility(user, 'view_cash_sales') || hasVisibility(user, 'view_financed_sales') || canManageFinanceConfig(user)
+  if (!isOwnerFarmer && !isPlacingAgent && !isStaff) return c.json({ error: 'Forbidden' }, 403)
+
+  // Resolve the payment path → template key.
+  //   cash → 'cash'; otherwise the product's financing_type_key, else the model.
+  const pathKey = contract.payment_type === 'cash'
+    ? 'cash'
+    : (contract.product_financing_type_key || contract.financing_model || 'loan_interest')
+  let template = await c.env.DB.prepare(`SELECT * FROM agreement_templates WHERE path_key=?`).bind(pathKey).first<any>()
+  if (!template) template = await c.env.DB.prepare(`SELECT * FROM agreement_templates WHERE path_key=?`).bind(contract.payment_type === 'cash' ? 'cash' : 'loan_interest').first<any>()
+  const style = normalizeAgreementStyle(safeJson(template?.style_json, {}))
+
+  // Resolve a human label for the financing type (for the title fallback).
+  let typeLabel = contract.payment_type === 'cash' ? 'Cash' : 'Financing'
+  if (contract.payment_type !== 'cash') {
+    const ft = await c.env.DB.prepare(`SELECT label FROM financing_types WHERE type_key=?`).bind(pathKey).first<any>()
+    if (ft?.label) typeLabel = ft.label
+  }
+  const title = template?.title || `${typeLabel.toUpperCase()} SALE AGREEMENT`
+
+  const money = (v: any) => 'KES ' + roundMoney(numberVal(v, 0)).toLocaleString()
+  const costPrice = roundMoney(numberVal(contract.supplier_cost, 0))
+  const salePrice = roundMoney(numberVal(contract.murabaha_price, 0))
+  const profit = roundMoney(salePrice - costPrice)
+  // Transaction Details table — auto-populated from registration + checkout.
+  const details: Array<{ label: string; value: string }> = [
+    { label: 'Agreement Reference', value: String(contract.contract_ref || `#${contract.id}`) },
+    { label: 'Date', value: new Date(contract.created_at || Date.now()).toLocaleDateString() },
+    { label: 'Farmer Name', value: String(contract.customer_name || '—') },
+    { label: 'National ID', value: String(contract.national_id || '—') },
+    { label: 'County', value: String(contract.county || '—') },
+    { label: 'Mobile', value: String(contract.customer_mobile || '—') },
+    { label: 'Financed Asset', value: `${contract.product_name || '—'}${contract.sku ? ` (${contract.sku})` : ''}` },
+    { label: 'Quantity', value: `${numberVal(contract.quantity, 1)} ${contract.unit || 'unit'}` },
+    { label: 'Payment Channel', value: contract.payment_type === 'cash' ? 'Cash' : typeLabel },
+    { label: 'Cost Price', value: money(costPrice) }
+  ]
+  if (contract.payment_type !== 'cash') {
+    details.push({ label: 'Profit / Markup', value: money(profit) })
+    details.push({ label: 'Selling Price', value: money(salePrice) })
+    details.push({ label: 'Deposit', value: money(contract.deposit_amount) })
+    details.push({ label: 'Financed Amount', value: money(contract.finance_principal) })
+    details.push({ label: 'Installments', value: `${numberVal(contract.installment_amount, 0) ? money(contract.installment_amount) : '—'} × ${numberVal(contract.term_months, 0)} (${contract.payment_frequency || 'monthly'})` })
+    details.push({ label: 'Total Payable', value: money(numberVal(contract.deposit_amount, 0) + numberVal(contract.outstanding, contract.murabaha_price)) })
+  } else {
+    details.push({ label: 'Selling Price', value: money(salePrice) })
+    details.push({ label: 'Amount Payable', value: money(salePrice) })
+  }
+
+  return c.json({
+    contract_id: contract.id,
+    path_key: pathKey,
+    type_label: typeLabel,
+    title,
+    overview_html: template?.overview_html || '',
+    body_html: template?.body_html || contract.terms_text || '',
+    terms_document_url: contract.terms_document_url || null,
+    details,
+    style
+  })
 })
 app.post('/api/murabaha/:id/decision', requireAuth, requireRole('admin', 'super_admin', 'operations_finance'), async (c) => {
   const id = c.req.param('id')
@@ -3977,6 +4157,153 @@ app.put('/api/settings/financing-markup', requireAuth, requirePermission('manage
 app.put('/api/settings/markup', requireAuth, requirePermission('manage_markup_pct'), saveFinancingMarkup)
 
 // ----------------------------------------------------------------------------
+// DYNAMIC FINANCING TYPES  (Feature 2a-ii)
+//   Super-admins / authorized users can create, edit and remove custom
+//   financing types. Any active type is automatically selectable during
+//   inventory listing and drives which agreement template is used at checkout.
+// ----------------------------------------------------------------------------
+// Who may manage financing types / agreement templates.
+function canManageFinanceConfig(user: SessionUser) {
+  return user.role === 'admin' || user.role === 'super_admin' ||
+    hasPermission(user, 'can_manage_finance_settings') || hasPermission(user, 'manage_markup_pct')
+}
+function slugifyKey(s: string): string {
+  return String(s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60)
+}
+// List financing types. Any authenticated user may read (needed to render the
+// checkout / inventory dropdowns); only active ones are returned unless ?all=1.
+app.get('/api/financing-types', requireAuth, async (c) => {
+  const includeAll = c.req.query('all') === '1'
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, type_key, label, description, charge_mode, is_system, active, sort_order
+       FROM financing_types ${includeAll ? '' : 'WHERE active = 1'}
+      ORDER BY sort_order, label`
+  ).all()
+  const user = c.get('user') as SessionUser
+  return c.json({ financing_types: results, can_manage: canManageFinanceConfig(user) })
+})
+app.post('/api/financing-types', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageFinanceConfig(user)) return c.json({ error: 'Forbidden' }, 403)
+  let b: any
+  try { b = await c.req.json() } catch (_) { return c.json({ error: 'Invalid request body' }, 400) }
+  const label = cleanText(b.label, 80)
+  if (!label) return c.json({ error: 'A label is required.' }, 400)
+  const type_key = slugifyKey(b.type_key || label)
+  if (!type_key) return c.json({ error: 'A valid type key could not be derived from the label.' }, 400)
+  const charge_mode = ['percentage', 'fixed', 'none'].includes(String(b.charge_mode)) ? String(b.charge_mode) : 'percentage'
+  const description = cleanText(b.description, 400)
+  const sort_order = Math.round(numberVal(b.sort_order, 100))
+  const active = boolInt(b.active, true) ? 1 : 0
+  const dup = await c.env.DB.prepare(`SELECT id FROM financing_types WHERE type_key=?`).bind(type_key).first<any>()
+  if (dup) return c.json({ error: `A financing type with key "${type_key}" already exists.` }, 409)
+  const r = await c.env.DB.prepare(
+    `INSERT INTO financing_types (type_key,label,description,charge_mode,is_system,active,sort_order,created_by)
+     VALUES (?,?,?,?,0,?,?,?)`
+  ).bind(type_key, label, description, charge_mode, active, sort_order, String(user.id)).run()
+  // Auto-seed a default agreement template for the new type so checkout has one.
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO agreement_templates (path_key,title,overview_html,body_html,updated_by)
+       VALUES (?,?,?,?,?) ON CONFLICT (path_key) DO NOTHING`
+    ).bind(type_key, `${label.toUpperCase()} SALE AGREEMENT`,
+      `<p>This ${label} Sale Agreement is made between Farmsky and the purchasing farmer for the asset described below.</p>`,
+      `<p>The buyer agrees to the ${label} repayment terms disclosed at checkout until the outstanding balance is fully settled.</p>`,
+      String(user.id)).run()
+  } catch (_) {}
+  await audit(c, user.id, 'create', 'financing_type', `${label} (${type_key})`)
+  return c.json({ ok: true, id: r.meta.last_row_id, type_key })
+})
+app.put('/api/financing-types/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageFinanceConfig(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const existing = await c.env.DB.prepare(`SELECT * FROM financing_types WHERE id=?`).bind(id).first<any>()
+  if (!existing) return c.json({ error: 'Not found' }, 404)
+  let b: any
+  try { b = await c.req.json() } catch (_) { return c.json({ error: 'Invalid request body' }, 400) }
+  const label = cleanText(b.label, 80) || existing.label
+  const charge_mode = ['percentage', 'fixed', 'none'].includes(String(b.charge_mode)) ? String(b.charge_mode) : existing.charge_mode
+  const description = b.description !== undefined ? cleanText(b.description, 400) : existing.description
+  const sort_order = b.sort_order !== undefined ? Math.round(numberVal(b.sort_order, existing.sort_order)) : existing.sort_order
+  const active = b.active !== undefined ? (boolInt(b.active, true) ? 1 : 0) : existing.active
+  // type_key is immutable once created (products reference it). label/desc/etc are editable.
+  await c.env.DB.prepare(
+    `UPDATE financing_types SET label=?, description=?, charge_mode=?, active=?, sort_order=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`
+  ).bind(label, description, charge_mode, active, sort_order, id).run()
+  await audit(c, user.id, 'update', 'financing_type', `${label} (${existing.type_key})`)
+  return c.json({ ok: true })
+})
+app.delete('/api/financing-types/:id', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  if (!canManageFinanceConfig(user)) return c.json({ error: 'Forbidden' }, 403)
+  const id = c.req.param('id')
+  const existing = await c.env.DB.prepare(`SELECT * FROM financing_types WHERE id=?`).bind(id).first<any>()
+  if (!existing) return c.json({ error: 'Not found' }, 404)
+  if (Number(existing.is_system) === 1) return c.json({ error: 'System financing types cannot be removed; you can deactivate them instead.' }, 400)
+  const inUse = await c.env.DB.prepare(`SELECT COUNT(*)::int n FROM products WHERE financing_type_key=?`).bind(existing.type_key).first<any>()
+  if (inUse?.n > 0) return c.json({ error: `Cannot remove: ${inUse.n} product(s) still use this financing type. Deactivate it instead.` }, 400)
+  await c.env.DB.prepare(`DELETE FROM financing_types WHERE id=?`).bind(id).run()
+  await audit(c, user.id, 'delete', 'financing_type', `${existing.label} (${existing.type_key})`)
+  return c.json({ ok: true })
+})
+
+// ----------------------------------------------------------------------------
+// AGREEMENT TEMPLATES  (Feature 2b — templating engine)
+//   path_key = 'cash' | any financing_types.type_key.
+//   Three configurable parts: title, overview_html (dynamic header),
+//   body_html (terms & body). style_json holds default styling overrides.
+// ----------------------------------------------------------------------------
+const DEFAULT_AGREEMENT_STYLE = { font_family: 'Calibri', font_size_pt: 12, line_height: 1.5, text_align: 'justify' }
+function normalizeAgreementStyle(raw: any) {
+  const s: any = { ...DEFAULT_AGREEMENT_STYLE, ...(raw && typeof raw === 'object' ? raw : {}) }
+  s.font_family = String(s.font_family || 'Calibri').slice(0, 60)
+  s.font_size_pt = numberVal(s.font_size_pt, 12)
+  s.line_height = numberVal(s.line_height, 1.5)
+  s.text_align = ['justify', 'left', 'right', 'center'].includes(String(s.text_align)) ? String(s.text_align) : 'justify'
+  return s
+}
+app.get('/api/agreement-templates', requireAuth, async (c) => {
+  const user = c.get('user') as SessionUser
+  const { results } = await c.env.DB.prepare(
+    `SELECT id, path_key, title, overview_html, body_html, style_json, updated_at FROM agreement_templates ORDER BY path_key`
+  ).all()
+  const templates = (results as any[]).map((t) => ({ ...t, style: normalizeAgreementStyle(safeJson(t.style_json, {})) }))
+  return c.json({ agreement_templates: templates, default_style: DEFAULT_AGREEMENT_STYLE, can_manage: canManageFinanceConfig(user) })
+})
+// Fetch a single template by path_key (used by checkout to render terms).
+app.get('/api/agreement-templates/:path_key', requireAuth, async (c) => {
+  const pk = c.req.param('path_key')
+  const t = await c.env.DB.prepare(`SELECT * FROM agreement_templates WHERE path_key=?`).bind(pk).first<any>()
+  if (!t) return c.json({ error: 'Not found' }, 404)
+  return c.json({ template: { ...t, style: normalizeAgreementStyle(safeJson(t.style_json, {})) } })
+})
+async function upsertAgreementTemplate(c: any, pathKey: string) {
+  const user = c.get('user') as SessionUser
+  if (!canManageFinanceConfig(user)) return c.json({ error: 'Forbidden' }, 403)
+  let b: any
+  try { b = await c.req.json() } catch (_) { return c.json({ error: 'Invalid request body' }, 400) }
+  const title = cleanText(b.title, 200) || `${pathKey.toUpperCase()} SALE AGREEMENT`
+  // overview_html / body_html are rich text; cap generously and strip control chars.
+  const overview_html = b.overview_html !== undefined ? String(b.overview_html).slice(0, 100000) : null
+  const body_html = b.body_html !== undefined ? String(b.body_html).slice(0, 200000) : null
+  const style_json = JSON.stringify(normalizeAgreementStyle(b.style))
+  const existing = await c.env.DB.prepare(`SELECT id FROM agreement_templates WHERE path_key=?`).bind(pathKey).first<any>()
+  if (existing) {
+    await c.env.DB.prepare(
+      `UPDATE agreement_templates SET title=?, overview_html=COALESCE(?, overview_html), body_html=COALESCE(?, body_html), style_json=?, updated_by=?, updated_at=CURRENT_TIMESTAMP WHERE path_key=?`
+    ).bind(title, overview_html, body_html, style_json, String(user.id), pathKey).run()
+  } else {
+    await c.env.DB.prepare(
+      `INSERT INTO agreement_templates (path_key,title,overview_html,body_html,style_json,updated_by) VALUES (?,?,?,?,?,?)`
+    ).bind(pathKey, title, overview_html || '', body_html || '', style_json, String(user.id)).run()
+  }
+  await audit(c, user.id, 'update', 'agreement_template', pathKey)
+  return c.json({ ok: true, path_key: pathKey })
+}
+app.put('/api/agreement-templates/:path_key', requireAuth, async (c) => upsertAgreementTemplate(c, c.req.param('path_key')))
+
+// ----------------------------------------------------------------------------
 // WITHDRAWAL CHARGE + SUPPORT CONTACT SETTINGS
 //   • withdrawal_charge : the standard withdrawal charge schema (flat + %).
 //   • support_contact   : phone/email shown when SasaPay main wallet is short.
@@ -4032,14 +4359,14 @@ app.post('/api/settings/quick-product', requireAuth, async (c) => {
   if (dup) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,subcategory,marketplace,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,transunion_product_code,created_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,subcategory,marketplace,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       p.sku, p.name, p.category, p.subcategory, p.marketplace, sourcePlatform, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
-      p.cash_price, p.credit_price, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
-      p.payment_option_mode, p.financing_model, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
-      p.financing_term_max_months, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-      p.cash_terms_doc_url, p.financing_terms_doc_url, p.transunion_product_code, user.id
+      p.cash_price, p.credit_price, p.cash_price_mode, p.cash_markup_amount, p.credit_price_mode, p.credit_markup_amount, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
+      p.payment_option_mode, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
+      p.financing_term_max_months, p.financing_tenure_unit, p.financing_rate_per_cycle, p.financing_amount_per_cycle, p.financing_cycle_count, p.financing_cycle_length_days, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
+      p.cash_terms_doc_url, p.financing_terms_doc_url, user.id
     ).run()
     await audit(c, user.id, 'create', 'product', `${p.name} (via settings builder, ${p.marketplace}/${sourcePlatform})`)
     return c.json({ id: r.meta.last_row_id, product: { id: r.meta.last_row_id, sku: p.sku, name: p.name, category: p.category, marketplace: p.marketplace, quantity: p.quantity } })
