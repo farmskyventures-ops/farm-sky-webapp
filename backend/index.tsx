@@ -246,12 +246,14 @@ function isSafeDataUrlOrHttp(value: any): boolean {
     return false
   }
 }
-// Agreement documents may be an image (jpg/png/webp/gif) OR a PDF, uploaded as a
-// data: URL, or a plain https URL to an already-hosted file. Same 8 MB cap and
-// magic-byte sniff as images, but PDFs are additionally accepted here (they are
-// NOT allowed for images/avatars). This blocks executables, HTML/SVG-with-script
-// and other malicious payloads from being stored and served back later.
-const ALLOWED_DOC_MIME = [...ALLOWED_IMAGE_MIME, 'application/pdf']
+// Agreement documents may be an image (jpg/png/webp/gif), a PDF, OR a Word
+// document (.doc / .docx), uploaded as a data: URL, or a plain https URL to an
+// already-hosted file. Same 8 MB cap and magic-byte sniff as images, but PDFs
+// and Word docs are additionally accepted here (they are NOT allowed for
+// images/avatars). This blocks executables, HTML/SVG-with-script and other
+// malicious payloads from being stored and served back later.
+const WORD_DOC_MIME = ['application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document']
+const ALLOWED_DOC_MIME = [...ALLOWED_IMAGE_MIME, 'application/pdf', ...WORD_DOC_MIME]
 const MAX_DOC_BYTES = 8 * 1024 * 1024 // 8 MB per document
 function isSafeDocDataUrlOrHttp(value: any): boolean {
   if (typeof value !== 'string' || !value) return false
@@ -272,7 +274,12 @@ function isSafeDocDataUrlOrHttp(value: any): boolean {
     const isGif = bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46
     const isWebp = bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46
     const isPdf = bytes[0] === 0x25 && bytes[1] === 0x50 && bytes[2] === 0x44 && bytes[3] === 0x46 // %PDF
-    return isJpeg || isPng || isGif || isWebp || isPdf
+    // .docx (and other OOXML) are ZIP containers → magic "PK\x03\x04".
+    const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04
+    // Legacy .doc is an OLE2 compound file → magic D0 CF 11 E0.
+    const isOle2 = bytes[0] === 0xd0 && bytes[1] === 0xcf && bytes[2] === 0x11 && bytes[3] === 0xe0
+    const wantsWord = WORD_DOC_MIME.includes(mime)
+    return isJpeg || isPng || isGif || isWebp || isPdf || (wantsWord && (isZip || isOle2))
   } catch (_) {
     return false
   }
@@ -522,6 +529,9 @@ function normalizeProductPayload(b: any) {
   const cycleCount = Math.max(0, Math.round(numberVal(b.financing_cycle_count, 0)))
   const cycleLengthDays = Math.max(1, Math.round(numberVal(b.financing_cycle_length_days, 30)))
   const financingTypeKey = cleanText(b.financing_type_key, 60)
+  // Agreement source mode per payment path — 'upload' or 'editor' (default).
+  const cashAgreementSource = String(b.cash_agreement_source) === 'upload' ? 'upload' : 'editor'
+  const financingAgreementSource = String(b.financing_agreement_source) === 'upload' ? 'upload' : 'editor'
   const paymentMode = b.payment_option_mode || (boolInt(b.cash_enabled, true) && boolInt(b.financing_enabled, true) ? 'both' : boolInt(b.cash_enabled, true) ? 'cash' : 'financing')
   // Storefront section (marketplace) + permanent source tag. `marketplace` is the
   // shopping section a product shows under (equipment | feeds | inputs); it is
@@ -564,10 +574,15 @@ function normalizeProductPayload(b: any) {
     financing_term_max_months: numberVal(b.financing_term_max_months, 12),
     cash_deposit_pct: numberVal(b.cash_deposit_pct, 100),
     financing_deposit_pct: numberVal(b.financing_deposit_pct, 10),
-    cash_terms_text: b.cash_terms_text || null,
-    financing_terms_text: b.financing_terms_text || null,
-    cash_terms_doc_url: b.cash_terms_doc_url || null,
-    financing_terms_doc_url: b.financing_terms_doc_url || null,
+    // Agreement source mode per payment path: 'upload' (a stored PDF/Word doc)
+    // or 'editor' (typed rich-text). We keep only the representation that
+    // matches the chosen mode so checkout renders unambiguously.
+    cash_agreement_source: cashAgreementSource,
+    financing_agreement_source: financingAgreementSource,
+    cash_terms_text: cashAgreementSource === 'upload' ? null : (b.cash_terms_text || null),
+    financing_terms_text: financingAgreementSource === 'upload' ? null : (b.financing_terms_text || null),
+    cash_terms_doc_url: cashAgreementSource === 'editor' ? null : (b.cash_terms_doc_url || null),
+    financing_terms_doc_url: financingAgreementSource === 'editor' ? null : (b.financing_terms_doc_url || null),
     financing_tenure_unit: tenureUnit,
     financing_rate_per_cycle: ratePerCycle,
     financing_amount_per_cycle: amountPerCycle,
@@ -1543,7 +1558,7 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
   for (const [field, label] of [['cash_terms_doc_url', 'Cash agreement'], ['financing_terms_doc_url', 'Financing agreement']] as const) {
     const v = (p as any)[field]
     if (v && !isSafeDocDataUrlOrHttp(v)) {
-      return c.json({ error: `${label} document must be a PDF or image under 8 MB.` }, 400)
+      return c.json({ error: `${label} document must be a PDF, Word (.doc/.docx) or image under 8 MB.` }, 400)
     }
   }
   // Permanent source tag: default to this app (equipment); allow an explicit,
@@ -1571,14 +1586,14 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
   const financeSetBy = canFinance ? user.id : null
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,subcategory,marketplace,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,created_by,finance_status,finance_set_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,subcategory,marketplace,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source,created_by,finance_status,finance_set_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       p.sku, p.name, p.category, p.subcategory, p.marketplace, sourcePlatform, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
       p.cash_price, p.credit_price, p.cash_price_mode, p.cash_markup_amount, p.credit_price_mode, p.credit_markup_amount, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
       p.payment_option_mode, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
       p.financing_term_max_months, p.financing_tenure_unit, p.financing_rate_per_cycle, p.financing_amount_per_cycle, p.financing_cycle_count, p.financing_cycle_length_days, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-      p.cash_terms_doc_url, p.financing_terms_doc_url, user.id, financeStatus, financeSetBy
+      p.cash_terms_doc_url, p.financing_terms_doc_url, p.cash_agreement_source, p.financing_agreement_source, user.id, financeStatus, financeSetBy
     ).run()
     await audit(c, user.id, 'create', 'product', `${p.name} (${financeStatus}, ${p.marketplace}/${sourcePlatform})`)
     return c.json({ id: r.meta.last_row_id, finance_status: financeStatus, marketplace: p.marketplace, source_platform: sourcePlatform })
@@ -1605,7 +1620,7 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
   // Validate uploaded image / agreement documents before touching the DB.
   if (canInv) {
     if (p.image && !isSafeDataUrlOrHttp(p.image)) return c.json({ error: 'Product image must be a JPEG, PNG, WebP or GIF under 8 MB.' }, 400)
-    if (p.cash_terms_doc_url && !isSafeDocDataUrlOrHttp(p.cash_terms_doc_url)) return c.json({ error: 'Cash agreement document must be a PDF or image under 8 MB.' }, 400)
+    if (p.cash_terms_doc_url && !isSafeDocDataUrlOrHttp(p.cash_terms_doc_url)) return c.json({ error: 'Cash agreement document must be a PDF, Word (.doc/.docx) or image under 8 MB.' }, 400)
     // A changed SKU must remain unique.
     if (p.sku && p.sku !== existing.sku) {
       const dup = await c.env.DB.prepare(`SELECT id FROM products WHERE sku = ? AND id <> ?`).bind(p.sku, id).first<any>()
@@ -1613,7 +1628,7 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
     }
   }
   if (canFinance && p.financing_terms_doc_url && !isSafeDocDataUrlOrHttp(p.financing_terms_doc_url)) {
-    return c.json({ error: 'Financing agreement document must be a PDF or image under 8 MB.' }, 400)
+    return c.json({ error: 'Financing agreement document must be a PDF, Word (.doc/.docx) or image under 8 MB.' }, 400)
   }
   // Choose which columns the editor is allowed to change. (source_platform is the
   // PERMANENT origin tag and is never editable.)
@@ -1621,12 +1636,12 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
     sku: p.sku, name: p.name, category: p.category, subcategory: p.subcategory, marketplace: p.marketplace, description: p.description, product_type: p.product_type,
     buying_price: p.buying_price, cash_markup_pct: p.cash_markup_pct, cash_price: p.cash_price, cash_price_mode: p.cash_price_mode, cash_markup_amount: p.cash_markup_amount,
     quantity: p.quantity, unit: p.unit, reorder_threshold: p.reorder_threshold, image: p.image || existing.image,
-    cash_enabled: p.cash_enabled, cash_deposit_pct: p.cash_deposit_pct, cash_terms_text: p.cash_terms_text, cash_terms_doc_url: p.cash_terms_doc_url
+    cash_enabled: p.cash_enabled, cash_deposit_pct: p.cash_deposit_pct, cash_terms_text: p.cash_terms_text, cash_terms_doc_url: p.cash_terms_doc_url, cash_agreement_source: p.cash_agreement_source
   } : {
     sku: existing.sku, name: existing.name, category: existing.category, subcategory: existing.subcategory, marketplace: existing.marketplace, description: existing.description, product_type: existing.product_type,
     buying_price: existing.buying_price, cash_markup_pct: existing.cash_markup_pct, cash_price: existing.cash_price, cash_price_mode: existing.cash_price_mode, cash_markup_amount: existing.cash_markup_amount,
     quantity: existing.quantity, unit: existing.unit, reorder_threshold: existing.reorder_threshold, image: existing.image,
-    cash_enabled: existing.cash_enabled, cash_deposit_pct: existing.cash_deposit_pct, cash_terms_text: existing.cash_terms_text, cash_terms_doc_url: existing.cash_terms_doc_url
+    cash_enabled: existing.cash_enabled, cash_deposit_pct: existing.cash_deposit_pct, cash_terms_text: existing.cash_terms_text, cash_terms_doc_url: existing.cash_terms_doc_url, cash_agreement_source: existing.cash_agreement_source
   }
   const finCols = canFinance ? {
     credit_markup_pct: p.credit_markup_pct, credit_price: p.credit_price, credit_price_mode: p.credit_price_mode, credit_markup_amount: p.credit_markup_amount, financing_enabled: p.financing_enabled,
@@ -1634,7 +1649,7 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
     financing_term_min_months: p.financing_term_min_months, financing_term_max_months: p.financing_term_max_months,
     financing_tenure_unit: p.financing_tenure_unit, financing_rate_per_cycle: p.financing_rate_per_cycle, financing_amount_per_cycle: p.financing_amount_per_cycle,
     financing_cycle_count: p.financing_cycle_count, financing_cycle_length_days: p.financing_cycle_length_days,
-    financing_deposit_pct: p.financing_deposit_pct, financing_terms_text: p.financing_terms_text, financing_terms_doc_url: p.financing_terms_doc_url,
+    financing_deposit_pct: p.financing_deposit_pct, financing_terms_text: p.financing_terms_text, financing_terms_doc_url: p.financing_terms_doc_url, financing_agreement_source: p.financing_agreement_source,
     payment_option_mode: p.payment_option_mode, finance_status: 'published', finance_set_by: user.id
   } : {
     credit_markup_pct: existing.credit_markup_pct, credit_price: existing.credit_price, credit_price_mode: existing.credit_price_mode, credit_markup_amount: existing.credit_markup_amount, financing_enabled: existing.financing_enabled,
@@ -1642,18 +1657,18 @@ app.put('/api/products/:id', requireAuth, requirePermission('can_manage_inventor
     financing_term_min_months: existing.financing_term_min_months, financing_term_max_months: existing.financing_term_max_months,
     financing_tenure_unit: existing.financing_tenure_unit, financing_rate_per_cycle: existing.financing_rate_per_cycle, financing_amount_per_cycle: existing.financing_amount_per_cycle,
     financing_cycle_count: existing.financing_cycle_count, financing_cycle_length_days: existing.financing_cycle_length_days,
-    financing_deposit_pct: existing.financing_deposit_pct, financing_terms_text: existing.financing_terms_text, financing_terms_doc_url: existing.financing_terms_doc_url,
+    financing_deposit_pct: existing.financing_deposit_pct, financing_terms_text: existing.financing_terms_text, financing_terms_doc_url: existing.financing_terms_doc_url, financing_agreement_source: existing.financing_agreement_source,
     payment_option_mode: existing.payment_option_mode, finance_status: existing.finance_status, finance_set_by: existing.finance_set_by
   }
   try {
     await c.env.DB.prepare(
-      `UPDATE products SET sku=?, name=?, category=?, subcategory=?, marketplace=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, cash_price_mode=?, cash_markup_amount=?, credit_price_mode=?, credit_markup_amount=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_type_key=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, financing_tenure_unit=?, financing_rate_per_cycle=?, financing_amount_per_cycle=?, financing_cycle_count=?, financing_cycle_length_days=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
+      `UPDATE products SET sku=?, name=?, category=?, subcategory=?, marketplace=?, description=?, product_type=?, buying_price=?, cash_markup_pct=?, credit_markup_pct=?, cash_price=?, credit_price=?, cash_price_mode=?, cash_markup_amount=?, credit_price_mode=?, credit_markup_amount=?, quantity=?, unit=?, reorder_threshold=?, image=COALESCE(?, image), cash_enabled=?, financing_enabled=?, payment_option_mode=?, financing_model=?, financing_type_key=?, financing_interest_pct=?, financing_frequency=?, financing_term_min_months=?, financing_term_max_months=?, financing_tenure_unit=?, financing_rate_per_cycle=?, financing_amount_per_cycle=?, financing_cycle_count=?, financing_cycle_length_days=?, cash_deposit_pct=?, financing_deposit_pct=?, cash_terms_text=?, financing_terms_text=?, cash_terms_doc_url=?, financing_terms_doc_url=?, cash_agreement_source=?, financing_agreement_source=?, finance_status=?, finance_set_by=?, finance_set_at=CASE WHEN ?='published' THEN CURRENT_TIMESTAMP ELSE finance_set_at END WHERE id=?`
     ).bind(
       coreCols.sku, coreCols.name, coreCols.category, coreCols.subcategory, coreCols.marketplace, coreCols.description, coreCols.product_type, coreCols.buying_price, coreCols.cash_markup_pct, finCols.credit_markup_pct,
       coreCols.cash_price, finCols.credit_price, coreCols.cash_price_mode, coreCols.cash_markup_amount, finCols.credit_price_mode, finCols.credit_markup_amount, coreCols.quantity, coreCols.unit, coreCols.reorder_threshold, coreCols.image || null, coreCols.cash_enabled, finCols.financing_enabled,
       finCols.payment_option_mode, finCols.financing_model, finCols.financing_type_key, finCols.financing_interest_pct, finCols.financing_frequency, finCols.financing_term_min_months,
       finCols.financing_term_max_months, finCols.financing_tenure_unit, finCols.financing_rate_per_cycle, finCols.financing_amount_per_cycle, finCols.financing_cycle_count, finCols.financing_cycle_length_days, coreCols.cash_deposit_pct, finCols.financing_deposit_pct, coreCols.cash_terms_text, finCols.financing_terms_text,
-      coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
+      coreCols.cash_terms_doc_url, finCols.financing_terms_doc_url, coreCols.cash_agreement_source, finCols.financing_agreement_source, finCols.finance_status, finCols.finance_set_by, finCols.finance_status, id
     ).run()
   } catch (err: any) {
     const msg = String(err?.message || err)
@@ -2463,6 +2478,9 @@ app.get('/api/murabaha/:id/agreement', requireAuth, async (c) => {
     overview_html: template?.overview_html || '',
     body_html: template?.body_html || contract.terms_text || '',
     terms_document_url: contract.terms_document_url || null,
+    // 'upload' when an uploaded PDF/Word doc backs this agreement, else 'editor'
+    // (typed rich-text). Lets checkout render the correct representation.
+    body_source: contract.terms_document_url ? 'upload' : 'editor',
     details,
     style
   })
@@ -4453,21 +4471,21 @@ app.post('/api/settings/quick-product', requireAuth, async (c) => {
   if (!p.sku || !p.name) return c.json({ error: 'SKU and name are required' }, 400)
   if (!(p.buying_price >= 0) || !(p.cash_price >= 0) || !(p.credit_price >= 0)) return c.json({ error: 'Prices must be valid non-negative numbers.' }, 400)
   if (p.image && !isSafeDataUrlOrHttp(p.image)) return c.json({ error: 'Product image must be a JPEG, PNG, WebP or GIF under 8 MB.' }, 400)
-  if (p.cash_terms_doc_url && !isSafeDocDataUrlOrHttp(p.cash_terms_doc_url)) return c.json({ error: 'Cash agreement document must be a PDF or image under 8 MB.' }, 400)
-  if (p.financing_terms_doc_url && !isSafeDocDataUrlOrHttp(p.financing_terms_doc_url)) return c.json({ error: 'Financing agreement document must be a PDF or image under 8 MB.' }, 400)
+  if (p.cash_terms_doc_url && !isSafeDocDataUrlOrHttp(p.cash_terms_doc_url)) return c.json({ error: 'Cash agreement document must be a PDF, Word (.doc/.docx) or image under 8 MB.' }, 400)
+  if (p.financing_terms_doc_url && !isSafeDocDataUrlOrHttp(p.financing_terms_doc_url)) return c.json({ error: 'Financing agreement document must be a PDF, Word (.doc/.docx) or image under 8 MB.' }, 400)
   const sourcePlatform = VALID_SOURCE_PLATFORMS.includes(String(raw?.source_platform || '').toLowerCase()) ? String(raw.source_platform).toLowerCase() : 'equipment'
   const dup = await c.env.DB.prepare(`SELECT id FROM products WHERE sku = ?`).bind(p.sku).first<any>()
   if (dup) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
   try {
     const r = await c.env.DB.prepare(
-      `INSERT INTO products (sku,name,category,subcategory,marketplace,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,created_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO products (sku,name,category,subcategory,marketplace,source_platform,description,product_type,supplier_id,buying_price,cash_markup_pct,credit_markup_pct,cash_price,credit_price,cash_price_mode,cash_markup_amount,credit_price_mode,credit_markup_amount,quantity,unit,reorder_threshold,image,cash_enabled,financing_enabled,payment_option_mode,financing_model,financing_type_key,financing_interest_pct,financing_frequency,financing_term_min_months,financing_term_max_months,financing_tenure_unit,financing_rate_per_cycle,financing_amount_per_cycle,financing_cycle_count,financing_cycle_length_days,cash_deposit_pct,financing_deposit_pct,cash_terms_text,financing_terms_text,cash_terms_doc_url,financing_terms_doc_url,cash_agreement_source,financing_agreement_source,created_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(
       p.sku, p.name, p.category, p.subcategory, p.marketplace, sourcePlatform, p.description, p.product_type, p.supplier_id, p.buying_price, p.cash_markup_pct, p.credit_markup_pct,
       p.cash_price, p.credit_price, p.cash_price_mode, p.cash_markup_amount, p.credit_price_mode, p.credit_markup_amount, p.quantity, p.unit, p.reorder_threshold, p.image, p.cash_enabled, p.financing_enabled,
       p.payment_option_mode, p.financing_model, p.financing_type_key, p.financing_interest_pct, p.financing_frequency, p.financing_term_min_months,
       p.financing_term_max_months, p.financing_tenure_unit, p.financing_rate_per_cycle, p.financing_amount_per_cycle, p.financing_cycle_count, p.financing_cycle_length_days, p.cash_deposit_pct, p.financing_deposit_pct, p.cash_terms_text, p.financing_terms_text,
-      p.cash_terms_doc_url, p.financing_terms_doc_url, user.id
+      p.cash_terms_doc_url, p.financing_terms_doc_url, p.cash_agreement_source, p.financing_agreement_source, user.id
     ).run()
     await audit(c, user.id, 'create', 'product', `${p.name} (via settings builder, ${p.marketplace}/${sourcePlatform})`)
     return c.json({ id: r.meta.last_row_id, product: { id: r.meta.last_row_id, sku: p.sku, name: p.name, category: p.category, marketplace: p.marketplace, quantity: p.quantity } })
