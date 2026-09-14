@@ -56,6 +56,43 @@ A demo lending platform for agriculture & livestock. Customers buy farm inputs
   hour range). Access is blocked outside the configured window.
 - **Payments**: M-Pesa and SasaPay only (with brand logos). KCB Buni is hidden
   from the front-end user.
+- **Dynamic pricing & agreements per inventory item**: cash and financed prices
+  each support **Percentage markup / Fixed-amount markup / Manual selling price**
+  (chosen from a dropdown), plus flexible **tenure** (Monthly / Yearly / Custom
+  cycle). Agreements are supplied per payment path via a dropdown — **Upload
+  document** (PDF or Word `.doc/.docx`, stored and rendered at checkout) or
+  **Type agreement** (built-in rich-text editor) — shown at checkout for digital
+  acceptance or offline download & signing.
+- **Reassign customer/user between agents** (RBAC permission
+  `manage_customer_reassignment`): Super-Admins/authorized users transfer a
+  farmer from one agent to another. The new agent instantly gains view +
+  transaction rights; the former agent is fully revoked. Every transfer is
+  logged to `customer_reassignments` (timestamp, performer, former + new agent,
+  customer) plus the audit trail.
+- **Quick Communication Action Buttons**: every onboarded user/customer row has
+  **Call / Email / Text (SMS) / WhatsApp** buttons that open the device dialer,
+  mail client, SMS app or WhatsApp with the number/address pre-filled. **Smart
+  routing** — for a *customer*, the buttons load the contact of the **assigned
+  agent** currently managing them; with a safe fallback to the **general support
+  pool / Super-Admin queue** when no agent is assigned. API payloads expose only
+  the whitelisted contact fields (`phone`, `whatsapp`, `email`) — no internal
+  metadata (data masking).
+- **Sales & Support CRM (Ticketing)** — a multi-role module (Super-Admin, Admin,
+  Agent, Support, Operations & any role granted `view_crm` / `manage_crm`):
+  - Create tickets on behalf of users/customers with detailed descriptions;
+    linking a customer auto-routes the ticket to their assigned agent.
+  - **Configurable categories/headers** (Sales, Technical, Payments, Agronomy +
+    custom), with a Super-Admin **configuration dashboard** to assign the
+    users/teams that handle each category (`manage_ticket_categories`).
+  - **Global search** (customer name, phone, email, ticket ID or keyword) and
+    **dynamic filters** (Status, Category, Assigned agent, Priority).
+  - **Actionable ticket view**: a timeline of previous notes, current status and
+    last handler; **Quick Resolve** (with resolution notes) and **Escalate**
+    (reassign to a higher tier, change priority, route with an internal note).
+  - **RBAC & security**: users/agents only see tickets in their assigned
+    categories (or assigned to / created by them); every request validates the
+    caller's role — no direct object reference. All search inputs are handled
+    with parameterized/ORM queries to prevent injection.
 
 ## Configuration (env)
 All integrations are env-driven — at deploy you just **copy-paste** the
@@ -77,6 +114,17 @@ tokens into `.env` (see `.env.example` for step-by-step instructions):
 - **Default tenant** (shared central DB): `EQUIPMENT_ORG_ID` / `DEFAULT_ORG_ID` —
   the `organizations.id` assigned to users created without a creating admin
   (public signup / bulk import). Falls back to most-populated → oldest org.
+
+### Environment variables for the CRM & Quick-Communication features
+**None are required.** These features add no new environment variables:
+- The **Quick Communication buttons** use the device's native URI schemes on the
+  client — `tel:` (dialer), `mailto:` (mail), `sms:` (messaging) and
+  `https://wa.me/<number>` (WhatsApp). They pre-fill the number/address in the
+  user's own apps and need no server-side gateway or key.
+- The **Sales & Support CRM** is fully database-backed (tables added by the
+  auto-applied migration) and reuses the existing auth/RBAC — no extra secrets.
+- The optional per-user **WhatsApp number** is stored on the `users` /
+  `customers` records and defaults to the phone number when unset.
 
 ## Test credentials
 | Role | Phone | Password |
