@@ -93,6 +93,31 @@ A demo lending platform for agriculture & livestock. Customers buy farm inputs
     categories (or assigned to / created by them); every request validates the
     caller's role — no direct object reference. All search inputs are handled
     with parameterized/ORM queries to prevent injection.
+- **Field Visit & Conversion Workflow** (`manage_field_visits`) — field agents
+  capture interactions with prospective clients during field operations, then
+  convert prospects into onboarded users triggering automated onboarding:
+  - **Log a Field Visit** with: Visit Details (Date, Location/Market/Town,
+    Notes), Contact Info (Prospect Name, Phone), and a **Farm/Business Profile**
+    dropdown — **Farming** or **AgSME (Business)**. When *Farming*, a *Type of
+    farming* dropdown reveals a **Livestock** profile (Type = Dairy/Poultry/Pig/
+    Beef/Fish, current number, stage of production cycle, maximum capacity, feed
+    brand, current buying price, distributor, bags per week) **or** a **Crop**
+    profile (type, acreage, stage, buying price, distributor, volumes per cycle,
+    plus a multi-row **"Add Input"** capture of Category → Name, e.g. Fertilizer
+    → DAP). The rich conditional profile is stored as JSON so the schema stays
+    stable.
+  - **List view** of every prospect spoken to, filterable by Prospect /
+    Converted, each with a **Convert** button (and a read-only detail view).
+  - **Convert** opens the standard onboarding form **prefilled** from the
+    captured prospect data (only remaining profile fields are requested). On
+    submit the prospect becomes a customer **with a login account**; the field
+    visit is marked *converted* and linked to the new customer.
+  - **Automated onboarding credentials by SMS** — converted users receive their
+    **Phone Number + a first-time OTP password** by SMS (reusing the existing
+    OTP/temp-password lifecycle: `must_change_password`, 2FA on first login).
+  - **RBAC & scoping**: available under the Super-Admin permission panel and
+    assignable to any user; **agents see only the visits they logged**, while
+    Super-Admins/Admins have global visibility. Granted to agents by default.
 
 ## Configuration (env)
 All integrations are env-driven — at deploy you just **copy-paste** the
@@ -125,6 +150,12 @@ tokens into `.env` (see `.env.example` for step-by-step instructions):
   auto-applied migration) and reuses the existing auth/RBAC — no extra secrets.
 - The optional per-user **WhatsApp number** is stored on the `users` /
   `customers` records and defaults to the phone number when unset.
+- The **Field Visit & Conversion Workflow** is fully database-backed (the
+  `field_visits` table + `manage_field_visits` permission are added by the
+  auto-applied migration `0037_field_visits.sql`). Conversion SMS credentials
+  reuse the **existing SMS OTP gateway** (`SMS_API_TOKEN` / `SMS_SENDER_ID`
+  above — blank falls back to on-screen demo OTP). **No new environment
+  variables are required.**
 
 ## Test credentials
 | Role | Phone | Password |
