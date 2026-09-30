@@ -54,8 +54,24 @@ A demo lending platform for agriculture & livestock. Customers buy farm inputs
   Financial Data, Document Attachments — Front/Back ID & passport photo).
 - **Time-Based Access Control**: per-role or per-user login windows (active days +
   hour range). Access is blocked outside the configured window.
-- **Payments**: M-Pesa and SasaPay only (with brand logos). KCB Buni is hidden
-  from the front-end user.
+- **Payments**: M-Pesa, SasaPay and **KCB (Buni)** at checkout (with brand logos).
+  Selecting **KCB** presents a secondary choice — **M-Pesa STK Push** (collect into
+  the sale) or **Funds Transfer** (routed to the dashboard Transactions module).
+- **KCB Buni Bank Transfers & Transactions** (`manage_transactions`, **KYC-gated**):
+  a dedicated dashboard module for **Account-to-Account** (internal KCB),
+  **Inter-Bank** (RTGS / EFT / PesaLink to any participating bank via the KCB
+  participant codes), **Mobile-Money Wallet** (KCB → M-Pesa) and **Currency
+  Conversion** transfers. Access is restricted server-side to users who hold the
+  permission **and** are KYC-verified. Built on the spec-compliant KCB Buni
+  `FundsTransferAPIService` (OAuth2 client-credentials, correct endpoints/headers),
+  with graceful live-or-simulation fallback.
+- **KCB Buni Instant Payment Notification (IPN)**: real-time account / till /
+  validation notifications from KCB, with **SHA256withRSA signature verification**
+  (`signature` header, KCB public key) enforced before any payload is accepted.
+- **Central gateway routing**: all Feed & Score payment/transfer calls route
+  through the Equipment gateway (`/api/v1/payments/*`) with HMAC signing, replay
+  protection and idempotency — now including `/funds-transfer`, `/callbacks/buni`,
+  `/callbacks/funds-transfer` and `/ipn/{account,till,validate}`.
 - **Dynamic pricing & agreements per inventory item**: cash and financed prices
   each support **Percentage markup / Fixed-amount markup / Manual selling price**
   (chosen from a dropdown), plus flexible **tenure** (Monthly / Yearly / Custom
@@ -125,6 +141,19 @@ tokens into `.env` (see `.env.example` for step-by-step instructions):
 - **M-Pesa Daraja STK Push**: `MPESA_*` — sandbox defaults pre-filled; paste your
   sandbox Consumer Key/Secret to test, or leave blank for simulation. STK push
   is used for **both cash checkout and Pay Later (Murabaha) repayments**.
+- **KCB Buni (STK Push · Funds Transfer · IPN)** — all optional; blank = simulation:
+  - `BUNI_CLIENT_ID`, `BUNI_CLIENT_SECRET` — OAuth2 client-credentials (from the
+    Buni developer portal application). Enables STK Push.
+  - `BUNI_ENV` — `sandbox`/`uat` for the UAT host, else production.
+  - `BUNI_SHARED_SHORTCODE` — defaults `true` (KCB shared paybill 522533). Set
+    `false` and supply `BUNI_ORG_SHORTCODE` + `BUNI_ORG_PASSKEY` for your own code.
+  - `BUNI_STK_CALLBACK_URL` — HTTPS endpoint M-Pesa posts STK results to
+    (defaults to the gateway's own `/api/v1/payments/callbacks/buni`).
+  - `BUNI_DEBIT_ACCOUNT`, `BUNI_COMPANY_CODE`, `BUNI_FT_CALLBACK_URL` — enable the
+    **Funds Transfer** module (money moves FROM this KCB account).
+  - `BUNI_IPN_PUBLIC_KEY` — the RSA **public key** (PEM) KCB provides; required in
+    production so inbound **IPN** payloads are signature-verified (SHA256withRSA).
+    When unset, IPN runs in sandbox/simulation mode (accepts unsigned for testing).
 - **SMS OTP — TalkSASA** (`talksasa.com`): paste `SMS_API_TOKEN` + `SMS_SENDER_ID`
   (your Safaricom-registered NameID). Endpoint defaults automatically. Blank = demo
   mode (OTP shown on screen).
