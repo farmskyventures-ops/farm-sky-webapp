@@ -180,6 +180,14 @@ function hasPermission(user: SessionUser, perm: string) {
   if (['super_admin', 'admin'].includes(user.role)) return true
   return Boolean(user.permissions?.[perm])
 }
+// Strict permission check: true ONLY when the flag is explicitly set on the user
+// (no blanket admin/super-admin override). For actions that must be exclusively
+// available to explicitly-assigned users (e.g. Sales Manual Reconciliation).
+// Super-Admins receive the flag explicitly via migration 0042, so they qualify;
+// a plain admin without the grant does not.
+function hasExplicitPermission(user: SessionUser, perm: string) {
+  return user?.permissions?.[perm] === true
+}
 // Visibility permissions are opt-out: absent key = allowed (backward compatible),
 // explicit false = hidden. Admins always allowed.
 function hasVisibility(user: SessionUser, perm: string) {
@@ -780,7 +788,7 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
   if (!token) return null
   const row = await c.env.DB.prepare(
     `SELECT u.id, u.full_name, u.phone, u.email, u.avatar_url, u.role, u.region, u.label, u.permissions, u.status,
-            u.schedule_enabled, u.access_days, u.access_start, u.access_end, s.expires_at
+            u.inventory_is_merchant, u.schedule_enabled, u.access_days, u.access_start, u.access_end, s.expires_at
      FROM sessions s JOIN users u ON CAST(u.id AS TEXT) = s.user_id WHERE s.token = ?`
   ).bind(token).first<any>()
   if (!row) return null
@@ -817,7 +825,8 @@ async function getSessionUser(c: any): Promise<SessionUser | null> {
     role: row.role,
     region: row.region,
     label: row.label || null,
-    permissions: parsePermissions(row.permissions, row.role, fallback)
+    permissions: parsePermissions(row.permissions, row.role, fallback),
+    inventory_is_merchant: Boolean(Number(row.inventory_is_merchant))
   }
 }
 // Declare the executing user's identity + capabilities inside the DB session so
@@ -868,6 +877,16 @@ function requirePermission(...perms: string[]) {
   return async (c: any, next: any) => {
     const user = c.get('user') as SessionUser
     if (!perms.some((perm) => hasPermission(user, perm))) return c.json({ error: 'Forbidden' }, 403)
+    await next()
+  }
+}
+// Like requirePermission but STRICT: requires the permission flag to be explicitly
+// set on the user (no blanket admin/super-admin pass). Use for actions that must
+// be exclusively accessible to users specifically assigned the capability.
+function requireExplicitPermission(...perms: string[]) {
+  return async (c: any, next: any) => {
+    const user = c.get('user') as SessionUser
+    if (!perms.some((perm) => hasExplicitPermission(user, perm))) return c.json({ error: 'Forbidden' }, 403)
     await next()
   }
 }
@@ -1566,9 +1585,14 @@ app.post('/api/products', requireAuth, requirePermission('can_manage_inventory')
   // Permanent source tag: default to this app (equipment); allow an explicit,
   // whitelisted override so inventory managers can list into a merchant/feed/
   // mazao marketplace from the admin destination buttons.
-  const sourcePlatform = VALID_SOURCE_PLATFORMS.includes(String(raw?.source_platform || '').toLowerCase())
-    ? String(raw.source_platform).toLowerCase()
-    : 'equipment'
+  // Merchant inventory users: if the creating user was flagged as a Merchant
+  // inventory source during onboarding, every product they create is PERMANENTLY
+  // tagged source_platform='merchant' (the marketplace category split is kept).
+  const sourcePlatform = user.inventory_is_merchant
+    ? 'merchant'
+    : (VALID_SOURCE_PLATFORMS.includes(String(raw?.source_platform || '').toLowerCase())
+      ? String(raw.source_platform).toLowerCase()
+      : 'equipment')
   // Reject a duplicate SKU up front with a clear 409 instead of a raw 500 from
   // the UNIQUE(sku) constraint (this was the reported crash on product upload).
   const dup = await c.env.DB.prepare(`SELECT id FROM products WHERE sku = ?`).bind(p.sku).first<any>()
@@ -4348,7 +4372,7 @@ app.put('/api/agents/:id', requireAuth, requireRole('admin', 'super_admin'), asy
 app.get('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c) => {
   const caller = c.get('user') as SessionUser
   const callerIsSuper = isSuperAdmin(caller)
-  const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, whatsapp, email, role, label, permissions, status, region, schedule_enabled, access_days, access_start, access_end, created_at FROM users ORDER BY id`).all()
+  const { results } = await c.env.DB.prepare(`SELECT id, full_name, phone, whatsapp, email, role, label, permissions, status, region, inventory_is_merchant, schedule_enabled, access_days, access_start, access_end, created_at FROM users ORDER BY id`).all()
   const usersWithPerms = [] as any[]
   for (const u of results as any[]) {
     // Super-Admin credential/profile data is visible ONLY to Super-Admins.
@@ -4356,7 +4380,7 @@ app.get('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (c
     // OTHER Super-Admin account is withheld entirely.
     if (String(u.role || '').toLowerCase() === 'super_admin' && !callerIsSuper && String(u.id) !== String(caller.id)) continue
     const fallback = await loadRoleTemplate(c, u.role)
-    usersWithPerms.push({ ...u, email: isPlaceholderEmail(u.email) ? '' : u.email, permissions: parsePermissions(u.permissions, u.role, fallback), access_days: safeJson(u.access_days, []) })
+    usersWithPerms.push({ ...u, email: isPlaceholderEmail(u.email) ? '' : u.email, permissions: parsePermissions(u.permissions, u.role, fallback), inventory_is_merchant: Boolean(Number(u.inventory_is_merchant)), access_days: safeJson(u.access_days, []) })
   }
   return c.json({ users: usersWithPerms })
 })
@@ -4410,6 +4434,11 @@ app.post('/api/users', requireAuth, requireRole('admin', 'super_admin'), async (
     ? await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by, org_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId, orgId).run()
     : await c.env.DB.prepare(`INSERT INTO users (full_name, phone, email, password, role, label, permissions, status, region, password_set, schedule_enabled, access_days, access_start, access_end, created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(b.full_name, p, email, await hashPassword(pwd), b.role, label, JSON.stringify(perms), b.status || 'active', b.region || null, provided, schedEnabled, schedDays, b.access_start || null, b.access_end || null, creatorId).run()
   if (b.role === 'agent') await c.env.DB.prepare(`INSERT INTO agents (user_id,region,permissions) VALUES (?,?,?)`).bind(r.meta.last_row_id, b.region || null, JSON.stringify(perms)).run()
+  // Merchant inventory source flag — only meaningful when the user can manage
+  // inventory; stored regardless so it's preserved if the permission is granted
+  // later, but only honoured when can_manage_inventory is set.
+  const isMerchantInv = (boolInt(b.inventory_is_merchant, false) && !!perms.can_manage_inventory) ? 1 : 0
+  await c.env.DB.prepare(`UPDATE users SET inventory_is_merchant=? WHERE id=?`).bind(isMerchantInv, r.meta.last_row_id).run()
   // Optional WhatsApp number for the quick-communication buttons (defaults to
   // the phone number when omitted).
   await c.env.DB.prepare(`UPDATE users SET whatsapp=? WHERE id=?`).bind(cleanText(b.whatsapp, 40) || p, r.meta.last_row_id).run()
@@ -4439,6 +4468,11 @@ app.put('/api/users/:id', requireAuth, requireRole('admin', 'super_admin'), asyn
     await c.env.DB.prepare(`UPDATE users SET full_name=?, phone=?, email=?, role=?, label=?, permissions=?, region=?, schedule_enabled=?, access_days=?, access_start=?, access_end=? WHERE id=?`).bind(b.full_name, b.phone, email, b.role, b.label || null, JSON.stringify(perms), b.region, schedEnabled, schedDays, b.access_start || null, b.access_end || null, id).run()
   }
   if (b.whatsapp !== undefined) await c.env.DB.prepare(`UPDATE users SET whatsapp=? WHERE id=?`).bind(cleanText(b.whatsapp, 40) || b.phone || null, id).run()
+  // Merchant inventory source flag (only honoured when can_manage_inventory set).
+  if (b.inventory_is_merchant !== undefined) {
+    const isMerchantInv = (boolInt(b.inventory_is_merchant, false) && !!perms.can_manage_inventory) ? 1 : 0
+    await c.env.DB.prepare(`UPDATE users SET inventory_is_merchant=? WHERE id=?`).bind(isMerchantInv, id).run()
+  }
   if (b.role === 'agent') {
     const exists = await c.env.DB.prepare(`SELECT user_id FROM agents WHERE user_id=?`).bind(id).first<any>()
     if (exists) await c.env.DB.prepare(`UPDATE agents SET region=?, permissions=? WHERE user_id=?`).bind(b.region || null, JSON.stringify(perms), id).run()
@@ -5270,7 +5304,9 @@ app.post('/api/settings/quick-product', requireAuth, async (c) => {
   if (p.image && !isSafeDataUrlOrHttp(p.image)) return c.json({ error: 'Product image must be a JPEG, PNG, WebP or GIF under 8 MB.' }, 400)
   if (p.cash_terms_doc_url && !isSafeDocDataUrlOrHttp(p.cash_terms_doc_url)) return c.json({ error: 'Cash agreement document must be a PDF, Word (.doc/.docx) or image under 8 MB.' }, 400)
   if (p.financing_terms_doc_url && !isSafeDocDataUrlOrHttp(p.financing_terms_doc_url)) return c.json({ error: 'Financing agreement document must be a PDF, Word (.doc/.docx) or image under 8 MB.' }, 400)
-  const sourcePlatform = VALID_SOURCE_PLATFORMS.includes(String(raw?.source_platform || '').toLowerCase()) ? String(raw.source_platform).toLowerCase() : 'equipment'
+  const sourcePlatform = user.inventory_is_merchant
+    ? 'merchant'
+    : (VALID_SOURCE_PLATFORMS.includes(String(raw?.source_platform || '').toLowerCase()) ? String(raw.source_platform).toLowerCase() : 'equipment')
   const dup = await c.env.DB.prepare(`SELECT id FROM products WHERE sku = ?`).bind(p.sku).first<any>()
   if (dup) return c.json({ error: `A product with SKU "${p.sku}" already exists. Use a unique SKU.` }, 409)
   try {
@@ -5847,7 +5883,7 @@ app.get('/api/documents/:type/:id', requireAuth, async (c) => {
 // the transaction + invoice rows, advances the status lifecycle and generates a
 // receipt identical to the automated one.
 // ----------------------------------------------------------------------------
-app.post('/api/murabaha/:id/manual-reconcile', requireAuth, requirePermission('sales_manual_reconciliation'), async (c) => {
+app.post('/api/murabaha/:id/manual-reconcile', requireAuth, requireExplicitPermission('sales_manual_reconciliation'), async (c) => {
   const id = c.req.param('id')
   const body = await c.req.json().catch(() => ({})) as any
   const txnCode = String(body.transaction_code || body.reference || '').trim()
