@@ -211,6 +211,13 @@ function numberVal(value: any, fallback = 0) {
   const n = Number(value)
   return Number.isFinite(n) ? n : fallback
 }
+// NULL-preserving numeric parse: returns null for an absent/blank value (so an
+// un-configured field is stored as NULL, not a default), else the parsed number.
+function numOrNull(value: any): number | null {
+  if (value === undefined || value === null || String(value).trim() === '') return null
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
 function boolInt(value: any, fallback = true) {
   if (value === undefined || value === null || value === '') return fallback
   if (typeof value === 'boolean') return value
@@ -577,13 +584,17 @@ function normalizeProductPayload(b: any) {
     payment_option_mode: paymentMode,
     // "Show buyer" supplier-cost/markup visibility toggle (default hidden).
     show_buyer: boolInt(b.show_buyer, false),
-    financing_model: b.financing_model || 'loan_interest',
-    financing_interest_pct: numberVal(b.financing_interest_pct, 0),
+    // Financing parameters are NULL-preserving: when a value was not supplied
+    // (un-configured product) we keep it null instead of substituting a default,
+    // so the UI shows no phantom financing terms until financing is explicitly
+    // configured. Only legitimately-entered values (including 0) are stored.
+    financing_model: b.financing_model || null,
+    financing_interest_pct: numOrNull(b.financing_interest_pct),
     financing_frequency: b.financing_frequency || 'monthly',
     financing_term_min_months: numberVal(b.financing_term_min_months, 3),
     financing_term_max_months: numberVal(b.financing_term_max_months, 12),
     cash_deposit_pct: numberVal(b.cash_deposit_pct, 100),
-    financing_deposit_pct: numberVal(b.financing_deposit_pct, 10),
+    financing_deposit_pct: numOrNull(b.financing_deposit_pct),
     // Agreement source mode per payment path: 'upload' (a stored PDF/Word doc)
     // or 'editor' (typed rich-text). We keep only the representation that
     // matches the chosen mode so checkout renders unambiguously.

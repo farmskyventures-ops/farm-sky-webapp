@@ -60,6 +60,20 @@ function btnReset(target) {
 window.btnLoading = btnLoading
 window.btnReset = btnReset
 // Friendly labels for equipment payment types
+// Render a financing fact ONLY when it was actually configured. Unset/blank
+// values (null / undefined / '') render as a dash — never a 0 / default
+// placeholder — so newly-added, un-configured products don't show phantom terms.
+const finFactValue = (v, suffix = '') => {
+  if (v === null || v === undefined || v === '' || Number.isNaN(Number(v))) return '—'
+  return `${Number(v)}${suffix}`
+}
+// Parse a numeric form field, returning null for a blank/empty input so
+// un-configured financing fields persist as NULL rather than a 0 default.
+const _numOrNull = (v) => {
+  if (v === null || v === undefined || String(v).trim() === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
 const payLabel = (t, model) => {
   if (t === 'financing') {
     return model === 'paygo'
@@ -1818,16 +1832,18 @@ window.buyModal = async (productId) => {
       </div>
       <div><label class="font-medium">Delivery Location</label><input id="dloc" type="text" placeholder="Village / Ward" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
     </div>
-    <!-- Cash-only facts (shown only when Cash is selected) -->
+    <!-- Cash-only facts (shown only when Cash is selected). The "Purchase type:
+         Outright cash" label is intentionally NOT shown to the buyer. -->
     <div id="cashFacts" class="responsive-grid cols-2 mt-3 text-xs hidden">
       <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Cash deposit requirement</div><div class="font-semibold mt-1">${Number(p.cash_deposit_pct ?? 100)}%</div></div>
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Purchase type</div><div class="font-semibold mt-1">Outright cash</div></div>
     </div>
-    <!-- Financing-only facts (shown only when Financing is selected) -->
+    <!-- Financing-only facts (shown only when Financing is selected). Values are
+         only rendered when actually configured on the product — unconfigured
+         fields stay blank (no 10% / Normal / 0% placeholders). -->
     <div id="finFacts" class="responsive-grid cols-2 mt-3 text-xs hidden">
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing deposit requirement</div><div class="font-semibold mt-1">${Number(p.financing_deposit_pct ?? 10)}%</div></div>
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing model</div><div class="font-semibold mt-1">${p.financing_model === 'paygo' ? 'PAYGO / M-KOPA-style' : 'Normal financing'}</div></div>
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Interest / finance rate</div><div class="font-semibold mt-1">${Number(p.financing_interest_pct || 0)}%</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing deposit requirement</div><div class="font-semibold mt-1">${finFactValue(p.financing_deposit_pct, '%')}</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Financing model</div><div class="font-semibold mt-1">${p.financing_model ? (p.financing_model === 'paygo' ? 'PAYGO / M-KOPA-style' : 'Normal financing') : '—'}</div></div>
+      <div class="bg-slate-50 border border-slate-200 rounded-lg p-3"><div class="text-slate-500">Interest / finance rate</div><div class="font-semibold mt-1">${finFactValue(p.financing_interest_pct, '%')}</div></div>
     </div>
     <div id="quoteBox" class="mt-4"></div>
     <div class="flex gap-2 mt-5">
@@ -1855,7 +1871,7 @@ window.getQuote = async (productId) => {
     <div class="bg-teal-50 border border-teal-200 rounded-xl p-4">
       <h4 class="font-bold text-teal-800 mb-2"><i class="fas fa-file-invoice-dollar mr-1"></i>Payment Summary</h4>
       <div class="space-y-1 text-sm">
-        <div class="flex justify-between"><span>Purchase type</span><b>${payLabel(data.payment_type, data.financing_model)}</b></div>
+        ${financing ? `<div class="flex justify-between"><span>Purchase type</span><b>${payLabel(data.payment_type, data.financing_model)}</b></div>` : ''}
         ${(data.show_buyer || (state.user && state.user.role !== 'customer')) ? `<div class="flex justify-between"><span>Supplier cost</span><b>${fmt(data.supplier_cost)}</b></div>` : ''}
         <div class="flex justify-between"><span>Deposit required</span><b>${data.deposit_pct}% (${fmt(data.deposit_amount)})</b></div>
         <div class="flex justify-between"><span>Amount due now</span><b>${fmt(data.amount_due_now)}</b></div>
@@ -1872,7 +1888,7 @@ window.getQuote = async (productId) => {
       <p class="text-xs text-teal-700 mt-2 italic">${esc(data.disclosure_note || '')}</p>
       ${data.terms_text ? `<div class="mt-3 text-xs text-slate-600 bg-white/70 rounded-lg p-3 border border-teal-100"><b>Terms summary:</b> ${esc(data.terms_text)}</div>` : ''}
       ${data.terms_document_url ? `<p class="mt-2 text-xs"><a href="${esc(data.terms_document_url)}" target="_blank" class="text-teal-700 underline">Open uploaded agreement</a></p>` : ''}
-      <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="consent"> I consent to these configured cash / financing terms.</label>
+      <label class="flex items-center gap-2 mt-3 text-sm"><input type="checkbox" id="consent"> ${financing ? 'I agree to the following Financing terms.' : 'I agree to the Cash terms.'}</label>
       <button onclick="submitBuy(${productId})" class="btn w-full mt-3 brand-bg text-white py-2.5 rounded-lg text-sm">${financing ? 'Submit Financing Application' : 'Confirm Cash Purchase'}</button>
     </div>`
 }
@@ -2873,11 +2889,12 @@ function productForm(prefix, p = {}) {
         <option value="">Loading types…</option>
       </select></div>
       <div><label class="field-label">Financing model (legacy)</label><select id="${prefix}_fin_model" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
-        <option value="loan_interest" ${(p.financing_model || 'loan_interest') === 'loan_interest' ? 'selected' : ''}>Normal financing with interest</option>
-        <option value="paygo" ${(p.financing_model || '') === 'paygo' ? 'selected' : ''}>PAYGO</option>
+        <option value="" ${!p.financing_model ? 'selected' : ''}>— not configured —</option>
+        <option value="loan_interest" ${p.financing_model === 'loan_interest' ? 'selected' : ''}>Normal financing with interest</option>
+        <option value="paygo" ${p.financing_model === 'paygo' ? 'selected' : ''}>PAYGO</option>
       </select></div>
-      <div><label class="field-label">Interest / finance rate %</label><input id="${prefix}_int" ${finDis} type="number" value="${Number(p.financing_interest_pct || 0)}" placeholder="Interest rate %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" ${finDis} type="number" value="${Number(p.financing_deposit_pct ?? 10)}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div><label class="field-label">Interest / finance rate %</label><input id="${prefix}_int" ${finDis} type="number" value="${p.financing_interest_pct ?? ''}" placeholder="Interest rate %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
+      <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" ${finDis} type="number" value="${p.financing_deposit_pct ?? ''}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
       <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-white">
         <div class="font-medium text-slate-700 mb-2 text-sm"><i class="fas fa-calendar-days text-teal-600 mr-1"></i>Tenure &amp; repayment schedule</div>
         <div class="responsive-grid cols-2">
@@ -3065,9 +3082,11 @@ function productPayload(prefix) {
     credit_price_mode: ($(prefix + '_credit_mode') || {}).value || 'percentage',
     credit_markup_amount: Number(($(prefix + '_credit_amt') || {}).value || 0),
     credit_price: Number(($(prefix + '_credit_price') || {}).value || 0),
-    financing_model: $(prefix + '_fin_model').value,
+    financing_model: $(prefix + '_fin_model').value || null,
     financing_type_key: ($(prefix + '_fin_type') || {}).value || null,
-    financing_interest_pct: Number($(prefix + '_int').value || 0),
+    // Blank financing fields persist as NULL (not a 0 / default) so an
+    // un-configured product shows no phantom financing terms downstream.
+    financing_interest_pct: _numOrNull($(prefix + '_int').value),
     financing_frequency: $(prefix + '_freq').value,
     financing_term_min_months: Number($(prefix + '_tmin').value || 3),
     financing_term_max_months: Number($(prefix + '_tmax').value || 12),
@@ -3078,7 +3097,7 @@ function productPayload(prefix) {
     financing_cycle_count: Number(($(prefix + '_cycle_count') || {}).value || 0),
     financing_cycle_length_days: Number(($(prefix + '_cycle_len') || {}).value || 30),
     cash_deposit_pct: Number($(prefix + '_cash_dep').value || 100),
-    financing_deposit_pct: Number($(prefix + '_fin_dep').value || 10),
+    financing_deposit_pct: _numOrNull($(prefix + '_fin_dep').value),
     // Agreement source mode + the matching representation (rich-text from the
     // editor, or the uploaded PDF/Word doc data URL).
     cash_agreement_source: ($(prefix + '_cash_ag_src') || {}).value || 'editor',
