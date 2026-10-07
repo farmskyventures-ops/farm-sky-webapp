@@ -1665,21 +1665,24 @@ window.checkoutCart = async () => {
   const items = _cart.map(x => ({ product_id: x.id, quantity: x.qty, payment_type: x.payment_type, term_months: x.term_months }))
   const body = { items, delivery_location: '', consent: true }
   if (_buyFor) body.customer_id = _buyFor.id
-  // KYC GATE: placing an order requires the buyer to have completed registration.
-  // If they have not, redirect straight to the ID / selfie verification flow
-  // (Screenshot 2) instead of attempting the order. The cart is preserved so the
-  // buyer can finalise the same order right after they finish verifying.
-  try {
-    const check = await api.post('/checkout/kyc-check', _buyFor ? { customer_id: _buyFor.id } : {})
-    if (check.data && !check.data.verified) {
-      toast('Complete registration to place your order.', false)
-      closeModal()
-      // returnToShop=true lands the user back on the shop after verifying, with
-      // their cart intact so they can press "Place an Order" again.
-      return completeRegistration(check.data.customer_id, true)
+  // KYC GATE (classification-aware): KYC is MANDATORY only when the order
+  // contains a FINANCING item. A pure cash order (direct or on-behalf) bypasses
+  // KYC entirely — only a valid phone is required. We pass the cart's payment
+  // classification upstream so the gateway enforces the correct rule.
+  const hasFinancing = _cart.some(x => x.payment_type === 'financing')
+  if (hasFinancing) {
+    try {
+      const check = await api.post('/checkout/kyc-check', { ...(_buyFor ? { customer_id: _buyFor.id } : {}), has_financing: true, items })
+      if (check.data && !check.data.verified) {
+        toast('Complete registration to place a financing order.', false)
+        closeModal()
+        // returnToShop=true lands the user back on the shop after verifying, with
+        // their cart intact so they can press "Place an Order" again.
+        return completeRegistration(check.data.customer_id, true)
+      }
+    } catch (err) {
+      return toast(err.response?.data?.error || 'Could not verify registration status', false)
     }
-  } catch (err) {
-    return toast(err.response?.data?.error || 'Could not verify registration status', false)
   }
   try {
     const { data } = await api.post('/murabaha/apply-bundle', body)
