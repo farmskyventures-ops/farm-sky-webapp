@@ -25,7 +25,11 @@ const TABLES_WITH_NUMERIC_ID = new Set([
   'transunion_checks', 'id_verifications', 'audit_logs', 'tickets', 'otp_codes',
   'payment_intents', 'change_requests',
   'merchant_keys', 'merchant_checkouts',
-  'system_backups', 'import_batches', 'import_rows', 'profile_amendments'
+  'system_backups', 'import_batches', 'import_rows', 'profile_amendments',
+  // Offtake / traceability / logistics (migration 0046).
+  'offtake_contracts', 'offtake_matches', 'aggregation_batches', 'traceability_events',
+  'logistics_vehicles', 'logistics_shipments', 'telemetry_pings',
+  'feature_flags', 'feature_flag_users', 'payment_channels', 'payment_channel_users'
 ])
 
 function convertPlaceholders(sql: string): string {
