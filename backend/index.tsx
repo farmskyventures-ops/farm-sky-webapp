@@ -707,12 +707,33 @@ function normalizeProductPayload(b: any) {
     financing_type_key: financingTypeKey
   }
 }
+// Raised when a required pricing/financing parameter was never explicitly
+// configured by the Super-Admin / authorized lister. Checkout surfaces this as a
+// 422 so NO silent fallback value can ever be booked (requirement: "no fallback
+// defaults; every parameter must be explicitly configured").
+class QuoteConfigError extends Error {
+  code = 'quote_config_missing'
+  product_name?: string
+  constructor(message: string, productName?: string) { super(message); this.product_name = productName }
+}
+// Read a value that MUST be explicitly configured. null/undefined/'' (never set)
+// throws; a real 0 is a valid explicit configuration and is returned as 0.
+function requiredNum(value: any, label: string, productName?: string): number {
+  if (value === null || value === undefined || value === '') {
+    throw new QuoteConfigError(`"${productName || 'This product'}" is missing a required setting: ${label}. Configure it in the product listing / financing settings before it can be sold.`, productName)
+  }
+  const n = Number(value)
+  if (!Number.isFinite(n)) throw new QuoteConfigError(`"${productName || 'This product'}" has an invalid ${label}.`, productName)
+  return n
+}
 function financingQuote(p: any, quantity: any, paymentType: string, termMonths: any, processingFeeCfg?: any) {
   const qty = Math.max(1, numberVal(quantity, 1))
   const supplier_cost = roundMoney(numberVal(p.buying_price) * qty)
   if (paymentType === 'cash') {
-    const total = roundMoney(numberVal(p.cash_price) * qty)
-    const deposit_pct = numberVal(p.cash_deposit_pct, 100)
+    // Cash price and deposit % must both be explicitly configured — no defaults.
+    const unitCash = requiredNum(p.cash_price, 'cash price', p.name)
+    const total = roundMoney(unitCash * qty)
+    const deposit_pct = requiredNum(p.cash_deposit_pct, 'cash deposit %', p.name)
     const amount_due_now = roundMoney(total * deposit_pct / 100)
     return {
       quantity: qty,
@@ -736,26 +757,44 @@ function financingQuote(p: any, quantity: any, paymentType: string, termMonths: 
       terms_document_url: p.cash_terms_doc_url || null
     }
   }
-  const principalBase = roundMoney(numberVal(p.credit_price || p.cash_price) * qty)
-  const deposit_pct = numberVal(p.financing_deposit_pct, 10)
+  // FINANCING — every structural parameter must be EXPLICITLY configured; there
+  // are no silent fallbacks. The financed price (credit_price) and deposit % are
+  // mandatory, and the finance charge must come from EITHER an explicit tenure
+  // model (per-cycle rate/amount + cycle count) OR an explicit legacy interest
+  // model (interest % + term bounds). A financing-enabled product with neither
+  // configured is rejected so an unverified/assumed value can never be booked.
+  const unitCredit = requiredNum(p.credit_price, 'financed (credit) price', p.name)
+  const principalBase = roundMoney(unitCredit * qty)
+  const deposit_pct = requiredNum(p.financing_deposit_pct, 'financing deposit %', p.name)
   const deposit_amount = roundMoney(principalBase * deposit_pct / 100)
   const finance_principal = roundMoney(principalBase - deposit_amount)
-  const interestRate = numberVal(p.financing_interest_pct, 0)
   const model = p.financing_model || 'loan_interest'
   // ---- Flexible tenure resolution ------------------------------------------
-  // The new tenure model (migration 0033) lets an admin describe repayment as
   //   monthly : rate/amount per month + total months
   //   yearly  : rate/amount per year  + total years
   //   custom  : rate/amount per cycle + length of each cycle (days)
-  // A per-cycle rate (%) or amount (money) drives the finance charge. When the
-  // product carries no tenure config we fall back to the legacy month-based
-  // interest model so existing inventory keeps working unchanged.
   const tenureUnit = ['monthly', 'yearly', 'custom'].includes(String(p.financing_tenure_unit)) ? String(p.financing_tenure_unit) : 'monthly'
   const ratePerCycle = numberVal(p.financing_rate_per_cycle, 0)
   const amountPerCycle = numberVal(p.financing_amount_per_cycle, 0)
   const cfgCycleCount = Math.max(0, Math.round(numberVal(p.financing_cycle_count, 0)))
   const cycleLengthDays = Math.max(1, Math.round(numberVal(p.financing_cycle_length_days, tenureUnit === 'yearly' ? 365 : 30)))
-  const usesTenureModel = (ratePerCycle > 0 || amountPerCycle > 0) && cfgCycleCount > 0
+  // Tenure model is "configured" when a cycle count is set (rate/amount may be 0
+  // only if that is the explicit intent, but at least one charge driver or an
+  // explicit zero-interest flag must exist — see validation below).
+  const usesTenureModel = cfgCycleCount > 0 && (ratePerCycle > 0 || amountPerCycle > 0)
+  // Legacy interest model is "configured" when an interest % AND term bounds are
+  // explicitly present (not null). A real 0% is a valid explicit configuration.
+  const hasLegacyInterest = p.financing_interest_pct !== null && p.financing_interest_pct !== undefined && p.financing_interest_pct !== ''
+    && p.financing_term_min_months !== null && p.financing_term_min_months !== undefined && p.financing_term_min_months !== ''
+    && p.financing_term_max_months !== null && p.financing_term_max_months !== undefined && p.financing_term_max_months !== ''
+  // Murabaha products (Feed/Nia style) deliberately carry NO finance charge — the
+  // markup is already baked into credit_price. Equipment honours that when the
+  // model is explicitly murabaha/cash-plus; otherwise a charge model is required.
+  const isNoChargeModel = model === 'murabaha'
+  if (!usesTenureModel && !hasLegacyInterest && !isNoChargeModel) {
+    throw new QuoteConfigError(`"${p.name || 'This product'}" is financing-enabled but has no financing structure configured (set either a per-cycle rate/amount with a cycle count, or an interest % with term bounds). Configure it before it can be financed.`, p.name)
+  }
+  const interestRate = numberVal(p.financing_interest_pct, 0)
   const frequency = p.financing_frequency || (model === 'paygo' ? 'daily' : 'monthly')
 
   let cycle_count: number
@@ -771,12 +810,20 @@ function financingQuote(p: any, quantity: any, paymentType: string, termMonths: 
       : tenureUnit === 'custom' ? Math.max(1, Math.round((cycle_count * cycleLengthDays) / 30))
       : cycle_count
     payment_frequency = tenureUnit === 'yearly' ? 'yearly' : tenureUnit === 'custom' ? 'custom' : 'monthly'
-  } else {
-    // Legacy month-based model.
-    term = Math.max(numberVal(p.financing_term_min_months, 3), Math.min(numberVal(termMonths, numberVal(p.financing_term_min_months, 3)), numberVal(p.financing_term_max_months, 12)))
+  } else if (hasLegacyInterest) {
+    // Explicit legacy month-based interest model.
+    const minT = numberVal(p.financing_term_min_months, 0), maxT = numberVal(p.financing_term_max_months, 0)
+    term = Math.max(minT, Math.min(numberVal(termMonths, minT), maxT))
     cycle_count = frequency === 'daily' ? term * 30 : frequency === 'weekly' ? term * 4 : term
     financing_charge = roundMoney(finance_principal * (interestRate / 100) * (term / 12))
     payment_frequency = frequency
+  } else {
+    // Explicit no-charge Murabaha: markup already in credit_price, zero charge.
+    const minT = numberVal(p.financing_term_min_months, 0), maxT = numberVal(p.financing_term_max_months, 0)
+    term = Math.max(1, Math.max(minT, Math.min(numberVal(termMonths, minT || 1), maxT || minT || 1)))
+    cycle_count = frequency === 'weekly' ? term * 4 : term
+    financing_charge = 0
+    payment_frequency = frequency === 'weekly' ? 'weekly' : 'monthly'
   }
   const installment_count = cycle_count
   // Processing fee is calculated on the amount borrowed (finance principal),
@@ -2328,12 +2375,113 @@ const checkoutQuoteHandler = async (c: any) => {
   if (payment_type === 'cash' && !p.cash_enabled) return c.json({ error: 'Cash purchase is not enabled for this equipment' }, 400)
   if (payment_type !== 'cash' && !p.financing_enabled) return c.json({ error: 'Financing is not enabled for this equipment' }, 400)
   const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
-  const q = financingQuote(p, quantity, payment_type === 'cash' ? 'cash' : 'financing', term_months, feeCfg)
+  let q
+  try { q = financingQuote(p, quantity, payment_type === 'cash' ? 'cash' : 'financing', term_months, feeCfg) }
+  catch (e: any) { if (e instanceof QuoteConfigError) return c.json({ error: 'quote_config_missing', message: e.message, product_name: e.product_name }, 422); throw e }
   // show_buyer gates whether the buyer may see the supplier cost + markup breakdown.
   return c.json({ product: p.name, show_buyer: Number(p.show_buyer) ? 1 : 0, ...q })
 }
 app.post('/api/checkout/quote', requireAuth, checkoutQuoteHandler)
 app.post('/api/murabaha/quote', requireAuth, checkoutQuoteHandler)
+
+// ---------------------------------------------------------------------------
+// CART / CHECKOUT OVERHAUL — authoritative bundle quote + shop discovery.
+//
+// quote-bundle: price EVERY cart line with the SAME financingQuote() the booking
+// path uses, so the cart/order modal shows the EXACT figures that will be booked
+// under Contracts (fixes the cart-vs-contract arithmetic discrepancy). It returns
+// per-line and aggregate cash/financed/grand totals.
+// ---------------------------------------------------------------------------
+const quoteBundleHandler = async (c: any) => {
+  const body = await c.req.json().catch(() => ({})) as any
+  const items = Array.isArray(body.items) ? body.items : []
+  if (!items.length) return c.json({ lines: [], total_cash: 0, total_financed: 0, grand_total: 0 })
+  if (items.length > 50) return c.json({ error: 'Too many items in a single order' }, 400)
+  const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
+  const lines: any[] = []
+  let total_cash = 0, total_financed = 0
+  for (const raw of items) {
+    const p = await withAdminContext(c, async () => await c.env.DB.prepare(`SELECT * FROM products WHERE id=?`).bind(raw?.product_id).first<any>())
+    if (!p) { lines.push({ product_id: raw?.product_id, error: 'Product not found' }); continue }
+    const ptype = raw?.payment_type === 'cash' ? 'cash' : 'financing'
+    const qty = Math.max(1, Number(raw?.quantity) || 1)
+    // Pricing/terms derive ENTIRELY from the product's own listing (its original
+    // marketplace), regardless of which marketplace the cart is opened in.
+    let q
+    try { q = financingQuote(p, qty, ptype, raw?.term_months, feeCfg) }
+    catch (e: any) {
+      if (e instanceof QuoteConfigError) { lines.push({ product_id: p.id, name: p.name, marketplace: p.marketplace || 'equipment', payment_type: ptype, quantity: qty, error: e.message }); continue }
+      throw e
+    }
+    // line_total is the authoritative booked value for this line (what lands in
+    // murabaha_price): cash -> cash_price*qty; financing -> full repayment total.
+    const line_total = roundMoney(numberVal(q.total_payable, 0))
+    if (ptype === 'cash') total_cash = roundMoney(total_cash + line_total)
+    else total_financed = roundMoney(total_financed + line_total)
+    lines.push({
+      product_id: p.id, name: p.name, marketplace: p.marketplace || 'equipment',
+      quantity: qty, payment_type: ptype, term_months: q.term_months,
+      unit_cash_price: roundMoney(numberVal(p.cash_price, 0)),
+      unit_credit_price: roundMoney(numberVal(p.credit_price || p.cash_price, 0)),
+      line_subtotal: roundMoney(numberVal(ptype === 'cash' ? p.cash_price : (p.credit_price || p.cash_price), 0) * qty),
+      deposit_pct: q.deposit_pct, deposit_amount: q.deposit_amount, amount_due_now: q.amount_due_now,
+      finance_principal: q.finance_principal, financing_charge: q.financing_charge || 0,
+      processing_fee: q.processing_fee || 0, installment_amount: q.installment_amount || 0,
+      installment_count: q.installment_count || 0, payment_frequency: q.payment_frequency,
+      interest_rate_pct: q.interest_rate_pct || 0, financing_model: q.financing_model,
+      line_total
+    })
+  }
+  return c.json({ lines, total_cash, total_financed, grand_total: roundMoney(total_cash + total_financed) })
+}
+app.post('/api/checkout/quote-bundle', requireAuth, quoteBundleHandler)
+
+// Frequently purchased: top published products by booked sales volume (sum of
+// contract quantities), falling back to newest stock when there is no history.
+app.get('/api/shop/frequent', requireAuth, async (c) => {
+  const limit = Math.min(20, Math.max(1, Number(c.req.query('limit')) || 10))
+  const mkt = String(c.req.query('marketplace') || '').trim().toLowerCase()
+  const appType = String(c.env.APP_TYPE || 'equipment').toLowerCase() === 'feed' ? 'feed' : 'equipment'
+  const rows = await withAdminContext(c, async () => {
+    const binds: any[] = []
+    let where = `p.finance_status = 'published' AND p.app_scope IN ('${appType}', 'both')`
+    if (['equipment', 'feeds', 'inputs'].includes(mkt)) { where += ` AND p.marketplace = ?`; binds.push(mkt) }
+    // LEFT JOIN so products with no sales still appear (volume 0), ordered by
+    // total booked quantity desc then newest.
+    const sql = `SELECT p.*, COALESCE(SUM(mc.quantity), 0) AS sales_volume, COUNT(mc.id) AS order_count
+                 FROM products p
+                 LEFT JOIN murabaha_contracts mc ON mc.product_id = p.id
+                 WHERE ${where}
+                 GROUP BY p.id
+                 ORDER BY sales_volume DESC, p.id DESC
+                 LIMIT ${limit}`
+    const { results } = await c.env.DB.prepare(sql).bind(...binds).all()
+    return results
+  })
+  const out = (rows as any[]).map((p: any) => ({ ...p, stock_status: p.quantity <= 0 ? 'out_of_stock' : p.quantity <= p.reorder_threshold ? 'low_stock' : 'in_stock' }))
+  return c.json({ products: out })
+})
+
+// Cross-marketplace global search: keyword match aggregated across EVERY
+// marketplace (equipment / feeds / inputs) this app can see, in one grid.
+app.get('/api/shop/search', requireAuth, async (c) => {
+  const qRaw = String(c.req.query('q') || '').trim()
+  if (!qRaw) return c.json({ products: [], query: '' })
+  const limit = Math.min(60, Math.max(1, Number(c.req.query('limit')) || 40))
+  const appType = String(c.env.APP_TYPE || 'equipment').toLowerCase() === 'feed' ? 'feed' : 'equipment'
+  const like = `%${qRaw.toLowerCase().replace(/[%_]/g, (m) => '\\' + m)}%`
+  const rows = await withAdminContext(c, async () => {
+    const sql = `SELECT * FROM products
+                 WHERE finance_status = 'published' AND app_scope IN (?, 'both')
+                   AND (LOWER(name) LIKE ? OR LOWER(COALESCE(category,'')) LIKE ? OR LOWER(COALESCE(subcategory,'')) LIKE ? OR LOWER(COALESCE(description,'')) LIKE ? OR LOWER(COALESCE(marketplace,'')) LIKE ?)
+                 ORDER BY (LOWER(name) LIKE ?) DESC, name
+                 LIMIT ${limit}`
+    const { results } = await c.env.DB.prepare(sql).bind(appType, like, like, like, like, like, like).all()
+    return results
+  })
+  const out = (rows as any[]).map((p: any) => ({ ...p, stock_status: p.quantity <= 0 ? 'out_of_stock' : p.quantity <= p.reorder_threshold ? 'low_stock' : 'in_stock' }))
+  return c.json({ products: out, query: qRaw })
+})
 // Unified checkout APPLY handler (cash + financing). Registered on the clean
 // /api/checkout/apply path AND the legacy /api/murabaha/apply path.
 const checkoutApplyHandler = async (c: any) => {
@@ -2369,7 +2517,9 @@ const checkoutApplyHandler = async (c: any) => {
     }, 412)
   }
   const feeCfg = await getSetting(c, 'processing_fee', DEFAULT_PROCESSING_FEE)
-  const q = financingQuote(p, qty, normalizedPaymentType, term_months, feeCfg)
+  let q
+  try { q = financingQuote(p, qty, normalizedPaymentType, term_months, feeCfg) }
+  catch (e: any) { if (e instanceof QuoteConfigError) return c.json({ error: 'quote_config_missing', message: e.message, product_name: e.product_name }, 422); throw e }
   const contractRef = ref(normalizedPaymentType === 'cash' ? 'CSH' : (q.financing_model === 'paygo' ? 'PGO' : 'FIN'))
   const status = normalizedPaymentType === 'cash'
     ? (q.amount_due_now > 0 ? 'pending_payment' : 'awaiting_cash_balance')
@@ -2517,7 +2667,9 @@ app.post('/api/murabaha/apply-bundle', requireAuth, async (c) => {
         product_name: p.name
       }, 412)
     }
-    const q = financingQuote(p, qty, ptype, raw?.term_months, feeCfg)
+    let q
+    try { q = financingQuote(p, qty, ptype, raw?.term_months, feeCfg) }
+    catch (e: any) { if (e instanceof QuoteConfigError) return c.json({ error: 'quote_config_missing', message: e.message, product_name: e.product_name }, 422); throw e }
     prepared.push({ p, qty, ptype, q })
   }
 
