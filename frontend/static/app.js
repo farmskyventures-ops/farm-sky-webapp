@@ -149,6 +149,126 @@ let _walletWithdrawInfo = null
 let _shopFilter = { marketplace: 'equipment', category: '', subcategory: '' }
 let _cart = []
 let _permMeta = { permissions: [], roles: [] }
+
+// ===========================================================================
+// SYNCHRONOUS CLIENT-SIDE PRICING ENGINE (Part 1.2 / Part 2 Module 1)
+// A faithful mirror of the backend financingQuote() so the cart & checkout can
+// render an INSTANT, deterministic itemized breakdown with ZERO network wait.
+// The server remains authoritative: /checkout/quote-bundle is still called on
+// submit to validate asynchronously, and any divergence/422 blocks the order.
+// Financing RULES are read from the MAPPED loan product (resolveLoanProductLocal)
+// so the client uses the exact same single source of truth as the server.
+// ===========================================================================
+const _round2 = (v) => Math.round((Number(v) || 0) * 100) / 100
+// Processing-fee config cache (mirrors backend getSetting('processing_fee')).
+let _procFeeCfg = { enabled: false, mode: 'percentage', percentage_rate: 0, tiers: [], product_ids: [] }
+function _clientProcessingFee(cfg, borrowed, productId) {
+  const c = cfg || {}
+  if (!c.enabled) return 0
+  if (Array.isArray(c.product_ids) && c.product_ids.length > 0) {
+    const pid = Number(productId)
+    if (!Number.isFinite(pid) || !c.product_ids.includes(pid)) return 0
+  }
+  const amt = Number(borrowed) || 0
+  if (c.mode === 'tiered') { const t = (c.tiers || []).find(t => amt >= t.min && amt <= t.max); return t ? _round2(t.fee) : 0 }
+  return _round2(amt * (Number(c.percentage_rate) || 0) / 100)
+}
+// Merge the mapped loan product's rules onto a product-shaped object (client
+// mirror of resolveLoanProductForProduct). Loan product wins for every rule.
+function resolveLoanProductLocal(p) {
+  if (!p || !p.financing_type_key) return p
+  const lp = (_loanProducts || []).find(x => x.type_key === p.financing_type_key && x.active !== 0)
+  if (!lp) return p
+  const pick = (a, b) => (a === null || a === undefined ? b : a)
+  let fee = null
+  try { fee = lp.processing_fee_json ? JSON.parse(lp.processing_fee_json) : null } catch (_) { fee = null }
+  return Object.assign({}, p, {
+    financing_model: lp.type_key || p.financing_model,
+    financing_interest_pct: pick(lp.interest_pct, p.financing_interest_pct),
+    financing_deposit_pct: pick(lp.deposit_pct, p.financing_deposit_pct),
+    financing_term_min_months: pick(lp.term_min_months, p.financing_term_min_months),
+    financing_term_max_months: pick(lp.term_max_months, p.financing_term_max_months),
+    financing_tenure_unit: pick(lp.tenure_unit, p.financing_tenure_unit),
+    financing_rate_per_cycle: pick(lp.rate_per_cycle, p.financing_rate_per_cycle),
+    financing_amount_per_cycle: pick(lp.amount_per_cycle, p.financing_amount_per_cycle),
+    financing_cycle_count: pick(lp.cycle_count, p.financing_cycle_count),
+    financing_cycle_length_days: pick(lp.cycle_length_days, p.financing_cycle_length_days),
+    financing_frequency: pick(lp.frequency, p.financing_frequency),
+    financing_terms_text: pick(lp.terms_text, p.financing_terms_text),
+    financing_terms_doc_url: pick(lp.terms_doc_url, p.financing_terms_doc_url),
+    _loan_product_processing_fee: fee
+  })
+}
+// Client quote. Returns { ok, error, ...quote }. Mirrors backend math exactly.
+// A missing required setting returns { ok:false, error } (the UI greys the line);
+// the server re-validates on submit so nothing unsafe is ever booked.
+function clientQuote(rawP, quantity, paymentType, termMonths) {
+  const num = (v, d) => { const n = Number(v); return Number.isFinite(n) ? n : (d === undefined ? 0 : d) }
+  const req = (v, label) => {
+    if (v === null || v === undefined || v === '') throw new Error(`Missing ${label}`)
+    const n = Number(v); if (!Number.isFinite(n)) throw new Error(`Invalid ${label}`); return n
+  }
+  try {
+    const p = paymentType === 'cash' ? rawP : resolveLoanProductLocal(rawP)
+    const qty = Math.max(1, num(quantity, 1))
+    if (paymentType === 'cash') {
+      const unit = req(p.cash_price, 'cash price')
+      const total = _round2(unit * qty)
+      const dep = req(p.cash_deposit_pct, 'cash deposit %')
+      const due = _round2(total * dep / 100)
+      return { ok: true, payment_type: 'cash', quantity: qty, base_price: total, financing_charge: 0,
+        processing_fee: 0, deposit_pct: dep, deposit_amount: due, term_months: 0, installment_count: 0,
+        installment_amount: 0, line_total: total, total_payable: total, outstanding_after_deposit: _round2(total - due) }
+    }
+    const unitCredit = req(p.credit_price, 'financed price')
+    const principalBase = _round2(unitCredit * qty)
+    const dep = req(p.financing_deposit_pct, 'financing deposit %')
+    const deposit_amount = _round2(principalBase * dep / 100)
+    const finance_principal = _round2(principalBase - deposit_amount)
+    const model = p.financing_model || 'loan_interest'
+    const tenureUnit = ['monthly', 'yearly', 'custom'].includes(String(p.financing_tenure_unit)) ? String(p.financing_tenure_unit) : 'monthly'
+    const ratePerCycle = num(p.financing_rate_per_cycle, 0)
+    const amountPerCycle = num(p.financing_amount_per_cycle, 0)
+    const cfgCycleCount = Math.max(0, Math.round(num(p.financing_cycle_count, 0)))
+    const cycleLengthDays = Math.max(1, Math.round(num(p.financing_cycle_length_days, tenureUnit === 'yearly' ? 365 : 30)))
+    const usesTenureModel = cfgCycleCount > 0 && (ratePerCycle > 0 || amountPerCycle > 0)
+    const hasLegacyInterest = p.financing_interest_pct != null && p.financing_interest_pct !== ''
+      && p.financing_term_min_months != null && p.financing_term_min_months !== ''
+      && p.financing_term_max_months != null && p.financing_term_max_months !== ''
+    const isNoChargeModel = model === 'murabaha'
+    if (!usesTenureModel && !hasLegacyInterest && !isNoChargeModel) throw new Error('financing structure not configured')
+    const interestRate = num(p.financing_interest_pct, 0)
+    const frequency = p.financing_frequency || (model === 'paygo' ? 'daily' : 'monthly')
+    let cycle_count, financing_charge, term, payment_frequency
+    if (usesTenureModel) {
+      cycle_count = cfgCycleCount
+      financing_charge = _round2(finance_principal * (ratePerCycle / 100) * cycle_count + amountPerCycle * cycle_count)
+      term = tenureUnit === 'yearly' ? cycle_count * 12 : tenureUnit === 'custom' ? Math.max(1, Math.round((cycle_count * cycleLengthDays) / 30)) : cycle_count
+      payment_frequency = tenureUnit === 'yearly' ? 'yearly' : tenureUnit === 'custom' ? 'custom' : 'monthly'
+    } else if (hasLegacyInterest) {
+      const minT = num(p.financing_term_min_months, 0), maxT = num(p.financing_term_max_months, 0)
+      term = Math.max(minT, Math.min(num(termMonths, minT), maxT))
+      cycle_count = frequency === 'daily' ? term * 30 : frequency === 'weekly' ? term * 4 : term
+      financing_charge = _round2(finance_principal * (interestRate / 100) * (term / 12))
+      payment_frequency = frequency
+    } else {
+      const minT = num(p.financing_term_min_months, 0), maxT = num(p.financing_term_max_months, 0)
+      term = Math.max(1, Math.max(minT, Math.min(num(termMonths, minT || 1), maxT || minT || 1)))
+      cycle_count = frequency === 'weekly' ? term * 4 : term
+      financing_charge = 0; payment_frequency = frequency === 'weekly' ? 'weekly' : 'monthly'
+    }
+    const feeCfg = p._loan_product_processing_fee || _procFeeCfg
+    const processing_fee = _clientProcessingFee(feeCfg, finance_principal, p.id)
+    const financed_total = _round2(finance_principal + financing_charge + processing_fee)
+    const installment_count = cycle_count
+    const installment_amount = installment_count > 0 ? _round2(financed_total / installment_count) : financed_total
+    const total_payable = _round2(deposit_amount + financed_total)
+    return { ok: true, payment_type: 'financing', quantity: qty, base_price: principalBase,
+      finance_principal, financing_charge, processing_fee, interest_rate_pct: interestRate,
+      deposit_pct: dep, deposit_amount, term_months: term, installment_count, installment_amount,
+      line_total: total_payable, total_payable, outstanding_after_deposit: financed_total }
+  } catch (e) { return { ok: false, error: e.message || 'Not configured for sale' } }
+}
 function getRoleTemplate(role) {
   return (_permMeta.roles || []).find((r) => r.role_key === role)
 }
@@ -474,6 +594,7 @@ async function loadFeatures() {
 function featureOn(key) { return _featuresEnabled.includes(key) }
 
 async function init() {
+  installMediaProtection()
   try {
     const { data } = await api.get('/me'); state.user = data.user
     await loadCrossConfig()
@@ -482,6 +603,18 @@ async function init() {
     startSessionSync()
   }
   catch { renderLogin() }
+}
+// ASSET & MEDIA SECURITY (Part 3): a single delegated guard that blocks the
+// context menu and drag-start on any protected media (product imagery) across
+// the whole app, including content rendered after the initial load. This is a
+// UI-level deterrent layered on top of the per-image shield/overlay + CSS.
+let _mediaProtectionInstalled = false
+function installMediaProtection() {
+  if (_mediaProtectionInstalled) return
+  _mediaProtectionInstalled = true
+  const isProtected = (el) => el && el.closest && (el.closest('.media-frame') || (el.classList && el.classList.contains('protected-media')))
+  document.addEventListener('contextmenu', (e) => { if (isProtected(e.target)) e.preventDefault() }, { capture: true })
+  document.addEventListener('dragstart', (e) => { if (isProtected(e.target)) e.preventDefault() }, { capture: true })
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,9 +1582,9 @@ function renderApp() {
 }
 window.go = (r) => { state.route = r; toggleSidebar(false); renderApp() }
 function route() {
-  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', transactions: 'Bank Transfers & Transactions', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', ledger: 'Unified Payment Ledger', amendments: 'Pending Profile Amendments', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants', channels: 'Payment Channel Management', features: 'Feature Management & QA', offtake: 'Offtake Contracts', matching: 'Match Buyers & Outgrowers', aggregation: 'Produce Aggregation', logistics: 'Logistics & Tracking', traceability: 'Traceability', buyers: 'Buyer Portal & Intake Sites', cashboards: 'Cashboards & Live Bids', slotting: 'Time Slotting', produce_orders: 'Orders & Freight', movements: 'Commodity Movements', settlement: 'Closed-Loop Settlement & RCTI', stocks: 'Stocks & Ledger' }
+  const titles = { dashboard: 'Dashboard', approvals: 'Financing Approvals', inventory: 'Equipment Inventory', finance_queue: 'Finance Approval Queue', customers: 'Customers', field_visits: 'Field Visits & Conversion', transactions: 'Bank Transfers & Transactions', crm: 'Sales & Support CRM', contracts: 'Purchases & Contracts', agents: 'Agent Management', users: 'User Accounts & Access', repayments: 'Repayment Performance', onboard: 'Farmer Onboarding', shop: 'Equipment Shop', cart: 'Your Cart', exports: 'Data Export & Reports', settings: 'Financing & Markup Settings', profile: 'My Account', wallet: 'My Wallet', wallets: 'Wallets & Payouts', ledger: 'Unified Payment Ledger', amendments: 'Pending Profile Amendments', imports: 'Bulk User Data Upload', backups: 'Automated System Backups', api_access: 'API Access', api_management: 'API Management', tenants: 'Payment Tenants', channels: 'Payment Channel Management', features: 'Feature Management & QA', offtake: 'Offtake Contracts', matching: 'Match Buyers & Outgrowers', aggregation: 'Produce Aggregation', logistics: 'Logistics & Tracking', traceability: 'Traceability', buyers: 'Buyer Portal & Intake Sites', cashboards: 'Cashboards & Live Bids', slotting: 'Time Slotting', produce_orders: 'Orders & Freight', movements: 'Commodity Movements', settlement: 'Closed-Loop Settlement & RCTI', stocks: 'Stocks & Ledger' }
   $('pageTitle').textContent = titles[state.route] || 'Dashboard'
-  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, transactions: viewTransactions, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, ledger: viewLedger, amendments: viewAmendments, imports: viewImports, backups: viewBackups, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants, channels: viewChannels, features: viewFeatures, offtake: viewOfftake, matching: viewMatching, aggregation: viewAggregation, logistics: viewLogistics, traceability: viewTraceability, buyers: viewBuyers, cashboards: viewCashboards, slotting: viewSlotting, produce_orders: viewProduceOrders, movements: viewMovements, settlement: viewSettlement, stocks: viewStocks }
+  const map = { dashboard: viewDashboard, approvals: viewApprovals, inventory: viewInventory, finance_queue: viewFinanceQueue, customers: viewCustomers, field_visits: viewFieldVisits, transactions: viewTransactions, crm: viewCrm, contracts: viewContracts, agents: viewAgents, users: viewUsers, repayments: viewRepayments, onboard: viewOnboard, shop: viewShop, cart: viewCartPage, exports: viewExports, settings: viewSettings, profile: viewProfile, wallet: viewMyWallet, wallets: viewWallets, ledger: viewLedger, amendments: viewAmendments, imports: viewImports, backups: viewBackups, api_access: viewApiAccess, api_management: viewApiManagement, tenants: viewTenants, channels: viewChannels, features: viewFeatures, offtake: viewOfftake, matching: viewMatching, aggregation: viewAggregation, logistics: viewLogistics, traceability: viewTraceability, buyers: viewBuyers, cashboards: viewCashboards, slotting: viewSlotting, produce_orders: viewProduceOrders, movements: viewMovements, settlement: viewSettlement, stocks: viewStocks }
   ;(map[state.route] || viewDashboard)()
 }
 
@@ -1547,10 +1680,21 @@ async function renderQuickCheckout() {
 // ---------------------------------------------------------------------------
 // SHOP (customer buy flow)
 // ---------------------------------------------------------------------------
+// ASSET & MEDIA SECURITY (Part 3): product/storefront imagery is rendered inside
+// a protected media frame that (a) shows the image at its NATIVE aspect ratio
+// (object-contain → no cropping/truncation), (b) lazy-loads + async-decodes with
+// a progressive fade-in, and (c) is hardened against casual download via a
+// transparent shield overlay + draggable/context-menu disabling (.protected-media).
 function prodImg(p, cls) {
-  return p.image
-    ? `<img src="${esc(p.image)}" alt="${esc(p.name)}" class="${cls} object-cover">`
-    : `<div class="${cls} flex items-center justify-center bg-gradient-to-br from-teal-50 to-emerald-100 text-teal-400"><i class="fas fa-box-open text-3xl"></i></div>`
+  if (!p.image) {
+    return `<div class="${cls} flex items-center justify-center bg-gradient-to-br from-teal-50 to-emerald-100 text-teal-400"><i class="fas fa-box-open text-3xl"></i></div>`
+  }
+  return `<div class="media-frame ${cls}">
+    <img src="${esc(p.image)}" alt="${esc(p.name)}" loading="lazy" decoding="async" draggable="false"
+         oncontextmenu="return false" onload="this.classList.add('media-loaded')"
+         class="media-contain media-fade protected-media">
+    <div class="media-shield" oncontextmenu="return false" ondragstart="return false"></div>
+  </div>`
 }
 // Farmer (customer) and Offtaker accounts may build a cross-marketplace cart for
 // their own purchases; an AGENT may build one while in an active Buy-For session
@@ -1598,11 +1742,15 @@ function shopDrawerHtml() {
 async function viewShop() {
   const { data } = await api.get('/products?shop=1')
   _products = data.products
+  // Ensure the client pricing engine has the loan-product rules + fee config so
+  // the cart/checkout can compute instant, deterministic itemized totals.
+  loadFinancingTypes().catch(() => {})
+  loadProcessingFeeCfg().catch(() => {})
   // Agent "Buy For" banner: show the selected farmer + a cancel action.
   const buyForBanner = _buyFor ? `<div class="mb-4 p-3 rounded-lg bg-emerald-50 border border-emerald-200 flex items-center justify-between flex-wrap gap-2">
       <div class="text-sm text-emerald-800"><i class="fas fa-cart-plus mr-1"></i>Buying on behalf of <b>${esc(_buyFor.name)}</b>${_buyFor.phone ? ` · ${esc(_buyFor.phone)}` : ''}. Add multiple products to one order, or use <b>Buy</b> for a single item.</div>
       <div class="flex gap-2">
-        <button onclick="openCart()" class="btn bg-white border border-emerald-300 text-emerald-700 px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-shopping-cart mr-1"></i>Order (${_cart.length})</button>
+        <button onclick="go('cart')" class="btn bg-white border border-emerald-300 text-emerald-700 px-3 py-1.5 rounded-lg text-xs"><i class="fas fa-shopping-cart mr-1"></i>Order (${_cart.length})</button>
         <button onclick="clearBuyFor()" class="btn bg-white border border-emerald-300 text-emerald-700 px-3 py-1.5 rounded-lg text-xs">Cancel Buy-For</button>
       </div>
     </div>` : ''
@@ -1623,7 +1771,7 @@ async function viewShop() {
       <div class="flex gap-2">
         ${Object.values(TAXONOMY).map(s => `<button onclick="shopSelect('${s.key}')" class="btn px-3 py-2 rounded-lg text-sm ${!_shopSearch && _shopFilter.marketplace === s.key ? 'brand-bg text-white' : 'bg-slate-100 hover:bg-slate-200'}"><i class="fas ${s.icon} mr-1"></i>${MARKETPLACE_LABELS[s.key]}</button>`).join('')}
       </div>
-      ${canUseCart() ? `<button onclick="openCart()" class="btn ml-auto bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-lg text-sm relative"><i class="fas fa-shopping-cart mr-1"></i>Cart <span id="cartCount" class="badge bg-teal-600 text-white ml-1">${_cart.length}</span></button>` : ''}
+      ${canUseCart() ? `<button onclick="go('cart')" class="btn ml-auto bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-lg text-sm relative"><i class="fas fa-shopping-cart mr-1"></i>Cart <span id="cartCount" class="badge bg-teal-600 text-white ml-1">${_cart.length}</span></button>` : ''}
     </div>
     <div id="shopBreadcrumb" class="text-sm text-slate-500 mb-3"></div>
     <div id="shopGrid"></div>`
@@ -1664,7 +1812,7 @@ function renderSearchGrid(q) {
         <div class="flex gap-2 mt-4">
           <button onclick="productDetail(${p.id})" class="btn flex-1 bg-slate-100 hover:bg-slate-200 py-2 rounded-lg text-sm"><i class="fas fa-circle-info mr-1"></i>Details</button>
           ${canUseCart() ? `<button onclick="addToCart(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn bg-slate-100 hover:bg-slate-200 py-2 px-3 rounded-lg text-sm disabled:opacity-40" title="Add to cart"><i class="fas fa-cart-plus"></i></button>` : ''}
-          <button onclick="buyModal(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-bolt mr-1"></i>Buy</button>
+          <button onclick="buyNow(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-bolt mr-1"></i>Buy Now</button>
         </div>
       </div>
     </div>`).join('') || '<div class="col-span-full text-center py-12 text-slate-400">No products match your search across any marketplace.</div>'
@@ -1691,7 +1839,7 @@ function renderShopGrid() {
         <div class="flex gap-2 mt-4">
           <button onclick="productDetail(${p.id})" class="btn flex-1 bg-slate-100 hover:bg-slate-200 py-2 rounded-lg text-sm"><i class="fas fa-circle-info mr-1"></i>Details</button>
           ${canUseCart() ? `<button onclick="addToCart(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn bg-slate-100 hover:bg-slate-200 py-2 px-3 rounded-lg text-sm disabled:opacity-40" title="Add to cart"><i class="fas fa-cart-plus"></i></button>` : ''}
-          <button onclick="buyModal(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-bolt mr-1"></i>Buy</button>
+          <button onclick="buyNow(${p.id})" ${p.quantity <= 0 ? 'disabled' : ''} class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm disabled:opacity-40"><i class="fas fa-bolt mr-1"></i>Buy Now</button>
         </div>
       </div>
     </div>`).join('') || '<div class="col-span-full text-center py-12 text-slate-400">No products in this category yet.</div>'
@@ -1714,45 +1862,90 @@ window.addToCart = (id) => {
   // Open the per-item terms picker so the added product respects its own listing.
   cartItemModal(id)
 }
+// UNIFIED FLOW (Part 2 Module 1): "Buy Now" follows the IDENTICAL flow as
+// "Add to Cart" — the same per-item terms picker (qty → payment type → if
+// Financed, only the mapped/approved financing options) — the only difference is
+// that after configuring the item it goes straight to checkout instead of
+// returning to the cart. Implemented as the same cartItemModal with buyNow=true.
+window.buyNow = (id) => {
+  if (!canUseCart()) return toast('Purchase from your own shop or a Buy-For session.', false)
+  const p = _products.find(x => x.id === id); if (!p) return
+  cartItemModal(id, undefined, true)
+}
 // Configure an individual item's terms (payment type, term, quantity) before it
 // joins the bundle. Reused for editing an item already in the cart.
-window.cartItemModal = (id, editIndex) => {
+// UNIFIED per-item terms picker (qty → payment type → if Financed, the mapped
+// financing option). Used by BOTH Add-to-Cart (buyNow=false) and Buy Now
+// (buyNow=true); the only difference is where it goes after saving. When the
+// product is financing-enabled the ONLY financing option offered is the one
+// mapped/approved for this product (its loan product) — never an ad-hoc choice.
+window.cartItemModal = (id, editIndex, buyNow) => {
   const p = _products.find(x => x.id === id)
   if (!p) return toast('Product unavailable', false)
   const existing = (typeof editIndex === 'number') ? _cart[editIndex] : null
-  const minTerm = Math.max(1, Number(p.financing_term_min_months || 3))
-  const maxTerm = Math.max(minTerm, Number(p.financing_term_max_months || 12))
+  // Resolve the mapped loan product so terms shown reflect the approved option.
+  const lp = (p.financing_type_key && (_loanProducts || []).find(x => x.type_key === p.financing_type_key && x.active !== 0)) || null
+  const minTerm = Math.max(1, Number((lp && lp.term_min_months) ?? p.financing_term_min_months ?? 3))
+  const maxTerm = Math.max(minTerm, Number((lp && lp.term_max_months) ?? p.financing_term_max_months ?? 12))
   const curTerm = existing ? Number(existing.term_months) : Math.min(6, maxTerm)
   const termOptions = Array.from({ length: maxTerm - minTerm + 1 }, (_, i) => minTerm + i)
     .map(m => `<option value="${m}" ${m === Math.max(minTerm, curTerm) ? 'selected' : ''}>${m}</option>`).join('')
   const curPtype = existing ? existing.payment_type : (p.cash_enabled ? 'cash' : 'financing')
+  // Financing is offered ONLY when the product is financing-enabled AND mapped to
+  // an approved loan product. The option label names that approved loan product.
+  const financeLabel = lp ? esc(lp.label || lp.type_key) : (p.financing_model === 'paygo' ? 'PAYGO financing' : 'Financing')
+  const financeAvailable = p.financing_enabled && (lp || p.financing_type_key || p.financing_model)
   const paymentOptions = [
     p.cash_enabled ? `<option value="cash" ${curPtype === 'cash' ? 'selected' : ''}>Cash purchase</option>` : '',
-    p.financing_enabled ? `<option value="financing" ${curPtype === 'financing' ? 'selected' : ''}>${p.financing_model === 'paygo' ? 'PAYGO financing' : 'Normal financing'}</option>` : ''
+    financeAvailable ? `<option value="financing" ${curPtype === 'financing' ? 'selected' : ''}>${financeLabel}</option>` : ''
   ].join('')
-  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas fa-cart-plus text-emerald-600 mr-2"></i>${existing ? 'Edit item' : 'Add to order'}: ${esc(p.name)}</h3>
+  const action = buyNow ? 'Buy Now' : (existing ? 'Update item' : 'Add to order')
+  showModal(`<h3 class="text-lg font-bold mb-1"><i class="fas ${buyNow ? 'fa-bolt' : 'fa-cart-plus'} text-emerald-600 mr-2"></i>${buyNow ? 'Buy Now' : (existing ? 'Edit item' : 'Add to order')}: ${esc(p.name)}</h3>
     ${_buyFor ? `<div class="mb-2 p-2 rounded-lg bg-emerald-50 border border-emerald-200 text-xs text-emerald-800"><i class="fas fa-user mr-1"></i>For <b>${esc(_buyFor.name)}</b></div>` : ''}
-    <p class="text-xs text-slate-500 mb-3">Set this item's own terms. Each product in the order keeps its own payment terms.</p>
+    <p class="text-xs text-slate-500 mb-3">Set this item's terms. ${buyNow ? 'You will go straight to checkout.' : 'Each product in the order keeps its own payment terms.'}</p>
     <div class="grid grid-cols-2 gap-3 text-sm">
-      <div><label class="font-medium">Quantity</label><input id="ci_qty" type="number" value="${existing ? existing.qty : 1}" min="1" max="${p.quantity}" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg"></div>
-      <div><label class="font-medium">Payment Type</label><select id="ci_ptype" onchange="ciToggleTerm()" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg">${paymentOptions}</select></div>
-      <div id="ci_termWrap" class="col-span-2 ${curPtype === 'financing' ? '' : 'hidden'}"><label class="font-medium">Financing Term (months)</label><select id="ci_term" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg">${termOptions}</select></div>
+      <div><label class="font-medium">Quantity</label><input id="ci_qty" type="number" value="${existing ? existing.qty : 1}" min="1" max="${p.quantity}" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg" oninput="ciRenderBreakdown(${p.id})"></div>
+      <div><label class="font-medium">Payment Type</label><select id="ci_ptype" onchange="ciToggleTerm(${p.id})" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg">${paymentOptions}</select></div>
+      <div id="ci_termWrap" class="col-span-2 ${curPtype === 'financing' ? '' : 'hidden'}"><label class="font-medium">Financing Term (months)</label><select id="ci_term" onchange="ciRenderBreakdown(${p.id})" class="w-full mt-1 px-3 py-2 border border-slate-300 rounded-lg">${termOptions}</select></div>
     </div>
-    <div class="grid grid-cols-2 gap-2 mt-3 text-xs">
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-2"><div class="text-slate-500">Cash price</div><div class="font-semibold">${fmt(p.cash_price)}</div><div class="text-slate-400 mt-0.5">deposit ${Number(p.cash_deposit_pct ?? 100)}%</div></div>
-      <div class="bg-slate-50 border border-slate-200 rounded-lg p-2"><div class="text-slate-500">Financing price</div><div class="font-semibold">${fmt(p.credit_price)}</div><div class="text-slate-400 mt-0.5">deposit ${Number(p.financing_deposit_pct ?? 10)}%</div></div>
-    </div>
+    <!-- INSTANT itemized breakdown (synchronous client engine; re-verified on submit) -->
+    <div id="ci_breakdown" class="mt-3"></div>
     <div class="flex gap-2 mt-4">
-      <button onclick="saveCartItem(${p.id}, ${typeof editIndex === 'number' ? editIndex : 'null'})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">${existing ? 'Update item' : 'Add to order'}</button>
-      <button onclick="${existing ? 'openCart()' : 'closeModal()'}" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
+      <button onclick="saveCartItem(${p.id}, ${typeof editIndex === 'number' ? editIndex : 'null'}, ${buyNow ? 'true' : 'false'})" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm">${action}</button>
+      <button onclick="${existing ? "go('cart')" : 'closeModal()'}" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
     </div>`)
+  ciRenderBreakdown(p.id)
 }
-window.ciToggleTerm = () => { const w = $('ci_termWrap'); if (w) w.classList.toggle('hidden', $('ci_ptype').value !== 'financing') }
-window.saveCartItem = (id, editIndex) => {
+window.ciToggleTerm = (id) => { const w = $('ci_termWrap'); if (w) w.classList.toggle('hidden', $('ci_ptype').value !== 'financing'); ciRenderBreakdown(id) }
+// Render the instant itemized breakdown inside the item modal using the client
+// pricing engine, so the buyer sees base/financed price, finance charge,
+// processing fee and deposit with zero loading delay.
+window.ciRenderBreakdown = (id) => {
+  const box = $('ci_breakdown'); if (!box) return
+  const p = _products.find(x => x.id === id); if (!p) return
+  const qty = Math.max(1, Number(($('ci_qty') || {}).value) || 1)
+  const ptype = ($('ci_ptype') || {}).value === 'cash' ? 'cash' : 'financing'
+  const term = ptype === 'financing' ? Number(($('ci_term') || {}).value || 0) : 0
+  const q = clientQuote(p, qty, ptype, term)
+  if (!q.ok) { box.innerHTML = `<div class="text-xs text-red-600 bg-red-50 rounded-lg p-2"><i class="fas fa-triangle-exclamation mr-1"></i>${esc(q.error)}</div>`; return }
+  const fin = ptype === 'financing'
+  box.innerHTML = `<div class="text-xs text-slate-600 space-y-0.5 bg-slate-50 rounded-lg p-3 border border-slate-200">
+    <div class="flex justify-between"><span>${fin ? 'Financed price' : 'Base price'} (×${qty})</span><span class="font-medium">${fmt(q.base_price)}</span></div>
+    ${fin && q.financing_charge ? `<div class="flex justify-between"><span>Finance charge${q.interest_rate_pct ? ` (${q.interest_rate_pct}%)` : ''}</span><span class="font-medium">${fmt(q.financing_charge)}</span></div>` : ''}
+    ${fin && q.processing_fee ? `<div class="flex justify-between"><span>Processing fee</span><span class="font-medium">${fmt(q.processing_fee)}</span></div>` : ''}
+    <div class="flex justify-between"><span>Deposit due now (${q.deposit_pct}%)</span><span class="font-medium">${fmt(q.deposit_amount)}</span></div>
+    ${fin ? `<div class="flex justify-between"><span>${q.installment_count} installment(s)</span><span class="font-medium">${fmt(q.installment_amount)} ea</span></div>` : ''}
+    <div class="flex justify-between font-bold text-slate-800 border-t border-slate-300 pt-1 mt-1"><span>Total payable</span><span>${fmt(q.total_payable)}</span></div>
+  </div>`
+}
+window.saveCartItem = (id, editIndex, buyNow) => {
   const p = _products.find(x => x.id === id); if (!p) return
   const qty = Math.max(1, Number($('ci_qty').value) || 1)
   const payment_type = $('ci_ptype').value === 'cash' ? 'cash' : 'financing'
   const term_months = payment_type === 'financing' ? Number($('ci_term')?.value || 0) : 0
+  // Guard: never add a line the client engine deems unsellable (server re-checks).
+  const vq = clientQuote(p, qty, payment_type, term_months)
+  if (!vq.ok) return toast(vq.error, false)
   const item = {
     id, name: p.name, marketplace: marketplaceOf(p), cash_price: p.cash_price, credit_price: p.credit_price,
     qty, payment_type, term_months
@@ -1762,7 +1955,7 @@ window.saveCartItem = (id, editIndex) => {
     // Merge into an existing identical line (same product + same terms).
     const dup = _cart.find(x => x.id === id && x.payment_type === payment_type && x.term_months === term_months)
     if (dup) { dup.qty += qty; toast(`${p.name} quantity updated`) }
-    else { _cart.push(item); toast(`${p.name} added to your order`) }
+    else { _cart.push(item); toast(buyNow ? `${p.name} ready for checkout` : `${p.name} added to your order`) }
   }
   const cc = $('cartCount'); if (cc) cc.textContent = _cart.length
   openCart()
@@ -1852,6 +2045,138 @@ function renderCartModal() {
 // "Add More Items" → close the modal and route to the shop so the buyer can pick
 // products from any marketplace, keeping the current cart intact.
 window.addMoreItems = () => { closeModal(); if (state.route !== 'shop') go('shop'); else route() }
+
+// ===========================================================================
+// FULL-PAGE CART ROUTE (Part 2 Module 1) — replaces the floating/small cart
+// container with a dedicated /cart page. Shows an INSTANT, itemized per-line
+// breakdown computed synchronously client-side (clientQuote), then confirms the
+// figures against the authoritative server quote in the background. The same
+// renderCartLines() powers both this page and the legacy modal so the two can
+// never diverge.
+// ===========================================================================
+// Build the itemized breakdown for a single cart line using the SYNCHRONOUS
+// client engine first (instant), falling back to the server-quoted line when
+// present. Returns { html, quote, err }.
+function cartLineBreakdown(x, i) {
+  const p = _products.find(pp => pp.id === x.id) || x
+  // Instant client quote (zero network wait).
+  const cq = clientQuote(p, x.qty, x.payment_type, x.term_months)
+  // If the authoritative server quote is loaded, prefer its figures (it is the
+  // booked number); otherwise show the instant client figures.
+  const srv = cartLineByIndex(i)
+  const q = (srv && !srv.error) ? srv : (cq.ok ? cq : null)
+  const err = (srv && srv.error) ? srv.error : (cq.ok ? null : cq.error)
+  const fin = x.payment_type === 'financing'
+  const itemized = q && !err ? `
+    <div class="mt-2 text-[11px] text-slate-500 space-y-0.5 bg-slate-50 rounded-lg p-2">
+      <div class="flex justify-between"><span>${fin ? 'Financed price' : 'Base price'} (×${x.qty})</span><span>${fmt(q.base_price)}</span></div>
+      ${fin && q.financing_charge ? `<div class="flex justify-between"><span>Finance charge${q.interest_rate_pct ? ` (${q.interest_rate_pct}%)` : ''}</span><span>${fmt(q.financing_charge)}</span></div>` : ''}
+      ${fin && q.processing_fee ? `<div class="flex justify-between"><span>Processing fee</span><span>${fmt(q.processing_fee)}</span></div>` : ''}
+      <div class="flex justify-between"><span>Deposit due now (${q.deposit_pct}%)</span><span>${fmt(q.deposit_amount)}</span></div>
+      ${fin ? `<div class="flex justify-between"><span>${q.installment_count} installment(s)</span><span>${fmt(q.installment_amount)}/${q.installment_count ? 'ea' : ''}</span></div>` : ''}
+      <div class="flex justify-between font-semibold text-slate-700 border-t border-slate-200 pt-0.5 mt-0.5"><span>Line total payable</span><span>${fmt(q.line_total)}</span></div>
+    </div>` : ''
+  return { quote: q, err, itemized }
+}
+// Compute grand totals synchronously from the client engine (instant), so the
+// page shows a number immediately even before the server quote returns.
+function clientCartTotals() {
+  let total_cash = 0, total_financed = 0, grand = 0, hasErr = false
+  _cart.forEach(x => {
+    const p = _products.find(pp => pp.id === x.id) || x
+    const cq = clientQuote(p, x.qty, x.payment_type, x.term_months)
+    if (!cq.ok) { hasErr = true; return }
+    if (x.payment_type === 'cash') total_cash += cq.line_total; else total_financed += cq.line_total
+    grand += cq.line_total
+  })
+  return { total_cash: _round2(total_cash), total_financed: _round2(total_financed), grand_total: _round2(grand), hasErr }
+}
+function renderCartLines(containerId) {
+  const box = document.getElementById(containerId); if (!box) return
+  const rows = _cart.map((x, i) => {
+    const bd = cartLineBreakdown(x, i)
+    return `<div class="py-3 border-b border-slate-100">
+      <div class="flex items-start justify-between gap-2">
+        <div class="min-w-0 flex-1">
+          <div class="font-medium text-sm truncate">${esc(x.name)}</div>
+          <div class="text-[11px] text-slate-400">${MARKETPLACE_LABELS[x.marketplace] || 'Equipment'} · ${x.payment_type === 'cash' ? 'Cash' : `Financing ${x.term_months}mo`}</div>
+          <div class="flex items-center gap-2 mt-1">
+            <button onclick="changeCartQty(${i}, -1)" class="w-6 h-6 rounded border border-slate-300 text-slate-600 text-xs leading-none hover:bg-slate-100">−</button>
+            <span class="text-sm font-medium w-6 text-center">${x.qty}</span>
+            <button onclick="changeCartQty(${i}, 1)" class="w-6 h-6 rounded border border-slate-300 text-slate-600 text-xs leading-none hover:bg-slate-100">+</button>
+            <button onclick="cartItemModal(${x.id}, ${i})" class="text-slate-500 text-xs hover:underline ml-2"><i class="fas fa-pen mr-0.5"></i>edit</button>
+            <button onclick="removeFromCart(${i})" class="text-red-500 text-xs hover:underline"><i class="fas fa-trash mr-0.5"></i>remove</button>
+          </div>
+        </div>
+        <div class="text-right shrink-0">
+          <div class="font-semibold text-sm ${bd.err ? 'text-red-400 line-through' : ''}">${bd.quote ? fmt(bd.quote.line_total) : '—'}</div>
+        </div>
+      </div>
+      ${bd.err ? `<div class="text-[11px] text-red-600 mt-1"><i class="fas fa-triangle-exclamation mr-1"></i>${esc(bd.err)}</div>` : bd.itemized}
+    </div>`
+  }).join('')
+  box.innerHTML = rows
+}
+// Full-page cart route.
+async function viewCartPage() {
+  if (!canUseCart()) { $('content').innerHTML = `<div class="card p-6 text-sm text-slate-500">Your cart is available when shopping from your own account or a Buy-For session.</div>`; return }
+  // Make sure products + pricing config are loaded so the client engine works.
+  if (!_products || !_products.length) { try { _products = (await api.get('/products?shop=1')).data.products } catch (_) {} }
+  loadFinancingTypes().catch(() => {}); loadProcessingFeeCfg().catch(() => {})
+  const who = _buyFor ? ` for ${esc(_buyFor.name)}` : ''
+  if (!_cart.length) {
+    $('content').innerHTML = `<div class="card p-8 text-center">
+      <i class="fas fa-shopping-cart text-5xl text-slate-200 mb-4"></i>
+      <h3 class="font-bold text-lg mb-1">Your cart${who} is empty</h3>
+      <p class="text-slate-400 text-sm mb-5">Add items from any marketplace — each item keeps its own payment terms.</p>
+      <button onclick="go('shop')" class="btn brand-bg text-white px-6 py-2.5 rounded-lg text-sm"><i class="fas fa-store mr-1"></i>Browse the shop</button>
+    </div>`
+    return
+  }
+  const t = clientCartTotals()
+  $('content').innerHTML = `
+    <div class="max-w-3xl mx-auto">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-xl font-bold"><i class="fas fa-shopping-cart mr-2 brand-text"></i>Your Cart${who}</h2>
+        <button onclick="go('shop')" class="btn bg-emerald-50 border border-emerald-300 text-emerald-700 px-4 py-2 rounded-lg text-sm"><i class="fas fa-plus mr-1"></i>Add more items</button>
+      </div>
+      <p class="text-xs text-slate-400 mb-3">${_cart.length} item(s) · each item keeps its own payment terms · figures update instantly and are re-verified on checkout</p>
+      <div class="card p-4"><div id="cartPageLines"></div></div>
+      <div class="card p-4 mt-4">
+        <div class="rounded-xl border border-slate-200 overflow-hidden text-sm">
+          <div class="flex justify-between px-4 py-2 bg-slate-50"><span class="text-slate-600">Total Cash</span><span class="font-semibold" id="cartTotCash">${fmt(t.total_cash)}</span></div>
+          <div class="flex justify-between px-4 py-2 bg-slate-50 border-t border-slate-100"><span class="text-slate-600">Total Financed</span><span class="font-semibold" id="cartTotFin">${fmt(t.total_financed)}</span></div>
+          <div class="flex justify-between px-4 py-3 bg-red-600 text-white border-t-2 border-red-700"><span class="font-bold uppercase tracking-wide"><i class="fas fa-receipt mr-1"></i>Grand Total</span><span class="font-extrabold text-base" id="cartGrand">${fmt(t.grand_total)}</span></div>
+        </div>
+        <div id="cartServerNote" class="text-[11px] text-slate-400 mt-2"><i class="fas fa-spinner fa-spin mr-1"></i>Verifying totals with the server…</div>
+        <div class="flex flex-col sm:flex-row gap-2 mt-4">
+          <button onclick="checkoutCart()" id="cartCheckoutBtn" class="btn flex-1 brand-bg text-white py-2.5 rounded-lg text-sm"><i class="fas fa-cash-register mr-1"></i>Proceed to Checkout</button>
+          <button onclick="go('shop')" class="btn px-4 bg-slate-100 py-2.5 rounded-lg text-sm hover:bg-slate-200">Keep shopping</button>
+        </div>
+      </div>
+      <div id="freqRow" class="mt-4"></div>
+    </div>`
+  renderCartLines('cartPageLines')
+  loadFrequentIntoCart()
+  // Background: confirm with the authoritative server quote, then re-render the
+  // lines/totals with the booked figures (they should match the client engine).
+  fetchCartQuote().then(() => {
+    if (state.route !== 'cart') return
+    renderCartLines('cartPageLines')
+    const q = _cartQuote
+    const note = $('cartServerNote'); const btn = $('cartCheckoutBtn')
+    if (q) {
+      const tc = $('cartTotCash'); if (tc) tc.textContent = fmt(q.total_cash)
+      const tf = $('cartTotFin'); if (tf) tf.textContent = fmt(q.total_financed)
+      const g = $('cartGrand'); if (g) g.textContent = fmt(q.grand_total)
+      const hasErr = (q.lines || []).some(l => l.error)
+      if (note) note.innerHTML = hasErr
+        ? '<span class="text-red-600"><i class="fas fa-triangle-exclamation mr-1"></i>Some items are not fully configured for sale. Remove or re-configure them to place the order.</span>'
+        : '<span class="text-emerald-600"><i class="fas fa-circle-check mr-1"></i>Totals verified against the booked contract figures.</span>'
+      if (btn) { btn.disabled = hasErr; btn.classList.toggle('opacity-50', hasErr); btn.classList.toggle('cursor-not-allowed', hasErr) }
+    } else if (note) note.textContent = ''
+  })
+}
 // Frequently Purchased — a single horizontal row of top sellers + See More.
 async function loadFrequentIntoCart() {
   const box = document.getElementById('freqRow'); if (!box) return
@@ -1879,7 +2204,16 @@ window.seeMoreShop = () => { closeModal(); if (state.route !== 'shop') go('shop'
 // single aggregated cash-deposit prompt is raised (directed to the farmer when
 // an agent is buying on their behalf).
 window.checkoutCart = async () => {
-  if (!_cart.length) return closeModal()
+  if (!_cart.length) { closeModal(); if (state.route === 'cart') route(); return }
+  // ASYNC SERVER VALIDATION (Part 1.2): the instant client figures are confirmed
+  // against the authoritative server quote before the order is submitted. Any
+  // config error (422) or line error blocks checkout so nothing unsafe is booked.
+  await fetchCartQuote()
+  if (_cartQuote && (_cartQuote.lines || []).some(l => l.error)) {
+    toast('Some items are not fully configured for sale. Please review your cart.', false)
+    if (state.route === 'cart') route()
+    return
+  }
   const items = _cart.map(x => ({ product_id: x.id, quantity: x.qty, payment_type: x.payment_type, term_months: x.term_months }))
   const body = { items, delivery_location: '', consent: true }
   if (_buyFor) body.customer_id = _buyFor.id
@@ -2015,7 +2349,7 @@ window.productDetail = (id) => {
   const p = _products.find(x => x.id === id)
   if (!p) return
   showModal(`
-    ${prodImg(p, 'w-full h-56 rounded-xl mb-4')}
+    ${prodImg(p, 'w-full h-64 rounded-xl mb-4')}
     <div class="flex justify-between items-start mb-1"><h3 class="text-xl font-bold">${esc(p.name)}</h3>${badge(p.stock_status)}</div>
     <p class="text-sm text-slate-500 mb-4"><i class="fas fa-tag mr-1"></i>${esc(p.category)} · SKU ${esc(p.sku)}</p>
     <div class="responsive-grid cols-2 text-sm">
@@ -3388,9 +3722,16 @@ function productForm(prefix, p = {}) {
       </div>
       <div id="${prefix}_finBlock" style="grid-column:1 / -1">
       <div style="grid-column:1 / -1" class="mt-2 mb-1 flex items-center gap-2 text-sm font-semibold text-slate-700 border-t pt-3">
-        <i class="fas fa-hand-holding-dollar text-teal-600"></i>Financial components ${canFin ? '' : '<span class="badge bg-amber-100 text-amber-700 ml-1">finance-authorized only</span>'}
+        <i class="fas fa-hand-holding-dollar text-teal-600"></i>Financing (Payment Availability)
       </div>
-      ${finNote}
+      <!-- CONSOLIDATION: the inventory form is now a MAPPING step only. Financing
+           RULES (rates, terms, deposits, markups, fees, agreements) are authored
+           solely in the Loan & Financing Products module. Here you only LINK this
+           product to a pre-configured loan product. -->
+      <div style="grid-column:1 / -1" class="bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 text-xs text-slate-600 mb-1">
+        <i class="fas fa-link text-teal-600 mr-1"></i>Financing terms are defined once in <b>Loan &amp; Financing Products</b>. Pick which pre-configured loan product applies to this listing — you are mapping, not re-defining rules.
+        ${canFin ? '' : '<div class="mt-2 text-amber-800"><i class="fas fa-lock mr-1"></i>You can <b>request</b> a financing link; the listing stays <b>Cash-Only Active</b> until a finance-authorized user approves it in the Finance Approval Queue.</div>'}
+      </div>
       <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-white">
         <div class="font-medium text-slate-700 mb-2 text-sm"><i class="fas fa-tags text-teal-600 mr-1"></i>Financed selling price</div>
         <div class="responsive-grid cols-2">
@@ -3401,38 +3742,31 @@ function productForm(prefix, p = {}) {
           <div id="${prefix}_credit_amt_wrap"><label class="field-label">Financing markup amount (KES)</label><input id="${prefix}_credit_amt" ${finDis} type="number" value="${Number(p.credit_markup_amount || 0)}" placeholder="Fixed amount added to cost" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
           <div id="${prefix}_credit_man_wrap"><label class="field-label">Financed selling price (KES)</label><input id="${prefix}_credit_price" ${finDis} type="number" value="${Number(p.credit_price || 0)}" placeholder="Direct selling price" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
         </div>
+        <div class="text-[11px] text-slate-400 mt-2">The financed price is the product's own sale price. All repayment rules (interest, deposit, term, fees) come from the mapped loan product.</div>
       </div>
-      <div><label class="field-label">Financing type</label><select id="${prefix}_fin_type" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}" data-selected="${esc(p.financing_type_key || p.financing_model || '')}">
-        <option value="">Loading types…</option>
-      </select></div>
-      <div><label class="field-label">Financing model (legacy)</label><select id="${prefix}_fin_model" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
-        <option value="" ${!p.financing_model ? 'selected' : ''}>— not configured —</option>
-        <option value="loan_interest" ${p.financing_model === 'loan_interest' ? 'selected' : ''}>Normal financing with interest</option>
-        <option value="paygo" ${p.financing_model === 'paygo' ? 'selected' : ''}>PAYGO</option>
-      </select></div>
-      <div><label class="field-label">Interest / finance rate %</label><input id="${prefix}_int" ${finDis} type="number" value="${p.financing_interest_pct ?? ''}" placeholder="Interest rate %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      <div><label class="field-label">Financing deposit %</label><input id="${prefix}_fin_dep" ${finDis} type="number" value="${p.financing_deposit_pct ?? ''}" placeholder="Financing deposit %" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      <div style="grid-column:1 / -1" class="border rounded-xl p-3 bg-white">
-        <div class="font-medium text-slate-700 mb-2 text-sm"><i class="fas fa-calendar-days text-teal-600 mr-1"></i>Tenure &amp; repayment schedule</div>
-        <div class="responsive-grid cols-2">
-          <div><label class="field-label">Tenure type</label><select id="${prefix}_tenure_unit" ${finDis} onchange="onTenureUnitChange('${prefix}')" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
-            ${['monthly','yearly','custom'].map(v => `<option value="${v}" ${(p.financing_tenure_unit || 'monthly') === v ? 'selected' : ''}>${TENURE_LABELS[v]}</option>`).join('')}
-          </select></div>
-          <div><label class="field-label" id="${prefix}_cyclecount_lbl">Total months</label><input id="${prefix}_cycle_count" ${finDis} type="number" value="${Number(p.financing_cycle_count || 0)}" placeholder="Number of cycles" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-          <div><label class="field-label" id="${prefix}_ratepc_lbl">Rate % per month</label><input id="${prefix}_rate_pc" ${finDis} type="number" value="${Number(p.financing_rate_per_cycle || 0)}" placeholder="% charged per cycle" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-          <div><label class="field-label" id="${prefix}_amtpc_lbl">Amount per month (KES)</label><input id="${prefix}_amt_pc" ${finDis} type="number" value="${Number(p.financing_amount_per_cycle || 0)}" placeholder="Fixed amount per cycle" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-          <div id="${prefix}_cyclelen_wrap"><label class="field-label">Length of each cycle (days)</label><input id="${prefix}_cycle_len" ${finDis} type="number" value="${Number(p.financing_cycle_length_days || 30)}" placeholder="Days per cycle" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-        </div>
-        <div class="text-[11px] text-slate-400 mt-2">Leave rate/amount at 0 to keep the legacy min/max-months model below.</div>
+      <div style="grid-column:1 / -1"><label class="field-label">Loan / Financing product (mapping)</label>
+        <select id="${prefix}_fin_type" ${finDis} class="px-3 py-2 border rounded-lg w-full ${finDis ? 'bg-slate-100 text-slate-400' : ''}" data-selected="${esc(p.financing_type_key || p.finance_pending_type_key || '')}" onchange="onLoanProductMap('${prefix}')">
+          <option value="">Cash only (no financing)</option>
+        </select>
+        <div id="${prefix}_fin_type_detail" class="text-[11px] text-slate-500 mt-1"></div>
       </div>
-      <div><label class="field-label">Repayment frequency (legacy)</label><select id="${prefix}_freq" ${finDis} class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}">
-        ${['daily','weekly','monthly'].map(v => `<option value="${v}" ${(p.financing_frequency || 'monthly') === v ? 'selected' : ''}>${v}</option>`).join('')}
-      </select></div>
-      <div><label class="field-label">Minimum term (months)</label><input id="${prefix}_tmin" ${finDis} type="number" value="${Number(p.financing_term_min_months || 3)}" placeholder="Minimum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      <div><label class="field-label">Maximum term (months)</label><input id="${prefix}_tmax" ${finDis} type="number" value="${Number(p.financing_term_max_months || 12)}" placeholder="Maximum term (months)" class="px-3 py-2 border rounded-lg ${finDis ? 'bg-slate-100 text-slate-400' : ''}"></div>
-      ${agreementSourceBlock(prefix, 'fin', 'Financing / PAYGO agreement', p, finDis)}
       </div>
     </div>`
+}
+// Render a read-only summary of the mapped loan product's terms so the lister
+// sees exactly which pre-configured rules will apply (no inline editing).
+window.onLoanProductMap = (prefix) => {
+  const sel = $(prefix + '_fin_type'); const box = $(prefix + '_fin_type_detail')
+  if (!sel || !box) return
+  const key = sel.value
+  const lp = (_loanProducts || []).find(x => x.type_key === key)
+  if (!key || !lp) { box.innerHTML = key ? '' : 'This listing will be <b>Cash-Only Active</b>.'; return }
+  const bits = []
+  if (lp.interest_pct != null) bits.push(`${lp.interest_pct}% interest`)
+  if (lp.deposit_pct != null) bits.push(`${lp.deposit_pct}% deposit`)
+  if (lp.term_min_months != null || lp.term_max_months != null) bits.push(`${lp.term_min_months ?? '?'}–${lp.term_max_months ?? '?'} mo`)
+  if (lp.rate_per_cycle) bits.push(`${lp.rate_per_cycle}%/cycle × ${lp.cycle_count ?? '?'}`)
+  box.innerHTML = `<i class="fas fa-circle-info text-teal-600 mr-1"></i>Applies <b>${esc(lp.label)}</b>${bits.length ? ' · ' + esc(bits.join(' · ')) : ''}. Terms are managed in Loan &amp; Financing Products.`
 }
 // DYNAMIC PAYMENT AVAILABILITY: show the cash block, the financing block, or
 // BOTH simultaneously based on the selected payment-availability mode. Selecting
@@ -3516,13 +3850,28 @@ window.onAgreementSourceChange = (prefix, key) => {
 // Cached active financing types (loaded from the API) so inventory + checkout
 // dropdowns can render synchronously after the first fetch.
 let _financingTypesCache = null
+let _loanProducts = []   // cache of loan products (financing_types) for the mapping dropdown
 async function loadFinancingTypes(force = false) {
   if (_financingTypesCache && !force) return _financingTypesCache
   try {
     const r = await api.get('/financing-types')
     _financingTypesCache = r.data.financing_types || []
   } catch (_) { _financingTypesCache = [] }
+  _loanProducts = _financingTypesCache
   return _financingTypesCache
+}
+// Load the processing-fee config so the client pricing engine matches the server.
+// Best-effort: on failure the engine treats the processing fee as disabled and
+// the authoritative server quote (on submit) still applies the real fee.
+let _procFeeLoaded = false
+async function loadProcessingFeeCfg(force = false) {
+  if (_procFeeLoaded && !force) return _procFeeCfg
+  try {
+    const r = await api.get('/settings/processing-fee-public')
+    if (r.data && r.data.processing_fee) _procFeeCfg = Object.assign(_procFeeCfg, r.data.processing_fee)
+  } catch (_) { /* keep defaults (disabled) */ }
+  _procFeeLoaded = true
+  return _procFeeCfg
 }
 // Show only the price input relevant to the chosen mode (pct / fixed / manual).
 window.onPriceModeChange = (prefix, which) => {
@@ -3564,8 +3913,11 @@ async function initProductForm(prefix) {
   if (sel) {
     const types = await loadFinancingTypes()
     const want = sel.getAttribute('data-selected') || ''
-    sel.innerHTML = types.map(t => `<option value="${esc(t.type_key)}" ${t.type_key === want ? 'selected' : ''}>${esc(t.label)}</option>`).join('')
-      || '<option value="">No financing types configured</option>'
+    // MAPPING dropdown: "Cash only" (no link) + one option per pre-configured
+    // loan product. Rules are NOT edited here — only the link is chosen.
+    sel.innerHTML = `<option value="">Cash only (no financing)</option>` +
+      types.map(t => `<option value="${esc(t.type_key)}" ${t.type_key === want ? 'selected' : ''}>${esc(t.label)}</option>`).join('')
+    onLoanProductMap(prefix)
   }
 }
 window.initProductForm = initProductForm
@@ -3599,30 +3951,16 @@ function productPayload(prefix) {
     credit_price_mode: ($(prefix + '_credit_mode') || {}).value || 'percentage',
     credit_markup_amount: Number(($(prefix + '_credit_amt') || {}).value || 0),
     credit_price: Number(($(prefix + '_credit_price') || {}).value || 0),
-    financing_model: $(prefix + '_fin_model').value || null,
+    // CONSOLIDATION: the inventory form is a MAPPING step. It sends ONLY the
+    // chosen loan-product key (financing_type_key). All financing RULES (interest,
+    // deposit, term, tenure, fees, agreement) are authored on and resolved from
+    // the Loan & Financing Products module at checkout — never inline here.
     financing_type_key: ($(prefix + '_fin_type') || {}).value || null,
-    // Blank financing fields persist as NULL (not a 0 / default) so an
-    // un-configured product shows no phantom financing terms downstream.
-    financing_interest_pct: _numOrNull($(prefix + '_int').value),
-    financing_frequency: $(prefix + '_freq').value,
-    financing_term_min_months: Number($(prefix + '_tmin').value || 3),
-    financing_term_max_months: Number($(prefix + '_tmax').value || 12),
-    // Flexible tenure parameters.
-    financing_tenure_unit: ($(prefix + '_tenure_unit') || {}).value || 'monthly',
-    financing_rate_per_cycle: Number(($(prefix + '_rate_pc') || {}).value || 0),
-    financing_amount_per_cycle: Number(($(prefix + '_amt_pc') || {}).value || 0),
-    financing_cycle_count: Number(($(prefix + '_cycle_count') || {}).value || 0),
-    financing_cycle_length_days: Number(($(prefix + '_cycle_len') || {}).value || 30),
-    cash_deposit_pct: Number($(prefix + '_cash_dep').value || 100),
-    financing_deposit_pct: _numOrNull($(prefix + '_fin_dep').value),
-    // Agreement source mode + the matching representation (rich-text from the
-    // editor, or the uploaded PDF/Word doc data URL).
+    cash_deposit_pct: Number(($(prefix + '_cash_dep') || {}).value || 100),
+    // Agreement source mode for the CASH path (financing agreement is on the loan product).
     cash_agreement_source: ($(prefix + '_cash_ag_src') || {}).value || 'editor',
-    financing_agreement_source: ($(prefix + '_fin_ag_src') || {}).value || 'editor',
     cash_terms_text: (($(prefix + '_cash_terms_rte') || {}).innerHTML || ($(prefix + '_cash_terms') || {}).value || '') || null,
-    financing_terms_text: (($(prefix + '_fin_terms_rte') || {}).innerHTML || ($(prefix + '_fin_terms') || {}).value || '') || null,
-    cash_terms_doc_url: ($(prefix + '_cash_doc') || {}).value || null,
-    financing_terms_doc_url: ($(prefix + '_fin_doc') || {}).value || null
+    cash_terms_doc_url: ($(prefix + '_cash_doc') || {}).value || null
   }
 }
 function financeStatusBadge(s) {
@@ -3800,60 +4138,70 @@ async function viewFinanceQueue() {
     </table>
   </div>`
 }
+// CONSOLIDATION (Part 1.1): the Finance Approval Queue approves/rejects the
+// LINKING request only — NO inline financing configuration. All financing
+// parameters are authored once on the Loan/Financing Products module. Here the
+// reviewer simply confirms (or overrides) which pre-configured loan product the
+// product should be linked to, then approves or rejects.
 window.financeModal = async (id) => {
-  // Load the current product (from cache if present) so we can prefill.
+  // Load the current product (from cache if present) so we can show the request.
   let p = (_products || []).find(x => x.id === id)
   if (!p) {
     try { const { data } = await api.get('/products/finance-queue'); p = (data.products || []).find(x => x.id === id) || {} } catch (_) { p = {} }
   }
   p = p || {}
-  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-hand-holding-dollar text-teal-600 mr-2"></i>Supply financial components</h3>
-    <p class="text-xs text-slate-500 mb-4">${esc(p.name || 'Product')} · ${esc(p.sku || '')}</p>
-    <div class="responsive-grid cols-2 text-sm">
-      <div><label class="field-label">Financing markup %</label><input id="fz_crm" type="number" value="${Number(p.credit_markup_pct || 20)}" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Financing model</label><select id="fz_model" class="px-3 py-2 border rounded-lg">
-        <option value="loan_interest" ${(p.financing_model || 'loan_interest') === 'loan_interest' ? 'selected' : ''}>Interest financing</option>
-        <option value="paygo" ${(p.financing_model || '') === 'paygo' ? 'selected' : ''}>PAYGO</option>
-      </select></div>
-      <div><label class="field-label">Interest / finance rate %</label><input id="fz_int" type="number" value="${Number(p.financing_interest_pct || 0)}" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Repayment frequency</label><select id="fz_freq" class="px-3 py-2 border rounded-lg">
-        ${['daily','weekly','monthly'].map(v => `<option value="${v}" ${(p.financing_frequency || 'monthly') === v ? 'selected' : ''}>${v}</option>`).join('')}
-      </select></div>
-      <div><label class="field-label">Minimum term (months)</label><input id="fz_tmin" type="number" value="${Number(p.financing_term_min_months || 3)}" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Maximum term (months)</label><input id="fz_tmax" type="number" value="${Number(p.financing_term_max_months || 12)}" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Financing deposit %</label><input id="fz_dep" type="number" value="${Number(p.financing_deposit_pct ?? 10)}" class="px-3 py-2 border rounded-lg"></div>
-      <div><label class="field-label">Payment availability</label><select id="fz_mode" class="px-3 py-2 border rounded-lg">
-        <option value="both">Cash + Financing</option><option value="financing">Financing only</option><option value="cash">Cash only</option>
-      </select></div>
-      <div style="grid-column:1 / -1"><label class="field-label">Financing / PAYGO terms summary</label><textarea id="fz_terms" class="px-3 py-2 border rounded-lg min-h-20">${esc(p.financing_terms_text || '')}</textarea></div>
-      <div style="grid-column:1 / -1"><label class="field-label">Financing agreement URL / file</label><input id="fz_doc" value="${esc(p.financing_terms_doc_url || '')}" placeholder="Agreement URL or uploaded file data" class="px-3 py-2 border rounded-lg text-xs"></div>
-      <div style="grid-column:1 / -1"><label class="field-label">Finance notes (optional)</label><input id="fz_notes" value="${esc(p.finance_notes || '')}" class="px-3 py-2 border rounded-lg text-xs"></div>
+  await loadFinancingTypes()
+  const requestedKey = p.finance_pending_type_key || p.financing_type_key || ''
+  const opts = (_loanProducts || []).filter(lp => lp.active !== 0).map(lp =>
+    `<option value="${esc(lp.type_key)}" ${lp.type_key === requestedKey ? 'selected' : ''}>${esc(lp.label || lp.type_key)}</option>`
+  ).join('')
+  showModal(`<h3 class="font-bold mb-1"><i class="fas fa-link text-teal-600 mr-2"></i>Approve financing link</h3>
+    <p class="text-xs text-slate-500 mb-1">${esc(p.name || 'Product')} · ${esc(p.sku || '')}</p>
+    <p class="text-xs text-slate-400 mb-4">Approve the request to link this product to a pre-configured loan product, or reject it (product stays <b>Cash only</b>). Financing rules are managed in the Loan/Financing Products module — they are never set here.</p>
+    <div class="text-sm">
+      <label class="field-label">Loan / financing product to link</label>
+      <select id="fz_link" class="px-3 py-2 border rounded-lg w-full" onchange="onFzLinkDetail()">
+        <option value="">— Select a loan product —</option>
+        ${opts}
+      </select>
+      <div id="fz_link_detail" class="mt-2 text-xs text-slate-500 bg-slate-50 rounded-lg p-3">Select a loan product to see its terms.</div>
+      <label class="field-label mt-3">Review notes (optional)</label>
+      <input id="fz_notes" value="${esc(p.finance_notes || '')}" class="px-3 py-2 border rounded-lg text-xs w-full" placeholder="Reason / internal note">
     </div>
     <div class="flex gap-2 mt-4">
-      <button onclick="submitFinance(${id}, true)" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-check mr-1"></i>Publish to storefront</button>
-      <button onclick="submitFinance(${id}, false)" class="btn px-4 bg-slate-100 rounded-lg text-sm">Save draft</button>
+      <button onclick="submitFinance(${id}, 'approve')" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm"><i class="fas fa-check mr-1"></i>Approve &amp; link</button>
+      <button onclick="submitFinance(${id}, 'reject')" class="btn px-4 bg-red-50 text-red-600 rounded-lg text-sm"><i class="fas fa-ban mr-1"></i>Reject (cash only)</button>
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
     </div>`)
+  onFzLinkDetail()
 }
-window.submitFinance = async (id, publish) => {
-  const payload = {
-    credit_markup_pct: Number($('fz_crm').value || 0),
-    financing_model: $('fz_model').value,
-    financing_interest_pct: Number($('fz_int').value || 0),
-    financing_frequency: $('fz_freq').value,
-    financing_term_min_months: Number($('fz_tmin').value || 3),
-    financing_term_max_months: Number($('fz_tmax').value || 12),
-    financing_deposit_pct: Number($('fz_dep').value || 10),
-    payment_option_mode: $('fz_mode').value,
-    financing_enabled: true,
-    financing_terms_text: $('fz_terms').value || null,
-    financing_terms_doc_url: $('fz_doc').value || null,
-    finance_notes: $('fz_notes').value || null,
-    finance_status: publish ? 'published' : 'pending_finance'
+// Render the selected loan product's read-only terms inside the approval modal.
+window.onFzLinkDetail = () => {
+  const el = $('fz_link_detail'); if (!el) return
+  const key = ($('fz_link') || {}).value || ''
+  const lp = (_loanProducts || []).find(x => x.type_key === key)
+  if (!lp) { el.innerHTML = 'Select a loan product to see its terms.'; return }
+  const bits = []
+  if (lp.interest_pct != null) bits.push(`Interest: <b>${lp.interest_pct}%</b>`)
+  if (lp.deposit_pct != null) bits.push(`Deposit: <b>${lp.deposit_pct}%</b>`)
+  if (lp.markup_pct != null) bits.push(`Markup: <b>${lp.markup_pct}%</b>`)
+  if (lp.term_min_months != null || lp.term_max_months != null) bits.push(`Term: <b>${lp.term_min_months ?? '?'}–${lp.term_max_months ?? '?'} mo</b>`)
+  if (lp.frequency) bits.push(`Repayment: <b>${esc(lp.frequency)}</b>`)
+  el.innerHTML = `<div class="font-semibold text-slate-700 mb-1">${esc(lp.label || lp.type_key)}</div>` +
+    (lp.description ? `<div class="mb-1">${esc(lp.description)}</div>` : '') +
+    (bits.length ? `<div>${bits.join(' · ')}</div>` : '<div class="text-amber-600">No numeric terms set on this loan product yet.</div>') +
+    (lp.terms_text ? `<div class="mt-1 text-slate-400">${esc(lp.terms_text).slice(0, 240)}</div>` : '')
+}
+window.submitFinance = async (id, action) => {
+  const payload = { action, finance_notes: ($('fz_notes') || {}).value || null }
+  if (action === 'approve') {
+    const key = ($('fz_link') || {}).value || ''
+    if (!key) { toast('Select a loan product to link', false); return }
+    payload.financing_type_key = key
   }
   try {
     await api.put(`/products/${id}/finance`, payload)
-    closeModal(); toast(publish ? 'Product published' : 'Finance draft saved'); viewFinanceQueue()
+    closeModal(); toast(action === 'approve' ? 'Financing link approved' : 'Request rejected (cash only)'); viewFinanceQueue()
   } catch (err) { toast(err.response?.data?.error || 'Failed', false) }
 }
 
@@ -6775,6 +7123,12 @@ async function renderFinancingTypes() {
           ${Number(t.is_system) ? '<span class="badge bg-slate-100 text-slate-500 ml-1">system</span>' : ''}
           ${Number(t.active) ? '' : '<span class="badge bg-amber-100 text-amber-700 ml-1">inactive</span>'}</div>
         <div class="text-[11px] text-slate-400">${esc(t.description || '')} · charge: ${esc(t.charge_mode)}</div>
+        <div class="text-[11px] text-teal-600 mt-0.5">${[
+          t.interest_pct != null ? `int ${t.interest_pct}%` : '',
+          t.deposit_pct != null ? `dep ${t.deposit_pct}%` : '',
+          (t.term_min_months != null || t.term_max_months != null) ? `term ${t.term_min_months ?? '?'}-${t.term_max_months ?? '?'}mo` : '',
+          t.frequency ? esc(t.frequency) : ''
+        ].filter(Boolean).join(' · ') || '<span class="text-amber-500">no terms set</span>'}</div>
       </div>
       ${_finTypesCanManage ? `<div class="flex gap-1">
         <button onclick="editFinType(${t.id})" class="btn px-2 py-1 bg-slate-100 rounded text-xs"><i class="fas fa-pen"></i></button>
@@ -6788,37 +7142,105 @@ async function renderFinancingTypes() {
   // Refresh the cache used by the inventory dropdown.
   loadFinancingTypes(true)
 }
+// CONSOLIDATION (Part 1.1 / Part 2 Module 2): this is the SOLE authoring tool
+// for all financing rules. Admins define interest, deposit, term, tenure,
+// repayment cadence, processing fees and the agreement text here — once — and
+// inventory listings simply MAP to one of these pre-configured loan products.
 function finTypeModal(t) {
   const editing = !!t
   t = t || { label: '', description: '', charge_mode: 'percentage', active: 1 }
-  showModal(`<h3 class="font-bold mb-3">${editing ? 'Edit' : 'Add'} financing type</h3>
-    <div class="space-y-3 text-sm">
-      <div><label class="field-label">Label</label><input id="ft_label" value="${esc(t.label)}" class="w-full px-3 py-2 border rounded-lg"></div>
+  const num = (v) => (v === null || v === undefined ? '' : v)
+  let fee = {}
+  try { fee = t.processing_fee_json ? JSON.parse(t.processing_fee_json) : (t.processing_fee || {}) } catch (_) { fee = {} }
+  showModal(`<h3 class="font-bold mb-1">${editing ? 'Edit' : 'Add'} loan / financing product</h3>
+    <p class="text-xs text-slate-500 mb-3">Define every financing rule here. Inventory listings only map to this product — rules are never re-defined on the product form.</p>
+    <div class="space-y-3 text-sm max-h-[70vh] overflow-y-auto pr-1">
+      <div class="responsive-grid cols-2">
+        <div><label class="field-label">Label</label><input id="ft_label" value="${esc(t.label)}" class="w-full px-3 py-2 border rounded-lg"></div>
+        <div><label class="field-label">Charge mode</label><select id="ft_charge" class="w-full px-3 py-2 border rounded-lg">
+          ${['percentage','fixed','none'].map(v => `<option value="${v}" ${t.charge_mode === v ? 'selected' : ''}>${v}</option>`).join('')}
+        </select></div>
+      </div>
       ${editing ? '' : '<div class="text-[11px] text-slate-400">A machine key is derived from the label automatically.</div>'}
-      <div><label class="field-label">Description</label><textarea id="ft_desc" class="w-full px-3 py-2 border rounded-lg min-h-16">${esc(t.description || '')}</textarea></div>
-      <div><label class="field-label">Charge mode</label><select id="ft_charge" class="w-full px-3 py-2 border rounded-lg">
-        ${['percentage','fixed','none'].map(v => `<option value="${v}" ${t.charge_mode === v ? 'selected' : ''}>${v}</option>`).join('')}
-      </select></div>
-      <label class="flex items-center gap-2"><input type="checkbox" id="ft_active" ${Number(t.active) ? 'checked' : ''}> Active (selectable during listing)</label>
+      <div><label class="field-label">Description</label><textarea id="ft_desc" class="w-full px-3 py-2 border rounded-lg min-h-14">${esc(t.description || '')}</textarea></div>
+
+      <div class="border-t pt-3"><div class="font-semibold text-slate-600 mb-2"><i class="fas fa-percent text-teal-600 mr-1"></i>Repayment rules</div>
+        <div class="responsive-grid cols-3">
+          <div><label class="field-label">Interest / finance %</label><input id="ft_interest" type="number" step="0.01" value="${num(t.interest_pct)}" class="w-full px-3 py-2 border rounded-lg" placeholder="e.g. 15"></div>
+          <div><label class="field-label">Markup %</label><input id="ft_markup" type="number" step="0.01" value="${num(t.markup_pct)}" class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Deposit %</label><input id="ft_deposit" type="number" step="0.01" value="${num(t.deposit_pct)}" class="w-full px-3 py-2 border rounded-lg" placeholder="e.g. 20"></div>
+          <div><label class="field-label">Min term (months)</label><input id="ft_tmin" type="number" value="${num(t.term_min_months)}" class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Max term (months)</label><input id="ft_tmax" type="number" value="${num(t.term_max_months)}" class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Tenure unit</label><select id="ft_tenure" class="w-full px-3 py-2 border rounded-lg">
+            <option value="">—</option>${['monthly','yearly','custom'].map(v => `<option value="${v}" ${t.tenure_unit === v ? 'selected' : ''}>${v}</option>`).join('')}
+          </select></div>
+          <div><label class="field-label">Repayment frequency</label><select id="ft_freq" class="w-full px-3 py-2 border rounded-lg">
+            <option value="">—</option>${['daily','weekly','monthly'].map(v => `<option value="${v}" ${t.frequency === v ? 'selected' : ''}>${v}</option>`).join('')}
+          </select></div>
+        </div>
+      </div>
+
+      <div class="border-t pt-3"><div class="font-semibold text-slate-600 mb-2"><i class="fas fa-calendar-day text-teal-600 mr-1"></i>PAYGO cycle (optional)</div>
+        <div class="responsive-grid cols-3">
+          <div><label class="field-label">Rate / cycle %</label><input id="ft_rpc" type="number" step="0.01" value="${num(t.rate_per_cycle)}" class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Amount / cycle</label><input id="ft_apc" type="number" step="0.01" value="${num(t.amount_per_cycle)}" class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Cycle count</label><input id="ft_cc" type="number" value="${num(t.cycle_count)}" class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Cycle length (days)</label><input id="ft_cld" type="number" value="${num(t.cycle_length_days)}" class="w-full px-3 py-2 border rounded-lg"></div>
+        </div>
+      </div>
+
+      <div class="border-t pt-3"><div class="font-semibold text-slate-600 mb-2"><i class="fas fa-receipt text-teal-600 mr-1"></i>Processing fee (optional)</div>
+        <div class="responsive-grid cols-3">
+          <div><label class="field-label">Fee mode</label><select id="ft_fee_mode" class="w-full px-3 py-2 border rounded-lg">
+            <option value="">None</option>
+            <option value="percentage" ${fee.mode === 'percentage' ? 'selected' : ''}>Percentage</option>
+            <option value="fixed" ${fee.mode === 'fixed' ? 'selected' : ''}>Fixed</option>
+          </select></div>
+          <div><label class="field-label">Fee value</label><input id="ft_fee_val" type="number" step="0.01" value="${num(fee.value ?? fee.amount ?? fee.pct)}" class="w-full px-3 py-2 border rounded-lg"></div>
+          <div><label class="field-label">Fee label</label><input id="ft_fee_label" value="${esc(fee.label || '')}" class="w-full px-3 py-2 border rounded-lg" placeholder="Processing fee"></div>
+        </div>
+      </div>
+
+      <div class="border-t pt-3"><div class="font-semibold text-slate-600 mb-2"><i class="fas fa-file-contract text-teal-600 mr-1"></i>Agreement</div>
+        <div><label class="field-label">Terms summary</label><textarea id="ft_terms" class="w-full px-3 py-2 border rounded-lg min-h-16">${esc(t.terms_text || '')}</textarea></div>
+        <div class="mt-2"><label class="field-label">Agreement URL / document</label><input id="ft_doc" value="${esc(t.terms_doc_url || '')}" class="w-full px-3 py-2 border rounded-lg text-xs" placeholder="Agreement URL"></div>
+      </div>
+
+      <label class="flex items-center gap-2"><input type="checkbox" id="ft_active" ${Number(t.active) ? 'checked' : ''}> Active (selectable when mapping a listing)</label>
     </div>
     <div class="flex gap-2 mt-4">
-      <button onclick="saveFinType(${editing ? t.id : 'null'})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save</button>
+      <button onclick="saveFinType(${editing ? t.id : 'null'})" class="btn flex-1 brand-bg text-white py-2 rounded-lg text-sm">Save loan product</button>
       <button onclick="closeModal()" class="btn px-4 bg-slate-100 rounded-lg text-sm">Cancel</button>
     </div>`)
 }
 window.addFinType = () => finTypeModal(null)
 window.editFinType = (id) => finTypeModal(_finTypes.find(x => x.id === id))
 window.saveFinType = async (id) => {
+  const numv = (el) => { const v = ($(el) || {}).value; return v === '' || v === undefined ? null : Number(v) }
+  const txt = (el) => { const v = ($(el) || {}).value; return v === undefined ? null : (v || null) }
+  const feeMode = ($('ft_fee_mode') || {}).value || ''
+  const feeVal = numv('ft_fee_val')
+  const processing_fee = feeMode && feeVal != null
+    ? { mode: feeMode, value: feeVal, label: txt('ft_fee_label') || 'Processing fee' }
+    : null
   const payload = {
     label: ($('ft_label') || {}).value || '',
     description: ($('ft_desc') || {}).value || '',
     charge_mode: ($('ft_charge') || {}).value || 'percentage',
-    active: !!($('ft_active') || {}).checked
+    active: !!($('ft_active') || {}).checked,
+    // Full loan-product rules authored here (sole authoring tool).
+    interest_pct: numv('ft_interest'), markup_pct: numv('ft_markup'), deposit_pct: numv('ft_deposit'),
+    term_min_months: numv('ft_tmin'), term_max_months: numv('ft_tmax'),
+    tenure_unit: ($('ft_tenure') || {}).value || null, frequency: ($('ft_freq') || {}).value || null,
+    rate_per_cycle: numv('ft_rpc'), amount_per_cycle: numv('ft_apc'),
+    cycle_count: numv('ft_cc'), cycle_length_days: numv('ft_cld'),
+    processing_fee,
+    terms_text: txt('ft_terms'), terms_doc_url: txt('ft_doc')
   }
   try {
     if (id) await api.put('/financing-types/' + id, payload)
     else await api.post('/financing-types', payload)
-    closeModal(); toast('Financing type saved'); renderFinancingTypes(); renderAgreementTemplates()
+    closeModal(); toast('Loan product saved'); renderFinancingTypes(); renderAgreementTemplates()
   } catch (err) { toast(err.response?.data?.error || 'Failed to save', false) }
 }
 window.toggleFinType = async (id, active) => {
